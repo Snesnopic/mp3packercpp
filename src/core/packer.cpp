@@ -1,4 +1,6 @@
 #include "packer.hpp"
+#include "huffman.hpp"
+#include "logger.hpp"
 #include "mp3_reader.hpp"
 #include "huffman.hpp"
 #include "bitstream.hpp"
@@ -118,7 +120,7 @@ static ChosenBitrate bytes_to_bitrate(MpegVersion version, int samplerate, Chann
 }
 
 void Packer::process(const std::string& input_file, const std::string& output_file) const {
-    std::cout << "Reading input file " << input_file << "..." << std::endl;
+    DEBUG_LOG("Reading input file " << input_file << "...");
     Mp3Reader reader(input_file);
     
     std::vector<Mp3Frame> all_frames;
@@ -136,13 +138,12 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
         has_xing = true;
         // Do NOT erase it! We must keep it to preserve the LAME tag!
         // all_frames.erase(all_frames.begin());
-        std::cout << "Detected XING header frame at beginning. Preserving it." << std::endl;
+        DEBUG_LOG("Detected XING header frame at beginning. Preserving it.");
     }
     
     size_t N = all_frames.size();
-    std::cout << "Optimizing " << N << " audio frames..." << std::endl;
-    
-    HuffmanOptimizer optimizer;
+    DEBUG_LOG("Optimizing " << N << " audio frames...");
+
     std::vector<std::vector<uint8_t>> optimized_main_data(N);
     std::vector<SideInfo> optimized_side_info(N);
     
@@ -242,8 +243,8 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
                         g.block_type,
                         g.mixed_block_flag != 0
                     };
-                    auto coeffs = optimizer.decode_quantized_coefficients(orig_cfg, data_reader, frame.header.samplerate);
-                    auto best_cfg = optimizer.find_best_config(coeffs, orig_cfg, frame.header.samplerate);
+                    auto coeffs = HuffmanOptimizer::decode_quantized_coefficients(orig_cfg, data_reader, frame.header.samplerate);
+                    auto best_cfg = HuffmanOptimizer::find_best_config(coeffs, orig_cfg, frame.header.samplerate);
                     
                     // Re-encode
                     size_t out_start = writer.tell_bit();
@@ -270,7 +271,7 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
                             if (gr == 0 || frame.side_info.scfsi[ch][3] == 0) writer.write_bits(scfs[k], slen2);
                         }
                     }
-                    optimizer.encode_quantized_coefficients(coeffs, best_cfg, writer, frame.header.samplerate);
+                    HuffmanOptimizer::encode_quantized_coefficients(coeffs, best_cfg, writer, frame.header.samplerate);
                     
                     // Update side info
                     g.big_values = best_cfg.big_values;
@@ -287,7 +288,7 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
                 }
             }
             }
-        } catch (const std::exception& e) {
+        } catch (const std::exception& _) {
             optimization_failed = true;
         }
 
@@ -316,14 +317,14 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
         }
     }
     
-    std::cout << "Huffman optimization completed. Running reservoir constraint solver..." << std::endl;
+    DEBUG_LOG("Huffman optimization completed. Running reservoir constraint solver...");
     
     // Backward Pass (Constraint Solver for Carry-over Reservoir)
     MpegVersion version = all_frames[0].header.version;
     int samplerate = all_frames[0].header.samplerate;
     ChannelMode channel_mode = all_frames[0].header.channel_mode;
     
-    std::cout << "Reservoir carryover calculated. Writing output stream..." << std::endl;
+    DEBUG_LOG("Reservoir carryover calculated. Writing output stream...");
     
     std::ofstream out(output_file, std::ios::binary);
     if (!out) {
@@ -379,7 +380,7 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
         // VBR Logic: Pick the smallest bitrate that gives us enough data_size
         // We must ensure that we leave at least required_carryover[i + 1] in the reservoir for the NEXT frames!
         int req_for_next = (i + 1 < N) ? required_carryover[i + 1] : 0;
-        int bytes_to_store = std::max(0, (int)optimized_main_data[i].size() + req_for_next - current_reservoir);
+        int bytes_to_store = std::max(0, static_cast<int>(optimized_main_data[i].size()) + req_for_next - current_reservoir);
         ChosenBitrate bitrate_use = bytes_to_bitrate(version, samplerate, channel_mode, bytes_to_store);
         
         int data_size = bitrate_use.data_size;
@@ -501,7 +502,7 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
                 bytes_buf[3] = (total_mp3_bytes >> 0) & 0xFF;
                 out.write(reinterpret_cast<const char*>(bytes_buf), 4);
                 
-                std::cout << "Patched Xing header Bytes field to " << total_mp3_bytes << " bytes." << std::endl;
+                DEBUG_LOG("Patched Xing header Bytes field to " << total_mp3_bytes << " bytes.");
             }
         }
     }

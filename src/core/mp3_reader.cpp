@@ -1,4 +1,5 @@
 #include "mp3_reader.hpp"
+#include "logger.hpp"
 #include <iostream>
 
 #include "bitstream.hpp"
@@ -40,7 +41,7 @@ void Mp3Reader::skip_id3v2_tag() {
             total_tag_size += 10;
         }
 
-        std::cout << "Found ID3v2 tag of size " << total_tag_size << " bytes. Storing in start_junk..." << std::endl;
+        DEBUG_LOG("Found ID3v2 tag of size " << total_tag_size << " bytes. Storing in start_junk...");
         file_.seekg(0, std::ios::beg);
         start_junk_.resize(total_tag_size);
         file_.read(reinterpret_cast<char*>(start_junk_.data()), total_tag_size);
@@ -128,8 +129,7 @@ std::optional<Mp3Frame> Mp3Reader::read_next_frame() {
                                static_cast<uint32_t>(buf[3]);
         auto header = parse_header(header_bits);
         if (header) {
-            std::cout << "Successfully parsed valid MP3 header: " << std::hex << header_bits << std::dec 
-                      << " at stream pos " << (static_cast<size_t>(file_.tellg()) - 4) << std::endl;
+            DEBUG_LOG("Successfully parsed valid MP3 header: " << std::hex << header_bits << std::dec << " at stream pos " << (static_cast<size_t>(file_.tellg()) - 4));
             Mp3Frame frame;
             header->bitrate.frame_size = calculate_frame_size(*header);
             frame.header = *header;
@@ -179,13 +179,13 @@ std::optional<Mp3Frame> Mp3Reader::read_next_frame() {
                         gi.mixed_block_flag = static_cast<int>(side_reader.read_bits(1));
                         for (int i = 0; i < 2; ++i) gi.table_select[i] = static_cast<int>(side_reader.read_bits(5));
                         gi.table_select[2] = 0; // Not used
-                        for (int i = 0; i < 3; ++i) gi.subblock_gain[i] = static_cast<int>(side_reader.read_bits(3));
+                        for (int & i : gi.subblock_gain) i = static_cast<int>(side_reader.read_bits(3));
                         
                         if (gi.block_type == 2 && gi.mixed_block_flag == 0) gi.region0_count = 8;
                         else gi.region0_count = 7;
                         gi.region1_count = 20 - gi.region0_count;
                     } else {
-                        for (int i = 0; i < 3; ++i) gi.table_select[i] = static_cast<int>(side_reader.read_bits(5));
+                        for (int & i : gi.table_select) i = static_cast<int>(side_reader.read_bits(5));
                         gi.region0_count = static_cast<int>(side_reader.read_bits(4));
                         gi.region1_count = static_cast<int>(side_reader.read_bits(3));
                         gi.block_type = 0;
@@ -203,22 +203,19 @@ std::optional<Mp3Frame> Mp3Reader::read_next_frame() {
             
             frame.main_data_raw.resize(static_cast<size_t>(main_data_size));
             file_.read(reinterpret_cast<char*>(frame.main_data_raw.data()), main_data_size);
-            
-            // Removed has_xing logic from here, packer.cpp does it!
 
             return frame;
-        } else {
-            // Invalid header found! Assume it's the start of end junk (like ID3v1 tag)
-            file_.seekg(-4, std::ios::cur);
-            size_t current_pos = static_cast<size_t>(file_.tellg());
-            if (current_pos < file_size_) {
-                size_t remaining = file_size_ - current_pos;
-                end_junk_.resize(remaining);
-                file_.read(reinterpret_cast<char*>(end_junk_.data()), static_cast<std::streamsize>(remaining));
-                std::cout << "Found " << remaining << " bytes of junk at end of stream (e.g. ID3v1). Stored in end_junk." << std::endl;
-            }
-            return std::nullopt;
         }
+        // Invalid header found! Assume it's the start of end junk (like ID3v1 tag)
+        file_.seekg(-4, std::ios::cur);
+        size_t current_pos = static_cast<size_t>(file_.tellg());
+        if (current_pos < file_size_) {
+            size_t remaining = file_size_ - current_pos;
+            end_junk_.resize(remaining);
+            file_.read(reinterpret_cast<char*>(end_junk_.data()), static_cast<std::streamsize>(remaining));
+            DEBUG_LOG("Found " << remaining << " bytes of junk at end of stream (e.g. ID3v1). Stored in end_junk.");
+        }
+        return std::nullopt;
     }
     return std::nullopt;
 }

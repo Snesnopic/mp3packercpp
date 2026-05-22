@@ -2,7 +2,6 @@
 #define MP3PACKERCPP_BITSTREAM_HPP
 
 #include <vector>
-#include <cstdint>
 #include <stdexcept>
 
 namespace mp3packer {

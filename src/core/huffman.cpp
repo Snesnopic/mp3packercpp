@@ -203,7 +203,7 @@ HuffmanConfig HuffmanOptimizer::find_best_config(const std::vector<int16_t>& coe
     for (int p = 0; p < max_possible_bv; ++p) {
         for (int t = 0; t < 32; ++t) {
             uint32_t c = pair_costs[p][t];
-            prefix_costs[p + 1][t] = std::min(prefix_costs[p][t] + c, (uint32_t)10000000);
+            prefix_costs[p + 1][t] = std::min(prefix_costs[p][t] + c, static_cast<uint32_t>(10000000));
         }
     }
 
@@ -303,9 +303,11 @@ HuffmanConfig HuffmanOptimizer::find_best_config(const std::vector<int16_t>& coe
             c1_cost += c1_arr[symbol].length + (v!=0) + (w!=0) + (x!=0) + (y!=0);
             cur += 4;
         }
-        
+
         uint32_t orig_cost = c0 + c1 + c2 + c1_cost;
-        if (orig_cost >= 10000) orig_cost = 99999;
+        if (orig_cost >= 10000) {
+            orig_cost = 99999;
+        }
     }
     
     return best;
