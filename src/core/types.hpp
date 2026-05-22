@@ -2,6 +2,7 @@
 #define MP3PACKERCPP_TYPES_HPP
 
 #include <vector>
+#include <cstdint>
 
 namespace mp3packer {
 
