@@ -47,7 +47,7 @@ struct GrChInfo {
     int preflag = 0;
     int scalefac_scale = 0;
     int count1table_select = 0;
-    std::vector<int> scalefactors;
+    std::vector<int> scalefactors{};
 };
 
 struct SideInfo {
@@ -58,10 +58,10 @@ struct SideInfo {
 };
 
 struct Mp3Frame {
-    Mp3Header header;
-    SideInfo side_info;
-    std::vector<uint8_t> side_info_raw;
-    std::vector<uint8_t> main_data_raw;
+    Mp3Header header{};
+    SideInfo side_info{};
+    std::vector<uint8_t> side_info_raw{};
+    std::vector<uint8_t> main_data_raw{};
 };
 
 } // namespace mp3packer

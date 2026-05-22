@@ -202,7 +202,7 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
                     
                     std::vector<int> scfs;
                     if (g.window_switching_flag && g.block_type == 2) {
-                        if (g.mixed_block_flag) {
+                        if (g.mixed_block_flag) { // NOLINT(bugprone-branch-clone)
                             for (int k = 0; k < 8; ++k) scfs.push_back(data_reader.read_bits(slen1));
                             for (int k = 8; k < 11; ++k) scfs.push_back(data_reader.read_bits(slen1));
                             for (int k = 11; k < 17; ++k) scfs.push_back(data_reader.read_bits(slen2));
@@ -343,7 +343,7 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
     // Backward Pass Constraint Solver
     std::vector<int> required_carryover(N, 0);
     int current_req = 0;
-    for (int i = (int)N - 1; i >= 0; --i) {
+    for (int i = static_cast<int>(N) - 1; i >= 0; --i) {
         int space_needed = static_cast<int>(optimized_main_data[i].size()) + current_req;
         
         // We allow the forward pass to use up to 320 kbps if needed, so the backward pass should assume max capacity.
@@ -396,7 +396,7 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
     // Pass 2: Write physical file
     // Find the last frame that actually contains non-zero data
     size_t N_out = N;
-    for (int i = (int)N - 1; i >= 0; --i) {
+    for (int i = static_cast<int>(N) - 1; i >= 0; --i) {
         if (chosen_bitrates[i].index == 14) {
             break;
         }

@@ -5,7 +5,7 @@
 
 namespace mp3packer {
 
-Mp3Reader::Mp3Reader(const std::string& filename) : file_(filename, std::ios::binary) {
+Mp3Reader::Mp3Reader(const std::string& filename) : file_(filename, std::ios::binary), file_size_(0), start_junk_(), end_junk_() {
     if (!file_) {
         throw std::runtime_error("Could not open file: " + filename);
     }
@@ -52,7 +52,7 @@ void Mp3Reader::skip_id3v2_tag() {
 std::optional<Mp3Header> Mp3Reader::parse_header(uint32_t header_bits) {
     if ((header_bits & 0xFFE00000) != 0xFFE00000) return std::nullopt;
 
-    Mp3Header header;
+    Mp3Header header{};
     int id = (header_bits >> 19) & 3;
     switch (id) {
         case 0: header.version = MpegVersion::MPEG25; break;

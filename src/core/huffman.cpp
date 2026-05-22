@@ -248,13 +248,9 @@ HuffmanConfig HuffmanOptimizer::find_best_config(const std::vector<int16_t>& coe
             cur += 4;
         }
         if (c1_possible) {
-            if (c1_bits_33 < c1_bits_32) {
-                c1_min_bits[bv] = c1_bits_33;
-                c1_best_is_33[bv] = true;
-            } else {
-                c1_min_bits[bv] = c1_bits_32;
-                c1_best_is_33[bv] = false;
-            }
+            bool use_33 = c1_bits_33 < c1_bits_32;
+            c1_min_bits[bv] = use_33 ? c1_bits_33 : c1_bits_32;
+            c1_best_is_33[bv] = use_33;
         }
     }
 

@@ -6,8 +6,8 @@
 namespace mp3packer {
 
 struct HuffmanTable {
-    const int16_t* table;
-    int linbits;
+    const int16_t* table = nullptr;
+    int linbits = 0;
 };
 
 static constexpr int16_t tab0[] = { 0 };
