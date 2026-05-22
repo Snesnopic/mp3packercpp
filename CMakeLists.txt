@@ -20,17 +20,7 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE "Release" CACHE STRING "Choose the type of build." FORCE)
 endif()
 
-# Release flags
-set(CMAKE_CXX_FLAGS_RELEASE "-O3 -march=native -DNDEBUG")
-
-# Debug flags
-if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
-    set(CMAKE_CXX_FLAGS_DEBUG "-O0 -g3 -fsanitize=address -fno-omit-frame-pointer")
-    set(CMAKE_EXE_LINKER_FLAGS_DEBUG "-fsanitize=address")
-elseif(MSVC)
-    # MSVC support for ASan requires specific setup, but these are standard flags
-    set(CMAKE_CXX_FLAGS_DEBUG "/Zi /Od /fsanitize=address")
-endif()
+option(USE_OPENMP "Enable OpenMP support for parallel processing" OFF)
 
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
@@ -41,9 +31,11 @@ file(GLOB CORE_SOURCES "src/core/*.cpp")
 add_library(mp3packercpp_core STATIC ${CORE_SOURCES})
 target_include_directories(mp3packercpp_core PUBLIC src/core)
 
-find_package(OpenMP)
-if(OpenMP_CXX_FOUND)
-    target_link_libraries(mp3packercpp_core PUBLIC OpenMP::OpenMP_CXX)
+if(USE_OPENMP)
+    find_package(OpenMP)
+    if(OpenMP_CXX_FOUND)
+        target_link_libraries(mp3packercpp_core PUBLIC OpenMP::OpenMP_CXX)
+    endif()
 endif()
 
 # --- CLI Executable ---

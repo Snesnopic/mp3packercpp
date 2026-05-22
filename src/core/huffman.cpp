@@ -109,8 +109,8 @@ std::vector<int16_t> HuffmanOptimizer::decode_quantized_coefficients(const Huffm
                 if (y == 15 && linbits > 0) y += reader.read_bits(linbits);
                 if (reader.read_bits(1)) y = -y;
             }
-            coeffs[out_off++] = x;
-            coeffs[out_off++] = y;
+            coeffs[out_off++] = static_cast<int16_t>(x);
+            coeffs[out_off++] = static_cast<int16_t>(y);
         }
     };
 

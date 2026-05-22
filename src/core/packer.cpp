@@ -155,7 +155,7 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
     }
 
     #pragma omp parallel for
-    for (size_t i = 0; i < N; ++i) {
+    for (int i = 0; i < static_cast<int>(N); ++i) {
         if (has_xing && i == 0) {
             optimized_main_data[i] = all_frames[i].main_data_raw;
             optimized_side_info[i] = all_frames[i].side_info;

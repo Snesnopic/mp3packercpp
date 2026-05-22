@@ -45,7 +45,6 @@ jobs:
             arch: x64
             compiler_c: clang
             compiler_cxx: clang++
-            install_deps: sudo apt-get update && sudo apt-get install -y libomp-dev
             asset_name: mp3packercpp-linux-x64-clang
 
           - name: Ubuntu ARM64 GCC
@@ -67,15 +66,11 @@ jobs:
           - name: macOS Intel
             os: macos-13
             arch: x64
-            install_deps: brew install libomp
-            cmake_args: -DOpenMP_ROOT=/usr/local/opt/libomp
             asset_name: mp3packercpp-darwin-x64
 
           - name: macOS ARM64
             os: macos-14
             arch: arm64
-            install_deps: brew install libomp
-            cmake_args: -DOpenMP_ROOT=/opt/homebrew/opt/libomp
             asset_name: mp3packercpp-darwin-arm64
 
     steps:
@@ -129,7 +124,7 @@ jobs:
           usesh: true
           arch: ${{ matrix.arch }}
           release: ${{ matrix.release }}
-          prepare: pkg install -y cmake git openmp
+          prepare: pkg install -y cmake git
           run: |
             cmake -B build -DCMAKE_BUILD_TYPE=Release
             cmake --build build --config Release
