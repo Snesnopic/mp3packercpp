@@ -9,7 +9,7 @@ namespace mp3packer {
 
 class BitstreamReader {
 public:
-    explicit BitstreamReader(const std::vector<uint8_t>& data) : data_(data), bit_pos_(0) {}
+    explicit BitstreamReader(const std::vector<uint8_t>& data) : data_(data) {}
 
     uint32_t read_bits(const int num_bits) {
         if (num_bits == 0) return 0;
@@ -40,12 +40,12 @@ public:
 
 private:
     const std::vector<uint8_t>& data_;
-    size_t bit_pos_;
+    size_t bit_pos_ = 0;
 };
 
 class BitstreamWriter {
 public:
-    BitstreamWriter() : bit_pos_(0) {}
+    BitstreamWriter() = default;
 
     void write_bits(const uint32_t value, const int num_bits) {
         if (num_bits == 0) return;
@@ -71,7 +71,7 @@ public:
 
 private:
     std::vector<uint8_t> data_;
-    size_t bit_pos_;
+    size_t bit_pos_ = 0;
 };
 
 } // namespace mp3packer

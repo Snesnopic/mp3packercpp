@@ -1,7 +1,6 @@
 #ifndef MP3PACKERCPP_PACKER_HPP
 #define MP3PACKERCPP_PACKER_HPP
 
-#include "types.hpp"
 #include <vector>
 #include <string>
 

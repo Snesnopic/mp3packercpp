@@ -8,9 +8,9 @@
 namespace mp3packer {
 
 struct SymbolCode {
-    uint32_t code;
-    int length;
-    bool valid;
+    uint32_t code = 0;
+    int length = 0;
+    bool valid = false;
 };
 
 class HuffmanTableManager {

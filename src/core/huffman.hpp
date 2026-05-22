@@ -1,7 +1,6 @@
 #ifndef MP3PACKERCPP_HUFFMAN_HPP
 #define MP3PACKERCPP_HUFFMAN_HPP
 
-#include "types.hpp"
 #include "bitstream.hpp"
 #include <vector>
 
