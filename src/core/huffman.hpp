@@ -24,8 +24,8 @@ public:
     HuffmanOptimizer();
 
     // Ported logic for -z flag
-    static std::vector<int16_t> decode_quantized_coefficients(const Mp3Frame& frame, const HuffmanConfig& config, BitstreamReader& reader, int samplerate);
-    static HuffmanConfig find_best_config(const Mp3Frame& frame, const std::vector<int16_t>& coeffs, const HuffmanConfig& orig_config, int samplerate);
+    static std::vector<int16_t> decode_quantized_coefficients(const HuffmanConfig& config, BitstreamReader& reader, int samplerate);
+    static HuffmanConfig find_best_config(const std::vector<int16_t>& coeffs, const HuffmanConfig& orig_config, int samplerate);
 
     static void encode_quantized_coefficients(const std::vector<int16_t>& coeffs, const HuffmanConfig& config, BitstreamWriter& writer, int samplerate);
 

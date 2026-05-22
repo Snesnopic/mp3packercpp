@@ -1,8 +1,17 @@
 cmake_minimum_required(VERSION 3.10)
 project(mp3packercpp)
 
-set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+# Enable strict warnings
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    add_compile_options(-Wall -Wextra -Wpedantic)
+elseif(MSVC)
+    add_compile_options(/W4)
+endif()
+
 set(CMAKE_BUILD_TYPE Release)
 set(CMAKE_CXX_FLAGS "-O3 -march=native")
 

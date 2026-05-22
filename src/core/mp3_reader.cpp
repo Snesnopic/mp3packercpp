@@ -10,7 +10,7 @@ Mp3Reader::Mp3Reader(const std::string& filename) : file_(filename, std::ios::bi
         throw std::runtime_error("Could not open file: " + filename);
     }
     file_.seekg(0, std::ios::end);
-    file_size_ = file_.tellg();
+    file_size_ = static_cast<size_t>(file_.tellg());
     file_.seekg(0, std::ios::beg);
     skip_id3v2_tag();
 }
@@ -30,10 +30,10 @@ void Mp3Reader::skip_id3v2_tag() {
     }
 
     if (header[0] == 'I' && header[1] == 'D' && header[2] == '3') {
-        uint32_t size = ((header[6] & 0x7F) << 21) |
-                        ((header[7] & 0x7F) << 14) |
-                        ((header[8] & 0x7F) << 7)  |
-                        (header[9] & 0x7F);
+        uint32_t size = (static_cast<uint32_t>(header[6] & 0x7F) << 21) |
+                        (static_cast<uint32_t>(header[7] & 0x7F) << 14) |
+                        (static_cast<uint32_t>(header[8] & 0x7F) << 7)  |
+                        static_cast<uint32_t>(header[9] & 0x7F);
 
         uint32_t total_tag_size = 10 + size;
         if (header[5] & 0x10) { // Footer present flag
@@ -121,9 +121,11 @@ int Mp3Reader::calculate_frame_size(const Mp3Header& header) {
 
 std::optional<Mp3Frame> Mp3Reader::read_next_frame() {
     uint8_t buf[4];
-    int attempts = 0;
     while (file_.read(reinterpret_cast<char*>(buf), 4)) {
-        uint32_t header_bits = (buf[0] << 24) | (buf[1] << 16) | (buf[2] << 8) | buf[3];
+        uint32_t header_bits = (static_cast<uint32_t>(buf[0]) << 24) |
+                               (static_cast<uint32_t>(buf[1]) << 16) |
+                               (static_cast<uint32_t>(buf[2]) << 8)  |
+                               static_cast<uint32_t>(buf[3]);
         auto header = parse_header(header_bits);
         if (header) {
             std::cout << "Successfully parsed valid MP3 header: " << std::hex << header_bits << std::dec 
@@ -140,56 +142,58 @@ std::optional<Mp3Frame> Mp3Reader::read_next_frame() {
                 file_.ignore(2); // Skip CRC for now
             }
 
-            frame.side_info_raw.resize(side_info_size);
+            frame.side_info_raw.resize(static_cast<size_t>(side_info_size));
             file_.read(reinterpret_cast<char*>(frame.side_info_raw.data()), side_info_size);
 
             // Parse Side Info
             BitstreamReader side_reader(frame.side_info_raw);
             SideInfo& si = frame.side_info;
-            int n_ch = (header->channel_mode == ChannelMode::Mono) ? 1 : 2;
-            int n_gr = (header->version == MpegVersion::MPEG1) ? 2 : 1;
+            int num_channels = (header->channel_mode == ChannelMode::Mono) ? 1 : 2;
+            int num_granules = (header->version == MpegVersion::MPEG1) ? 2 : 1;
 
-            si.main_data_begin = side_reader.read_bits( (header->version == MpegVersion::MPEG1) ? 9 : 8 );
+            si.main_data_begin = static_cast<int>(side_reader.read_bits( (header->version == MpegVersion::MPEG1) ? 9 : 8 ));
             if (header->channel_mode == ChannelMode::Mono) {
-                si.private_bits = side_reader.read_bits( (header->version == MpegVersion::MPEG1) ? 5 : 1 );
+                si.private_bits = static_cast<int>(side_reader.read_bits( (header->version == MpegVersion::MPEG1) ? 5 : 1 ));
             } else {
-                si.private_bits = side_reader.read_bits( (header->version == MpegVersion::MPEG1) ? 3 : 2 );
+                si.private_bits = static_cast<int>(side_reader.read_bits( (header->version == MpegVersion::MPEG1) ? 3 : 2 ));
             }
 
-            for (int ch = 0; ch < n_ch; ++ch) {
-                for (int scfsi_band = 0; scfsi_band < 4; ++scfsi_band) {
-                    si.scfsi[ch][scfsi_band] = side_reader.read_bits(1);
+            if (header->version == MpegVersion::MPEG1) {
+                for (int ch = 0; ch < num_channels; ++ch) {
+                    for (int scfsi_band = 0; scfsi_band < 4; ++scfsi_band) {
+                        si.scfsi[ch][scfsi_band] = static_cast<uint8_t>(side_reader.read_bits(1));
+                    }
                 }
             }
 
-            for (int gr = 0; gr < n_gr; ++gr) {
-                for (int ch = 0; ch < n_ch; ++ch) {
+            for (int gr = 0; gr < num_granules; ++gr) {
+                for (int ch = 0; ch < num_channels; ++ch) {
                     auto& gi = si.gr[gr][ch];
-                    gi.part2_3_length = side_reader.read_bits(12);
-                    gi.big_values = side_reader.read_bits(9);
-                    gi.global_gain = side_reader.read_bits(8);
-                    gi.scalefac_compress = side_reader.read_bits( (header->version == MpegVersion::MPEG1) ? 4 : 9 );
-                    gi.window_switching_flag = side_reader.read_bits(1);
+                    gi.part2_3_length = static_cast<int>(side_reader.read_bits(12));
+                    gi.big_values = static_cast<int>(side_reader.read_bits(9));
+                    gi.global_gain = static_cast<int>(side_reader.read_bits(8));
+                    gi.scalefac_compress = static_cast<int>(side_reader.read_bits( (header->version == MpegVersion::MPEG1) ? 4 : 9 ));
+                    gi.window_switching_flag = static_cast<int>(side_reader.read_bits(1));
                     if (gi.window_switching_flag) {
-                        gi.block_type = side_reader.read_bits(2);
-                        gi.mixed_block_flag = side_reader.read_bits(1);
-                        for (int i = 0; i < 2; ++i) gi.table_select[i] = side_reader.read_bits(5);
+                        gi.block_type = static_cast<int>(side_reader.read_bits(2));
+                        gi.mixed_block_flag = static_cast<int>(side_reader.read_bits(1));
+                        for (int i = 0; i < 2; ++i) gi.table_select[i] = static_cast<int>(side_reader.read_bits(5));
                         gi.table_select[2] = 0; // Not used
-                        for (int i = 0; i < 3; ++i) gi.subblock_gain[i] = side_reader.read_bits(3);
+                        for (int i = 0; i < 3; ++i) gi.subblock_gain[i] = static_cast<int>(side_reader.read_bits(3));
                         
-                        if (gi.block_type == 0) {
-                            std::cerr << "Invalid block_type 0 with window_switching_flag set" << std::endl;
-                        }
+                        if (gi.block_type == 2 && gi.mixed_block_flag == 0) gi.region0_count = 8;
+                        else gi.region0_count = 7;
+                        gi.region1_count = 20 - gi.region0_count;
                     } else {
-                        for (int i = 0; i < 3; ++i) gi.table_select[i] = side_reader.read_bits(5);
-                        gi.region0_count = side_reader.read_bits(4);
-                        gi.region1_count = side_reader.read_bits(3);
+                        for (int i = 0; i < 3; ++i) gi.table_select[i] = static_cast<int>(side_reader.read_bits(5));
+                        gi.region0_count = static_cast<int>(side_reader.read_bits(4));
+                        gi.region1_count = static_cast<int>(side_reader.read_bits(3));
                         gi.block_type = 0;
                         gi.mixed_block_flag = 0;
                     }
-                    gi.preflag = (header->version == MpegVersion::MPEG1) ? side_reader.read_bits(1) : 0;
-                    gi.scalefac_scale = side_reader.read_bits(1);
-                    gi.count1table_select = side_reader.read_bits(1);
+                    gi.preflag = static_cast<int>((header->version == MpegVersion::MPEG1) ? side_reader.read_bits(1) : 0);
+                    gi.scalefac_scale = static_cast<int>(side_reader.read_bits(1));
+                    gi.count1table_select = static_cast<int>(side_reader.read_bits(1));
                 }
             }
 
@@ -197,7 +201,7 @@ std::optional<Mp3Frame> Mp3Reader::read_next_frame() {
             int header_size = 4;
             int main_data_size = header->bitrate.frame_size - header_size - crc_size - side_info_size;
             
-            frame.main_data_raw.resize(main_data_size);
+            frame.main_data_raw.resize(static_cast<size_t>(main_data_size));
             file_.read(reinterpret_cast<char*>(frame.main_data_raw.data()), main_data_size);
             
             // Removed has_xing logic from here, packer.cpp does it!
@@ -206,11 +210,11 @@ std::optional<Mp3Frame> Mp3Reader::read_next_frame() {
         } else {
             // Invalid header found! Assume it's the start of end junk (like ID3v1 tag)
             file_.seekg(-4, std::ios::cur);
-            size_t current_pos = file_.tellg();
+            size_t current_pos = static_cast<size_t>(file_.tellg());
             if (current_pos < file_size_) {
                 size_t remaining = file_size_ - current_pos;
                 end_junk_.resize(remaining);
-                file_.read(reinterpret_cast<char*>(end_junk_.data()), remaining);
+                file_.read(reinterpret_cast<char*>(end_junk_.data()), static_cast<std::streamsize>(remaining));
                 std::cout << "Found " << remaining << " bytes of junk at end of stream (e.g. ID3v1). Stored in end_junk." << std::endl;
             }
             return std::nullopt;

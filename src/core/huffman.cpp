@@ -82,7 +82,7 @@ static std::vector<int> get_sf_bands_short(int samplerate) {
 
 HuffmanOptimizer::HuffmanOptimizer() = default;
 
-std::vector<int16_t> HuffmanOptimizer::decode_quantized_coefficients(const Mp3Frame& frame, const HuffmanConfig& config, BitstreamReader& reader, int samplerate) {
+std::vector<int16_t> HuffmanOptimizer::decode_quantized_coefficients(const HuffmanConfig& config, BitstreamReader& reader, int samplerate) {
     std::vector<int16_t> coeffs(576, 0);
     int out_off = 0;
     const auto sf_bands = get_sf_bands(samplerate);
@@ -150,7 +150,7 @@ std::vector<int16_t> HuffmanOptimizer::decode_quantized_coefficients(const Mp3Fr
     return coeffs;
 }
 
-HuffmanConfig HuffmanOptimizer::find_best_config(const Mp3Frame& frame, const std::vector<int16_t>& coeffs, const HuffmanConfig& orig_config, int samplerate) {
+HuffmanConfig HuffmanOptimizer::find_best_config(const std::vector<int16_t>& coeffs, const HuffmanConfig& orig_config, int samplerate) {
     if (orig_config.window_switching_flag) {
         return orig_config;
     }

@@ -21,7 +21,7 @@ public:
             
             if (byte_idx >= data_.size()) {
                 result <<= (num_bits - i);
-                bit_pos_ += (num_bits - i);
+                bit_pos_ += static_cast<size_t>(num_bits - i);
                 return result;
             }
 
