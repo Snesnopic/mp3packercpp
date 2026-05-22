@@ -6,7 +6,7 @@ void printUsage() {
     std::cout << "Usage: mp3packercpp [-z] <input.mp3> <output.mp3>\n";
     std::cout << "  -z : Recompress frames to find optimal Huffman settings (takes time)\n";
 }
-int main(int argc, char* argv[]) {
+int main(int argc, const char* argv[]) {
     bool recompress_huffman = false;
     std::filesystem::path input;
     std::filesystem::path output;

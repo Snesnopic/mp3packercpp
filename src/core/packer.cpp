@@ -76,7 +76,6 @@ static bool is_xing_frame(const Mp3Frame& frame) {
 }
 
 struct ChosenBitrate {
-    int bitrate_kbps;
     bool padding;
     int data_size;
     int index;
@@ -103,12 +102,10 @@ static ChosenBitrate bytes_to_bitrate(MpegVersion version, int samplerate, Chann
         
         int unpadded_data_size = unpadded_frame_size - 4 - side_info_size;
         if (unpadded_data_size >= bytes) {
-            return {br, false, unpadded_data_size, index};
+            return {false, unpadded_data_size, index};
         }
-        
-        int padded_data_size = unpadded_frame_size + 1 - 4 - side_info_size;
-        if (padded_data_size >= bytes) {
-            return {br, true, padded_data_size, index};
+        if (unpadded_data_size + 1 >= bytes) {
+            return {true, unpadded_data_size + 1, index};
         }
     }
     
@@ -117,7 +114,7 @@ static ChosenBitrate bytes_to_bitrate(MpegVersion version, int samplerate, Chann
     int max_frame_size = (version == MpegVersion::MPEG1) ?
                          (144 * max_br * 1000 / samplerate) + 1 :
                          (72 * max_br * 1000 / samplerate) + 1;
-    return {max_br, true, max_frame_size - 4 - side_info_size, 14};
+    return {true, max_frame_size - 4 - side_info_size, 14};
 }
 
 void Packer::process(const std::string& input_file, const std::string& output_file) const {
@@ -134,10 +131,9 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
     }
     
     bool has_xing = false;
-    Mp3Frame xing_frame;
+    // Removed unused xing_frame here
     if (is_xing_frame(all_frames[0])) {
         has_xing = true;
-        xing_frame = all_frames[0];
         // Do NOT erase it! We must keep it to preserve the LAME tag!
         // all_frames.erase(all_frames.begin());
         std::cout << "Detected XING header frame at beginning. Preserving it." << std::endl;
@@ -337,7 +333,7 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
     // Write start junk (ID3v2)
     const auto& start_junk = reader.get_start_junk();
     if (!start_junk.empty()) {
-        out.write((char*)start_junk.data(), static_cast<std::streamsize>(start_junk.size()));
+        out.write(reinterpret_cast<const char*>(start_junk.data()), static_cast<std::streamsize>(start_junk.size()));
     }
     
     // Track where the Xing frame starts in the file
@@ -414,8 +410,8 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
     size_t global_main_data_ptr = 0;
     
     for (size_t i = 0; i < N_out; ++i) {
-        auto& frame = all_frames[i];
-        auto& side = optimized_side_info[i];
+        const auto& frame = all_frames[i];
+        const auto& side = optimized_side_info[i];
         
         ChosenBitrate bitrate_use = chosen_bitrates[i];
         
@@ -442,21 +438,21 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
             new_side = all_frames[i].side_info_raw;
         }
 
-        out.write((char*)head, 4);
-        out.write((char*)new_side.data(), static_cast<std::streamsize>(new_side.size()));
+        out.write(reinterpret_cast<const char*>(head), 4);
+        out.write(reinterpret_cast<const char*>(new_side.data()), static_cast<std::streamsize>(new_side.size()));
         
         int data_size = bitrate_use.data_size;
         int avail = static_cast<int>(global_main_data.size() - global_main_data_ptr);
         int write_len = std::min(data_size, avail);
         
         if (write_len > 0) {
-            out.write((char*)&global_main_data[global_main_data_ptr], write_len);
+            out.write(reinterpret_cast<const char*>(&global_main_data[global_main_data_ptr]), write_len);
             global_main_data_ptr += static_cast<size_t>(write_len);
         }
         
         if (data_size > write_len) {
             std::vector<uint8_t> pad(static_cast<size_t>(data_size - write_len), 0x00);
-            out.write((char*)pad.data(), static_cast<std::streamsize>(pad.size()));
+            out.write(reinterpret_cast<const char*>(pad.data()), static_cast<std::streamsize>(pad.size()));
         }
     }
     
@@ -466,15 +462,15 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
     // Write end junk (ID3v1)
     const auto& end_junk = reader.get_end_junk();
     if (!end_junk.empty()) {
-        out.write((char*)end_junk.data(), static_cast<std::streamsize>(end_junk.size()));
+        out.write(reinterpret_cast<const char*>(end_junk.data()), static_cast<std::streamsize>(end_junk.size()));
     }
     
     // Patch Xing header 'Bytes' field if present
     if (has_xing && xing_header_file_pos != 0) {
-        size_t total_mp3_bytes = mp3_end_pos - (xing_header_file_pos); // Size of the MP3 frame stream
+        // Scope reduced
         
         // Find where the Bytes field is in the Xing frame
-        auto& xing_main_data = all_frames[0].main_data_raw;
+        const auto& xing_main_data = all_frames[0].main_data_raw;
         if (xing_main_data.size() >= 12) {
             uint32_t flags = (static_cast<uint32_t>(xing_main_data[4]) << 24) | 
                              (static_cast<uint32_t>(xing_main_data[5]) << 16) | 
@@ -496,13 +492,14 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
                 size_t physical_bytes_pos = xing_header_file_pos + 4 + static_cast<size_t>(side_info_size) + bytes_offset;
                 
                 // Seek back and write the new size
+                size_t total_mp3_bytes = mp3_end_pos - xing_header_file_pos; // Size of the MP3 frame stream
                 out.seekp(static_cast<std::streamoff>(physical_bytes_pos), std::ios::beg);
                 uint8_t bytes_buf[4];
                 bytes_buf[0] = (total_mp3_bytes >> 24) & 0xFF;
                 bytes_buf[1] = (total_mp3_bytes >> 16) & 0xFF;
                 bytes_buf[2] = (total_mp3_bytes >> 8) & 0xFF;
                 bytes_buf[3] = (total_mp3_bytes >> 0) & 0xFF;
-                out.write((char*)bytes_buf, 4);
+                out.write(reinterpret_cast<const char*>(bytes_buf), 4);
                 
                 std::cout << "Patched Xing header Bytes field to " << total_mp3_bytes << " bytes." << std::endl;
             }

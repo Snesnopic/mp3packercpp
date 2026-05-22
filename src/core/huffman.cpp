@@ -46,12 +46,10 @@ private:
             
             int16_t val = *s.pos;
             if (val < 0) {
-                stack.push_back({s.pos + 1, s.code << 1, s.length + 1});
-                stack.push_back({s.pos + 1 - val, (s.code << 1) | 1, s.length + 1});
-            } else {
-                if (val >= 0 && val < 256) {
-                    arr[val] = {s.code, s.length, true};
-                }
+                stack.push_back({s.pos + 1, static_cast<uint32_t>(s.code << 1), static_cast<uint8_t>(s.length + 1)});
+                stack.push_back({s.pos + 1 - val, static_cast<uint32_t>((s.code << 1) | 1), static_cast<uint8_t>(s.length + 1)});
+            } else if (val < 256) {
+                arr[val] = {s.code, static_cast<uint8_t>(s.length), true};
             }
         }
         return arr;
@@ -290,7 +288,6 @@ HuffmanConfig HuffmanOptimizer::find_best_config(const std::vector<int16_t>& coe
     
     // Calculate cost of orig_config manually to see why it was rejected or overpriced
     int orig_bv = orig_config.big_values;
-    uint32_t orig_cost = 0;
     if (!orig_config.window_switching_flag && orig_bv <= max_possible_bv) {
         int r0 = std::min(orig_bv, sf_bands[orig_config.region0_count + 1] / 2);
         int r1 = std::min(orig_bv, sf_bands[orig_config.region0_count + orig_config.region1_count + 2] / 2);
@@ -311,11 +308,10 @@ HuffmanConfig HuffmanOptimizer::find_best_config(const std::vector<int16_t>& coe
             cur += 4;
         }
         
-        orig_cost = c0 + c1 + c2 + c1_cost;
+        uint32_t orig_cost = c0 + c1 + c2 + c1_cost;
         if (orig_cost >= 10000) orig_cost = 99999;
     }
     
-    //printf("find_best_config: min=%u, orig_cost=%u\n", min_total_bits, orig_cost);
     return best;
 }
 
