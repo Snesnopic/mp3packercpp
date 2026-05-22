@@ -62,11 +62,17 @@ static std::vector<uint8_t> serialize_side_info(const Mp3Header& h, const SideIn
 
 static uint32_t get_samplerate_index(const MpegVersion v, const int sr) {
     if (v == MpegVersion::MPEG1) {
-        if (sr == 44100) return 0; if (sr == 48000) return 1; if (sr == 32000) return 2;
+        if (sr == 44100) return 0;
+        if (sr == 48000) return 1;
+        if (sr == 32000) return 2;
     } else if (v == MpegVersion::MPEG2) {
-        if (sr == 22050) return 0; if (sr == 24000) return 1; if (sr == 16000) return 2;
+        if (sr == 22050) return 0;
+        if (sr == 24000) return 1;
+        if (sr == 16000) return 2;
     } else {
-        if (sr == 11025) return 0; if (sr == 12000) return 1; if (sr == 8000) return 2;
+        if (sr == 11025) return 0;
+        if (sr == 12000) return 1;
+        if (sr == 8000)  return 2;
     }
     return 0;
 }
