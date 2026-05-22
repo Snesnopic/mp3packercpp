@@ -5,9 +5,12 @@
 
 namespace mp3packer {
 
+/**
+ * @brief Represents an MPEG Huffman table configuration.
+ */
 struct HuffmanTable {
-    const int16_t* table = nullptr;
-    int linbits = 0;
+    const int16_t* table = nullptr; ///< Pointer to the hardcoded tree data array
+    int linbits = 0;                ///< Number of linbits for ESC value encoding
 };
 
 static constexpr int16_t tab0[] = { 0 };
@@ -29,6 +32,10 @@ static constexpr int16_t tab24[] = { -451,-117, -43, -25, -15, -7, -3, -1, 239, 
 static constexpr int16_t tab_c0[] = { -29, -21, -13, -7, -3, -1, 11, 15, -1, 13, 14, -3, -1, 7, 5, 9, -3, -1, 6, 3, -1, 10, 12, -3, -1, 2, 1, -1, 4, 8, 0 };
 static constexpr int16_t tab_c1[] = { -15, -7, -3, -1, 15, 14, -1, 13, 12, -3, -1, 11, 10, -1, 9, 8, -7, -3, -1, 7, 6, -1, 5, 4, -3, -1, 3, 2, -1, 1, 0 };
 
+/**
+ * @brief The 34 Huffman tables defined by the MPEG audio standard.
+ * Indices 0-31 are for the big_values region, 32-33 are for the count1 region.
+ */
 static constexpr HuffmanTable huffman_tables[34] = {
     {tab0, 0}, {tab1, 0}, {tab2, 0}, {tab3, 0}, {tab0, 0}, {tab5, 0}, {tab6, 0}, {tab7, 0},
     {tab8, 0}, {tab9, 0}, {tab10, 0}, {tab11, 0}, {tab12, 0}, {tab13, 0}, {tab0, 0}, {tab15, 0},
@@ -37,11 +44,17 @@ static constexpr HuffmanTable huffman_tables[34] = {
     {tab_c0, 0}, {tab_c1, 0}
 };
 
+/**
+ * @brief Maximum quantizer step size representable per table.
+ */
 static constexpr int max_quant_per_table[32] = {
     0, 1, 2, 2, -1, 3, 3, 5, 5, 5, 7, 7, 7, 15, -1, 15,
     16, 18, 22, 30, 78, 270, 1038, 8206, 30, 46, 78, 142, 270, 526, 2062, 8206
 };
 
+/**
+ * @brief Linbits configured per table (tables 16-31 only).
+ */
 static constexpr int linbits_per_table[32] = {
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
     1, 2, 3, 4, 6, 8, 10, 13, 4, 5, 6, 7, 8, 9, 11, 13

@@ -5,11 +5,16 @@
 
 namespace mp3packer {
 
+/**
+ * @brief Global logger configuration for mp3packercpp.
+ */
 class Logger {
 public:
 #ifndef NDEBUG
+    /** @brief Toggles debug logging output. Enabled by default in Debug builds. */
     static inline bool verbose = true;
 #else
+    /** @brief Toggles debug logging output. Disabled by default in Release builds. */
     static inline bool verbose = false;
 #endif
 };

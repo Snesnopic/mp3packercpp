@@ -157,7 +157,7 @@ HuffmanConfig HuffmanOptimizer::find_best_config(const std::vector<int16_t>& coe
     uint32_t min_total_bits = 0xFFFFFFFF;
     auto sf_bands = get_sf_bands(samplerate);
 
-    // 1. Pre-calculate bit costs for each coefficient pair in every table
+    // pre-calculate bit costs for each coefficient pair in every table
     std::vector<std::array<int, 32>> pair_costs(288);
     for (int p = 0; p < 288; ++p) {
         int x = std::abs(coeffs[2 * p]);
@@ -283,7 +283,7 @@ HuffmanConfig HuffmanOptimizer::find_best_config(const std::vector<int16_t>& coe
         }
     }
     
-    // Calculate cost of orig_config manually to see why it was rejected or overpriced
+    // calculate cost of orig_config manually to see why it was rejected or overpriced
     int orig_bv = orig_config.big_values;
     if (!orig_config.window_switching_flag && orig_bv <= max_possible_bv) {
         int r0 = std::min(orig_bv, sf_bands[orig_config.region0_count + 1] / 2);

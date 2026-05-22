@@ -37,7 +37,7 @@ void Mp3Reader::skip_id3v2_tag() {
                         static_cast<uint32_t>(header[9] & 0x7F);
 
         uint32_t total_tag_size = 10 + size;
-        if (header[5] & 0x10) { // Footer present flag
+        if (header[5] & 0x10) { // footer present flag
             total_tag_size += 10;
         }
 
@@ -63,7 +63,7 @@ std::optional<Mp3Header> Mp3Reader::parse_header(uint32_t header_bits) {
     }
 
     const int layer = (header_bits >> 17) & 3;
-    if (layer != 1) return std::nullopt; // Only Layer III
+    if (layer != 1) return std::nullopt; // only layer iii
 
     header.has_crc = !((header_bits >> 16) & 1);
 
@@ -74,9 +74,9 @@ std::optional<Mp3Header> Mp3Reader::parse_header(uint32_t header_bits) {
     if (samplerate_index == 3) return std::nullopt;
 
     static constexpr int samplerates[3][3] = {
-        {44100, 48000, 32000}, // MPEG 1
-        {22050, 24000, 16000}, // MPEG 2
-        {11025, 12000, 8000}   // MPEG 2.5
+        {44100, 48000, 32000}, // mpeg 1
+        {22050, 24000, 16000}, // mpeg 2
+        {11025, 12000, 8000}   // mpeg 2.5
     };
     header.samplerate = samplerates[static_cast<int>(header.version)][samplerate_index];
 
@@ -92,11 +92,11 @@ std::optional<Mp3Header> Mp3Reader::parse_header(uint32_t header_bits) {
     header.original = (header_bits >> 2) & 1;
     header.emphasis = static_cast<Emphasis>(header_bits & 3);
 
-    // Bitrate calculation
+    // bitrate calculation
     static const int bitrates[3][16] = {
-        {0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0}, // MPEG 1
-        {0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0},    // MPEG 2
-        {0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0}     // MPEG 2.5
+        {0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0}, // mpeg 1
+        {0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0},    // mpeg 2
+        {0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0}     // mpeg 2.5
     };
     header.bitrate.bitrate_kbps = bitrates[static_cast<int>(header.version)][bitrate_index];
     header.bitrate.padding = header.padding;
@@ -139,13 +139,13 @@ std::optional<Mp3Frame> Mp3Reader::read_next_frame() {
                                  (header->channel_mode == ChannelMode::Mono ? 9 : 17);
             
             if (header->has_crc) {
-                file_.ignore(2); // Skip CRC for now
+                file_.ignore(2); // skip crc for now
             }
 
             frame.side_info_raw.resize(static_cast<size_t>(side_info_size));
             file_.read(reinterpret_cast<char*>(frame.side_info_raw.data()), side_info_size);
 
-            // Parse Side Info
+            // parse side info
             BitstreamReader side_reader(frame.side_info_raw);
             SideInfo& si = frame.side_info;
             int num_channels = (header->channel_mode == ChannelMode::Mono) ? 1 : 2;
@@ -178,7 +178,7 @@ std::optional<Mp3Frame> Mp3Reader::read_next_frame() {
                         gi.block_type = static_cast<int>(side_reader.read_bits(2));
                         gi.mixed_block_flag = static_cast<int>(side_reader.read_bits(1));
                         for (int i = 0; i < 2; ++i) gi.table_select[i] = static_cast<int>(side_reader.read_bits(5));
-                        gi.table_select[2] = 0; // Not used
+                        gi.table_select[2] = 0; // not used
                         for (int & i : gi.subblock_gain) i = static_cast<int>(side_reader.read_bits(3));
                         
                         if (gi.block_type == 2 && gi.mixed_block_flag == 0) gi.region0_count = 8;
@@ -206,7 +206,7 @@ std::optional<Mp3Frame> Mp3Reader::read_next_frame() {
 
             return frame;
         }
-        // Invalid header found! Assume it's the start of end junk (like ID3v1 tag)
+        // invalid header found! assume it's the start of end junk (like id3v1 tag)
         file_.seekg(-4, std::ios::cur);
         size_t current_pos = static_cast<size_t>(file_.tellg());
         if (current_pos < file_size_) {

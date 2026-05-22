@@ -111,7 +111,7 @@ static ChosenBitrate bytes_to_bitrate(MpegVersion version, int samplerate, Chann
         }
     }
     
-    // Fallback to max bitrate if not found
+    // fallback to max bitrate if not found
     int max_br = bitrates[14];
     int max_frame_size = (version == MpegVersion::MPEG1) ?
                          (144 * max_br * 1000 / samplerate) + 1 :
@@ -133,10 +133,10 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
     }
     
     bool has_xing = false;
-    // Removed unused xing_frame here
+    // removed unused xing_frame here
     if (is_xing_frame(all_frames[0])) {
         has_xing = true;
-        // Do NOT erase it! We must keep it to preserve the LAME tag!
+        // do not erase it! we must keep it to preserve the lame tag!
         // all_frames.erase(all_frames.begin());
         DEBUG_LOG("Detected XING header frame at beginning. Preserving it.");
     }
@@ -172,19 +172,19 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
         data_reader.seek_bit(start_byte * 8);
 
         BitstreamWriter writer;
-        SideInfo side_copy = frame.side_info; // Backup in case we fallback
+        SideInfo side_copy = frame.side_info; // backup in case we fallback
         bool optimization_failed = false;
         
         try {
             if (!this->recompress_huffman) {
-                optimization_failed = true; // Fallback to raw copy of original data
+                optimization_failed = true; // fallback to raw copy of original data
             } else {
                 for (int gr = 0; gr < n_gr; ++gr) {
                 for (int ch = 0; ch < n_ch; ++ch) {
                     GrChInfo& g = frame.side_info.gr[gr][ch];
                     size_t gc_orig_start = data_reader.tell_bit();
 
-                    // Read Scalefactors
+                    // read scalefactors
                     int slen1 = 0, slen2 = 0;
                     if (frame.header.version == MpegVersion::MPEG1) {
                         if (g.window_switching_flag && g.block_type == 2) {
@@ -236,7 +236,7 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
                         }
                     }
 
-                    // Decode & Optimize Huffman
+                    // decode & optimize huffman
                     HuffmanConfig orig_cfg = {
                         g.region0_count,
                         g.region1_count,
@@ -252,7 +252,7 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
                     auto coeffs = HuffmanOptimizer::decode_quantized_coefficients(orig_cfg, data_reader, frame.header.samplerate);
                     auto best_cfg = HuffmanOptimizer::find_best_config(coeffs, orig_cfg, frame.header.samplerate);
                     
-                    // Re-encode
+                    // re-encode
                     size_t out_start = writer.tell_bit();
                     if (g.window_switching_flag && g.block_type == 2) {
                         if (g.mixed_block_flag) {
@@ -279,7 +279,7 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
                     }
                     HuffmanOptimizer::encode_quantized_coefficients(coeffs, best_cfg, writer, frame.header.samplerate);
                     
-                    // Update side info
+                    // update side info
                     g.big_values = best_cfg.big_values;
                     g.region0_count = best_cfg.region0_count;
                     g.region1_count = best_cfg.region1_count;
@@ -308,7 +308,7 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
 
         std::vector<uint8_t> new_main = writer.data();
         if (optimization_failed || new_main.size() > static_cast<size_t>(total_orig_bytes)) {
-            // Fallback to original main data
+            // fallback to original main data
             new_main.assign(global_res.begin() + start_byte, global_res.begin() + start_byte + total_orig_bytes);
             frame.side_info = side_copy;
         }
@@ -319,7 +319,7 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
     
     DEBUG_LOG("Huffman optimization completed. Running reservoir constraint solver...");
     
-    // Backward Pass (Constraint Solver for Carry-over Reservoir)
+    // backward pass (constraint solver for carry-over reservoir)
     MpegVersion version = all_frames[0].header.version;
     int samplerate = all_frames[0].header.samplerate;
     ChannelMode channel_mode = all_frames[0].header.channel_mode;
@@ -331,23 +331,23 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
         throw std::runtime_error("Could not open output file: " + output_file);
     }
     
-    // Write start junk (ID3v2)
+    // write start junk (id3v2)
     const auto& start_junk = reader.get_start_junk();
     if (!start_junk.empty()) {
         out.write(reinterpret_cast<const char*>(start_junk.data()), static_cast<std::streamsize>(start_junk.size()));
     }
     
-    // Track where the Xing frame starts in the file
-    size_t xing_header_file_pos = out.tellp(); // Usually right after ID3v2
+    // track where the xing frame starts in the file
+    size_t xing_header_file_pos = out.tellp(); // usually right after id3v2
     if (!has_xing) xing_header_file_pos = 0;
     
-    // Backward Pass Constraint Solver
+    // backward pass constraint solver
     std::vector<int> required_carryover(N, 0);
     int current_req = 0;
     for (int i = static_cast<int>(N) - 1; i >= 0; --i) {
         int space_needed = static_cast<int>(optimized_main_data[i].size()) + current_req;
         
-        // We allow the forward pass to use up to 320 kbps if needed, so the backward pass should assume max capacity.
+        // we allow the forward pass to use up to 320 kbps if needed, so the backward pass should assume max capacity.
         ChosenBitrate max_br = bytes_to_bitrate(version, samplerate, channel_mode, 9999);
         int max_data_per_frame = max_br.data_size;
         
@@ -360,7 +360,7 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
     
     std::vector<ChosenBitrate> chosen_bitrates(N);
     
-    // Pass 1: Build global_main_data and calculate main_data_begin
+    // pass 1: build global_main_data and calculate main_data_begin
     for (size_t i = 0; i < N; ++i) {
         auto& side = optimized_side_info[i];
         
@@ -369,7 +369,7 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
         if (current_reservoir > max_reservoir) {
             int stuffing_len = current_reservoir - max_reservoir;
             for (int j = 0; j < stuffing_len; ++j) {
-                global_main_data.push_back(0xFF); // Stuffing byte
+                global_main_data.push_back(0xFF); // stuffing byte
             }
             current_reservoir = max_reservoir;
         }
@@ -377,8 +377,8 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
         side.main_data_begin = static_cast<uint16_t>(current_reservoir);
         global_main_data.insert(global_main_data.end(), optimized_main_data[i].begin(), optimized_main_data[i].end());
         
-        // VBR Logic: Pick the smallest bitrate that gives us enough data_size
-        // We must ensure that we leave at least required_carryover[i + 1] in the reservoir for the NEXT frames!
+        // vbr logic: pick the smallest bitrate that gives us enough data_size
+        // we must ensure that we leave at least required_carryover[i + 1] in the reservoir for the next frames!
         int req_for_next = (i + 1 < N) ? required_carryover[i + 1] : 0;
         int bytes_to_store = std::max(0, static_cast<int>(optimized_main_data[i].size()) + req_for_next - current_reservoir);
         ChosenBitrate bitrate_use = bytes_to_bitrate(version, samplerate, channel_mode, bytes_to_store);
@@ -394,8 +394,8 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
         global_main_data.insert(global_main_data.end(), end_pad.begin(), end_pad.end());
     }
     
-    // Pass 2: Write physical file
-    // Find the last frame that actually contains non-zero data
+    // pass 2: write physical file
+    // find the last frame that actually contains non-zero data
     size_t N_out = N;
     for (int i = static_cast<int>(N) - 1; i >= 0; --i) {
         if (chosen_bitrates[i].index == 14) {
@@ -457,20 +457,20 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
         }
     }
     
-    // Save position before end_junk to calculate total MP3 stream size
+    // save position before end_junk to calculate total mp3 stream size
     size_t mp3_end_pos = static_cast<size_t>(out.tellp());
     
-    // Write end junk (ID3v1)
+    // write end junk (id3v1)
     const auto& end_junk = reader.get_end_junk();
     if (!end_junk.empty()) {
         out.write(reinterpret_cast<const char*>(end_junk.data()), static_cast<std::streamsize>(end_junk.size()));
     }
     
-    // Patch Xing header 'Bytes' field if present
+    // patch xing header 'bytes' field if present
     if (has_xing && xing_header_file_pos != 0) {
-        // Scope reduced
+        // scope reduced
         
-        // Find where the Bytes field is in the Xing frame
+        // find where the bytes field is in the xing frame
         const auto& xing_main_data = all_frames[0].main_data_raw;
         if (xing_main_data.size() >= 12) {
             uint32_t flags = (static_cast<uint32_t>(xing_main_data[4]) << 24) | 
@@ -478,22 +478,22 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
                              (static_cast<uint32_t>(xing_main_data[6]) << 8) | 
                              static_cast<uint32_t>(xing_main_data[7]);
                              
-            if (flags & 2) { // Bytes field is present
+            if (flags & 2) { // bytes field is present
                 size_t bytes_offset = 8;
-                if (flags & 1) { // Frames field is also present before Bytes
+                if (flags & 1) { // frames field is also present before bytes
                     bytes_offset += 4;
                 }
                 
-                // Calculate physical file position of the Bytes field
-                // It is after the MP3 Header (4 bytes) + Side Info size
+                // calculate physical file position of the bytes field
+                // it is after the mp3 header (4 bytes) + side info size
                     int side_info_size = (version == MpegVersion::MPEG1) ? 
                                          (channel_mode == ChannelMode::Mono ? 17 : 32) :
                                          (channel_mode == ChannelMode::Mono ? 9 : 17);
                                      
                 size_t physical_bytes_pos = xing_header_file_pos + 4 + static_cast<size_t>(side_info_size) + bytes_offset;
                 
-                // Seek back and write the new size
-                size_t total_mp3_bytes = mp3_end_pos - xing_header_file_pos; // Size of the MP3 frame stream
+                // seek back and write the new size
+                size_t total_mp3_bytes = mp3_end_pos - xing_header_file_pos; // size of the mp3 frame stream
                 out.seekp(static_cast<std::streamoff>(physical_bytes_pos), std::ios::beg);
                 uint8_t bytes_buf[4];
                 bytes_buf[0] = (total_mp3_bytes >> 24) & 0xFF;
