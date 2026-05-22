@@ -34,8 +34,8 @@ int main(int argc, const char* argv[]) {
     try {
         mp3packer::Packer packer;
         packer.recompress_huffman = recompress_huffman;
-        packer.process(input, output);
-        std::cout << "Successfully packed " << input << " into " << output << "\n";
+        packer.process(input.string(), output.string());
+        std::cout << "Successfully packed " << input.string() << " into " << output.string() << "\n";
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << "\n";
         return EXIT_FAILURE;

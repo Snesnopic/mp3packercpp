@@ -294,7 +294,7 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
                 }
             }
             }
-        } catch (const std::exception& _) {
+        } catch (const std::exception&) {
             optimization_failed = true;
         }
 
