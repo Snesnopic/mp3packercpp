@@ -1,4 +1,5 @@
-#pragma once
+#ifndef MP3PACKERCPP_BITSTREAM_HPP
+#define MP3PACKERCPP_BITSTREAM_HPP
 
 #include <vector>
 #include <cstdint>
@@ -74,3 +75,5 @@ private:
 };
 
 } // namespace mp3packer
+
+#endif // MP3PACKERCPP_BITSTREAM_HPP

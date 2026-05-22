@@ -1,8 +1,7 @@
-#pragma once
+#ifndef MP3PACKERCPP_HUFFMAN_TABLES_HPP
+#define MP3PACKERCPP_HUFFMAN_TABLES_HPP
 
 #include <cstdint>
-#include <vector>
-#include <array>
 
 namespace mp3packer {
 
@@ -49,3 +48,5 @@ static constexpr int linbits_per_table[32] = {
 };
 
 } // namespace mp3packer
+
+#endif // MP3PACKERCPP_HUFFMAN_TABLES_HPP

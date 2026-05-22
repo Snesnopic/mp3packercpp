@@ -1,4 +1,5 @@
-#pragma once
+#ifndef MP3PACKERCPP_TYPES_HPP
+#define MP3PACKERCPP_TYPES_HPP
 
 #include <vector>
 
@@ -64,3 +65,5 @@ struct Mp3Frame {
 };
 
 } // namespace mp3packer
+
+#endif // MP3PACKERCPP_TYPES_HPP

@@ -1,4 +1,5 @@
-#pragma once
+#ifndef MP3PACKERCPP_MP3_READER_HPP
+#define MP3PACKERCPP_MP3_READER_HPP
 
 #include "types.hpp"
 #include <fstream>
@@ -30,3 +31,5 @@ private:
 };
 
 } // namespace mp3packer
+
+#endif // MP3PACKERCPP_MP3_READER_HPP

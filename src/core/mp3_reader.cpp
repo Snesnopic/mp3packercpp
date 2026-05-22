@@ -72,7 +72,7 @@ std::optional<Mp3Header> Mp3Reader::parse_header(uint32_t header_bits) {
     int samplerate_index = (header_bits >> 10) & 3;
     if (samplerate_index == 3) return std::nullopt;
 
-    static const int samplerates[3][3] = {
+    static constexpr int samplerates[3][3] = {
         {44100, 48000, 32000}, // MPEG 1
         {22050, 24000, 16000}, // MPEG 2
         {11025, 12000, 8000}   // MPEG 2.5
