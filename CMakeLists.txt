@@ -12,8 +12,22 @@ elseif(MSVC)
     add_compile_options(/W4)
 endif()
 
-set(CMAKE_BUILD_TYPE Release)
-set(CMAKE_CXX_FLAGS "-O3 -march=native")
+# Default to Release if not specified
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+  set(CMAKE_BUILD_TYPE "Release" CACHE STRING "Choose the type of build." FORCE)
+endif()
+
+# Release flags
+set(CMAKE_CXX_FLAGS_RELEASE "-O3 -march=native -DNDEBUG")
+
+# Debug flags
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    set(CMAKE_CXX_FLAGS_DEBUG "-O0 -g3 -fsanitize=address -fno-omit-frame-pointer")
+    set(CMAKE_EXE_LINKER_FLAGS_DEBUG "-fsanitize=address")
+elseif(MSVC)
+    # MSVC support for ASan requires specific setup, but these are standard flags
+    set(CMAKE_CXX_FLAGS_DEBUG "/Zi /Od /fsanitize=address")
+endif()
 
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
