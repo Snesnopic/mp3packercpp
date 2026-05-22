@@ -264,7 +264,8 @@ HuffmanConfig HuffmanOptimizer::find_best_config(const std::vector<int16_t>& coe
             if (r0_bits >= 10000) continue;
 
             for (int r1_idx = 0; r1_idx < 8; ++r1_idx) {
-                int r1_end = std::min(bv, sf_bands[r0_idx + r1_idx + 2] / 2);
+                int idx = std::min(r0_idx + r1_idx + 2, static_cast<int>(sf_bands.size()) - 1);
+                int r1_end = std::min(bv, sf_bands[idx] / 2);
                 int t1;
                 uint32_t r1_bits = get_best_region(r0_end, r1_end, t1);
                 if (r1_bits >= 10000) continue;

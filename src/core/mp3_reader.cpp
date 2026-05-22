@@ -54,7 +54,7 @@ std::optional<Mp3Header> Mp3Reader::parse_header(uint32_t header_bits) {
     if ((header_bits & 0xFFE00000) != 0xFFE00000) return std::nullopt;
 
     Mp3Header header{};
-    int id = (header_bits >> 19) & 3;
+    const int id = (header_bits >> 19) & 3;
     switch (id) {
         case 0: header.version = MpegVersion::MPEG25; break;
         case 2: header.version = MpegVersion::MPEG2; break;
@@ -62,15 +62,15 @@ std::optional<Mp3Header> Mp3Reader::parse_header(uint32_t header_bits) {
         default: return std::nullopt;
     }
 
-    int layer = (header_bits >> 17) & 3;
+    const int layer = (header_bits >> 17) & 3;
     if (layer != 1) return std::nullopt; // Only Layer III
 
     header.has_crc = !((header_bits >> 16) & 1);
 
-    int bitrate_index = (header_bits >> 12) & 0xF;
+    const int bitrate_index = (header_bits >> 12) & 0xF;
     if (bitrate_index == 0 || bitrate_index == 15) return std::nullopt;
 
-    int samplerate_index = (header_bits >> 10) & 3;
+    const int samplerate_index = (header_bits >> 10) & 3;
     if (samplerate_index == 3) return std::nullopt;
 
     static constexpr int samplerates[3][3] = {

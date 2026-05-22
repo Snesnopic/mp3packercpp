@@ -147,7 +147,14 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
     std::vector<std::vector<uint8_t>> optimized_main_data(N);
     std::vector<SideInfo> optimized_side_info(N);
     
-    std::vector<uint8_t> in_res;
+    std::vector<uint8_t> global_res;
+    std::vector<size_t> frame_main_starts(N);
+    for (size_t i = 0; i < N; ++i) {
+        frame_main_starts[i] = global_res.size();
+        global_res.insert(global_res.end(), all_frames[i].main_data_raw.begin(), all_frames[i].main_data_raw.end());
+    }
+
+    #pragma omp parallel for
     for (size_t i = 0; i < N; ++i) {
         if (has_xing && i == 0) {
             optimized_main_data[i] = all_frames[i].main_data_raw;
@@ -155,13 +162,12 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
             continue;
         }
         auto& frame = all_frames[i];
-        in_res.insert(in_res.end(), frame.main_data_raw.begin(), frame.main_data_raw.end());
 
         int n_ch = (frame.header.channel_mode == ChannelMode::Mono) ? 1 : 2;
         int n_gr = (frame.header.version == MpegVersion::MPEG1) ? 2 : 1;
 
-        BitstreamReader data_reader(in_res);
-        size_t frame_main_start = in_res.size() - frame.main_data_raw.size();
+        BitstreamReader data_reader(global_res);
+        size_t frame_main_start = frame_main_starts[i];
         size_t start_byte = (frame_main_start >= static_cast<size_t>(frame.side_info.main_data_begin)) ? (frame_main_start - static_cast<size_t>(frame.side_info.main_data_begin)) : 0;
         data_reader.seek_bit(start_byte * 8);
 
@@ -303,18 +309,12 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
         std::vector<uint8_t> new_main = writer.data();
         if (optimization_failed || new_main.size() > static_cast<size_t>(total_orig_bytes)) {
             // Fallback to original main data
-            new_main.assign(in_res.begin() + start_byte, in_res.begin() + start_byte + total_orig_bytes);
+            new_main.assign(global_res.begin() + start_byte, global_res.begin() + start_byte + total_orig_bytes);
             frame.side_info = side_copy;
         }
 
         optimized_main_data[i] = new_main;
         optimized_side_info[i] = frame.side_info;
-
-        // Keep in_res bounded
-        if (in_res.size() > 1024) {
-            size_t erase_bytes = in_res.size() - 1024;
-            in_res.erase(in_res.begin(), in_res.begin() + erase_bytes);
-        }
     }
     
     DEBUG_LOG("Huffman optimization completed. Running reservoir constraint solver...");
