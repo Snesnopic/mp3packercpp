@@ -64,7 +64,7 @@ jobs:
             asset_name: mp3packercpp-linux-x86
 
           - name: macOS Intel
-            os: macos-13
+            os: macos-15-intel
             arch: x64
             asset_name: mp3packercpp-darwin-x64
 
@@ -74,7 +74,7 @@ jobs:
             asset_name: mp3packercpp-darwin-arm64
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Dependencies
         if: matrix.install_deps
@@ -116,7 +116,7 @@ jobs:
             release: '15.0'
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Build in VM
         uses: vmactions/freebsd-vm@v1

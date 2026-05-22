@@ -3,6 +3,7 @@
 
 #include <vector>
 #include <stdexcept>
+#include <cstdint>
 
 namespace mp3packer {
 
