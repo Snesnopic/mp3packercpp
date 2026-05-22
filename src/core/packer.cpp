@@ -1,9 +1,9 @@
-#include "packer.hpp"
-#include "huffman.hpp"
-#include "logger.hpp"
-#include "mp3_reader.hpp"
-#include "huffman.hpp"
-#include "bitstream.hpp"
+#include "include/packer.hpp"
+#include "include/huffman.hpp"
+#include "include/logger.hpp"
+#include "include/mp3_reader.hpp"
+#include "include/huffman.hpp"
+#include "include/bitstream.hpp"
 #include <iostream>
 #include <algorithm>
 #include <vector>

@@ -1,7 +1,7 @@
 #ifndef MP3PACKERCPP_MP3_READER_HPP
 #define MP3PACKERCPP_MP3_READER_HPP
 
-#include "../types.hpp"
+#include "types.hpp"
 #include <fstream>
 #include <vector>
 #include <optional>

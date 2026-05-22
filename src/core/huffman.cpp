@@ -1,5 +1,5 @@
-#include "huffman.hpp"
-#include "huffman_tables.hpp"
+#include "include/huffman.hpp"
+#include "include/huffman_tables.hpp"
 #include <map>
 #include <algorithm>
 #include <iostream>

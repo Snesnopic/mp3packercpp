@@ -1,8 +1,8 @@
-#include "mp3_reader.hpp"
-#include "logger.hpp"
+#include "include/mp3_reader.hpp"
+#include "include/logger.hpp"
 #include <iostream>
 
-#include "bitstream.hpp"
+#include "include/bitstream.hpp"
 
 namespace mp3packer {
 

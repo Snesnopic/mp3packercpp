@@ -1,6 +1,6 @@
 #include <filesystem>
 #include <iostream>
-#include "packer.hpp"
+#include "../core/include/packer.hpp"
 
 void printUsage() {
     std::cout << "Usage: mp3packercpp [-z] <input.mp3> <output.mp3>\n";
