@@ -20,6 +20,9 @@ public:
     /** @brief If true, applies aggressive Huffman tree re-encoding (brute-force). */
     bool recompress_huffman = false;
     
+    /** @brief Number of threads to use. If 0, uses auto-detection. */
+    unsigned int num_threads = 0;
+    
     /**
      * @brief Processes an input MP3 file and writes the optimized result to an output file.
      * @param input_file Path to the source MP3 file.

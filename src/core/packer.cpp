@@ -9,6 +9,8 @@
 #include <vector>
 #include <fstream>
 #include <stdexcept>
+#include <atomic>
+#include <thread>
 
 namespace mp3packer {
 
@@ -160,9 +162,16 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
         global_res.insert(global_res.end(), all_frames[i].main_data_raw.begin(), all_frames[i].main_data_raw.end());
     }
 
-    #pragma omp parallel for
-    for (int i = 0; i < static_cast<int>(N); ++i) {
-        if (has_xing && i == 0) {
+    std::atomic<size_t> current_frame{0};
+    unsigned int active_threads = this->num_threads > 0 ? this->num_threads : std::thread::hardware_concurrency();
+    if (active_threads == 0) active_threads = 4;
+
+    auto worker = [&]() {
+        while (true) {
+            size_t i = current_frame.fetch_add(1);
+            if (i >= N) break;
+
+            if (has_xing && i == 0) {
             optimized_main_data[i] = all_frames[i].main_data_raw;
             optimized_side_info[i] = all_frames[i].side_info;
             continue;
@@ -321,6 +330,15 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
 
         optimized_main_data[i] = new_main;
         optimized_side_info[i] = frame.side_info;
+        }
+    };
+
+    std::vector<std::thread> threads;
+    for (unsigned int t = 0; t < active_threads; ++t) {
+        threads.emplace_back(worker);
+    }
+    for (auto& thread : threads) {
+        thread.join();
     }
     
     DEBUG_LOG("Huffman optimization completed. Running reservoir constraint solver...");

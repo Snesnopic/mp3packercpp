@@ -3,11 +3,13 @@
 #include "../core/include/packer.hpp"
 
 void printUsage() {
-    std::cout << "Usage: mp3packercpp [-z] <input.mp3> <output.mp3>\n";
-    std::cout << "  -z : Recompress frames to find optimal Huffman settings (takes time)\n";
+    std::cout << "Usage: mp3packercpp [-z] [-t threads] <input.mp3> <output.mp3>\n";
+    std::cout << "  -z         : Recompress frames to find optimal Huffman settings (takes time)\n";
+    std::cout << "  -t threads : Number of threads to use (default: auto)\n";
 }
 int main(int argc, const char* argv[]) {
     bool recompress_huffman = false;
+    int num_threads = 0;
     std::filesystem::path input;
     std::filesystem::path output;
 
@@ -15,6 +17,14 @@ int main(int argc, const char* argv[]) {
         std::string arg = argv[i];
         if (arg == "-z") {
             recompress_huffman = true;
+        } else if (arg == "-t") {
+            if (i + 1 < argc) {
+                num_threads = std::stoi(argv[++i]);
+            } else {
+                std::cerr << "Missing value for -t\n";
+                printUsage();
+                return EXIT_FAILURE;
+            }
         } else if (input.empty()) {
             input = arg;
         } else if (output.empty()) {
@@ -34,6 +44,7 @@ int main(int argc, const char* argv[]) {
     try {
         mp3packer::Packer packer;
         packer.recompress_huffman = recompress_huffman;
+        packer.num_threads = num_threads > 0 ? num_threads : 0;
         packer.process(input.string(), output.string());
         std::cout << "Successfully packed " << input.string() << " into " << output.string() << "\n";
     } catch (const std::exception& e) {
