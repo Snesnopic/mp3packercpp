@@ -36,7 +36,7 @@ public:
      * @param samplerate Sampling rate of the frame.
      * @return A vector of exactly 576 decoded integer coefficients.
      */
-    static std::vector<int16_t> decode_quantized_coefficients(const HuffmanConfig& config, BitstreamReader& reader, int samplerate);
+    static std::vector<int16_t> decode_quantized_coefficients(const HuffmanConfig& config, BitstreamReader& reader, int samplerate, size_t bit_limit);
 
     /**
      * @brief Performs brute-force search to find the optimal Huffman table combination.

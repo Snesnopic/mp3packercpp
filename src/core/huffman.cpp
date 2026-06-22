@@ -80,7 +80,7 @@ static std::vector<int> get_sf_bands_short(int samplerate) {
 
 HuffmanOptimizer::HuffmanOptimizer() = default;
 
-std::vector<int16_t> HuffmanOptimizer::decode_quantized_coefficients(const HuffmanConfig& config, BitstreamReader& reader, int samplerate) {
+std::vector<int16_t> HuffmanOptimizer::decode_quantized_coefficients(const HuffmanConfig& config, BitstreamReader& reader, int samplerate, size_t bit_limit) {
     std::vector<int16_t> coeffs(576, 0);
     int out_off = 0;
     const auto sf_bands = get_sf_bands(samplerate);
@@ -137,7 +137,7 @@ std::vector<int16_t> HuffmanOptimizer::decode_quantized_coefficients(const Huffm
     decode_region(r2_pairs, config.table2);
 
     int count1_table = config.count1_table_select ? 33 : 32;
-    while (out_off <= 572 && !reader.eof()) {
+    while (out_off <= 572 && reader.get_bits_read() < bit_limit) {
         int got = decode_symbol(count1_table);
         if (got == 0 && reader.eof()) break;
         coeffs[out_off++] = (got & 8) ? (reader.read_bits(1) ? -1 : 1) : 0;
@@ -277,7 +277,7 @@ HuffmanConfig HuffmanOptimizer::find_best_config(const std::vector<int16_t>& coe
                 uint32_t total = r0_bits + r1_bits + r2_bits + c1_min_bits[bv];
                 if (total < min_total_bits) {
                     min_total_bits = total;
-                    best = {r0_idx, r1_idx, bv, t0, t1, t2, false, c1_best_is_33[bv], 0, 0};
+                    best = {r0_idx, r1_idx, bv, t0, t1, t2, c1_best_is_33[bv], false, 0, 0};
                 }
             }
         }

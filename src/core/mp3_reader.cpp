@@ -139,7 +139,7 @@ std::optional<Mp3Frame> Mp3Reader::read_next_frame() {
                                  (header->channel_mode == ChannelMode::Mono ? 9 : 17);
             
             if (header->has_crc) {
-                file_.ignore(2); // skip crc for now
+                file_.read(reinterpret_cast<char*>(frame.crc_raw), 2);
             }
 
             frame.side_info_raw.resize(static_cast<size_t>(side_info_size));

@@ -88,6 +88,7 @@ struct SideInfo {
  */
 struct Mp3Frame {
     Mp3Header header{};                  ///< Parsed frame header
+    uint8_t crc_raw[2] = {0, 0};         ///< Raw CRC bytes if present
     SideInfo side_info{};                ///< Parsed side information
     std::vector<uint8_t> side_info_raw{};///< Raw bytes of the side info section
     std::vector<uint8_t> main_data_raw{};///< Raw bytes of the main data (payload)
