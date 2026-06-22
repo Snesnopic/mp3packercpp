@@ -1,0 +1,84 @@
+name: CI Tests
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+
+jobs:
+  build_and_test:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Set up CMake
+      uses: jwlawson/actions-setup-cmake@v1.13
+      with:
+        cmake-version: '3.21.x'
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y lame ffmpeg mp3val
+
+    - name: Build mp3packercpp
+      run: |
+        mkdir -p build
+        cd build
+        cmake ..
+        cmake --build . -j $(nproc)
+
+    - name: Generate Test Audio
+      run: |
+        # Generate a 5-second sine wave
+        ffmpeg -y -f lavfi -i "sine=frequency=1000:duration=5" test_tone.wav
+        
+        # Encode with CRC (-p) and VBR (-V 2) to force Xing tag and gapless info
+        lame -p -V 2 test_tone.wav test_original.mp3
+
+    - name: Process with mp3packercpp
+      run: |
+        ./build/bin/mp3packercpp -z test_original.mp3 test_packed.mp3
+
+    - name: Verify Audio Fidelity (Lossless Check)
+      run: |
+        echo "Decoding audio to WAV using LAME..."
+        lame --decode test_original.mp3 orig.wav
+        lame --decode test_packed.mp3 packed.wav
+        
+        echo "Comparing LAME decoded PCM data..."
+        if cmp -s orig.wav packed.wav; then
+          echo "SUCCESS: The LAME decoded audio is bit-perfect!"
+        else
+          echo "ERROR: The LAME decoded audio differs!"
+          exit 1
+        fi
+        
+        echo "Decoding audio to WAV using FFmpeg..."
+        ffmpeg -y -v error -i test_original.mp3 orig_ff.wav
+        ffmpeg -y -v error -i test_packed.mp3 packed_ff.wav
+        
+        echo "Comparing FFmpeg decoded PCM data..."
+        if cmp -s orig_ff.wav packed_ff.wav; then
+          echo "SUCCESS: The FFmpeg decoded audio is bit-perfect!"
+        else
+          echo "ERROR: The FFmpeg decoded audio differs!"
+          exit 1
+        fi
+
+    - name: Verify Structural Integrity and CRC
+      run: |
+        # mp3val checks the MPEG frame headers, CRC validity, and overall stream integrity
+        mp3val test_packed.mp3 > mp3val_report.txt
+        cat mp3val_report.txt
+        
+        # If mp3val reports "WARNING" or "ERROR", we should fail the test
+        if grep -q "WARNING\|ERROR" mp3val_report.txt; then
+          echo "ERROR: mp3val detected structural issues or bad CRC!"
+          exit 1
+        else
+          echo "SUCCESS: MP3 structure and CRCs are valid."
+        fi
