@@ -75,8 +75,9 @@ jobs:
         mp3val test_packed.mp3 > mp3val_report.txt
         cat mp3val_report.txt
         
-        # If mp3val reports "WARNING" or "ERROR", we should fail the test
-        if grep -q "WARNING\|ERROR" mp3val_report.txt; then
+        # fail only on real structural/CRC issues; ignore the cosmetic
+        # "No supported tags" warning that mp3val emits for tagless files
+        if grep -E "WARNING|ERROR" mp3val_report.txt | grep -v "No supported tags" | grep -q .; then
           echo "ERROR: mp3val detected structural issues or bad CRC!"
           exit 1
         else
