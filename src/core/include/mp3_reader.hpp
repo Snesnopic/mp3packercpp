@@ -60,7 +60,7 @@ private:
      * @param header The parsed header for the frame.
      * @return The frame size in bytes.
      */
-    static int calculate_frame_size(const Mp3Header& header);
+    static uint16_t calculate_frame_size(const Mp3Header& header);
 
     /**
      * @brief Identifies and skips over an ID3v2 tag if present at the current position.

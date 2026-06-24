@@ -9,66 +9,66 @@ namespace mp3packer {
 /**
  * @brief Specifies the MPEG audio version.
  */
-enum class MpegVersion { MPEG1, MPEG2, MPEG25 };
+enum class MpegVersion : uint8_t { MPEG1, MPEG2, MPEG25 };
 
 /**
  * @brief Specifies the audio channel mode.
  */
-enum class ChannelMode { Stereo, JointStereo, DualChannel, Mono };
+enum class ChannelMode : uint8_t { Stereo, JointStereo, DualChannel, Mono };
 
 /**
  * @brief Specifies the emphasis mode used for the audio.
  */
-enum class Emphasis { None, _50_15, Reserved, CCITT };
+enum class Emphasis : uint8_t { None, _50_15, Reserved, CCITT };
 
 /**
  * @brief Holds physical and logical information about a specific bitrate configuration.
  */
 struct BitrateInfo {
-    int bitrate_kbps;  ///< Nominal bitrate in kilobits per second
-    int frame_size;    ///< Size of the frame in bytes (calculated including padding)
-    int data_size;     ///< Size of the data payload excluding headers
-    bool padding;      ///< True if padding bit is set for this frame
-    int index;         ///< Index of the bitrate in the MPEG bitrate table
+    uint16_t bitrate_kbps = 0; ///< Nominal bitrate in kilobits per second
+    uint16_t frame_size = 0;   ///< Size of the frame in bytes (including padding)
+    uint16_t data_size = 0;    ///< Size of the data payload excluding headers
+    bool padding = false;      ///< True if padding bit is set for this frame
+    uint8_t index = 0;         ///< Index of the bitrate in the MPEG bitrate table
 };
 
 /**
  * @brief Represents the decoded 32-bit MPEG audio frame header.
  */
 struct Mp3Header {
-    MpegVersion version;       ///< MPEG version
-    bool has_crc;              ///< True if a CRC check follows the header
-    BitrateInfo bitrate;       ///< Information about frame bitrate and sizes
-    int samplerate;            ///< Sampling frequency in Hz
-    bool padding;              ///< Padding bit
-    bool private_bit;          ///< Private bit for application-specific triggers
-    ChannelMode channel_mode;  ///< Audio channel mode
-    bool ms_stereo;            ///< True if Middle/Side stereo is enabled (Joint Stereo)
-    bool is_stereo;            ///< True if Intensity stereo is enabled (Joint Stereo)
-    bool copyright;            ///< Copyright bit
-    bool original;             ///< Original/Copy bit
-    Emphasis emphasis;         ///< Emphasis indicator
+    MpegVersion version = MpegVersion::MPEG1; ///< MPEG version
+    bool has_crc = false;                      ///< True if a CRC check follows the header
+    BitrateInfo bitrate;                       ///< Information about frame bitrate and sizes
+    uint32_t samplerate = 0;                   ///< Sampling frequency in Hz
+    bool padding = false;                      ///< Padding bit
+    bool private_bit = false;                  ///< Private bit for application-specific triggers
+    ChannelMode channel_mode = ChannelMode::Mono; ///< Audio channel mode
+    bool ms_stereo = false;   ///< True if Middle/Side stereo is enabled (Joint Stereo)
+    bool is_stereo = false;   ///< True if Intensity stereo is enabled (Joint Stereo)
+    bool copyright = false;   ///< Copyright bit
+    bool original = false;    ///< Original/Copy bit
+    Emphasis emphasis = Emphasis::None; ///< Emphasis indicator
 };
 
 /**
  * @brief Decoding information for a specific granule and channel.
  */
 struct GrChInfo {
-    int part2_3_length = 0;        ///< Length of scalefactors and main data in bits
-    int big_values = 0;            ///< Number of large spectral values divided by 2
-    int global_gain = 0;           ///< Quantization step size
-    int scalefac_compress = 0;     ///< Defines the number of bits used for scalefactors
-    int window_switching_flag = 0; ///< True if block type is not normal (0)
-    int block_type = 0;            ///< 0: normal, 1: start, 2: short, 3: end
-    int mixed_block_flag = 0;      ///< True if low frequencies are long blocks and high are short
-    int table_select[3] = {0, 0, 0}; ///< Huffman table indices for the three regions
-    int subblock_gain[3] = {0, 0, 0};///< Gain offset for short blocks
-    int region0_count = 0;         ///< Size of the first scalefactor band region
-    int region1_count = 0;         ///< Size of the second scalefactor band region
-    int preflag = 0;               ///< Pre-emphasis flag
-    int scalefac_scale = 0;        ///< Scale of the scalefactors
-    int count1table_select = 0;    ///< Huffman table index for the count1 region
-    std::vector<int> scalefactors{}; ///< Decoded scalefactors for the granule/channel
+    uint16_t part2_3_length = 0;    ///< Length of scalefactors + Huffman data in bits (12-bit field)
+    uint16_t big_values = 0;        ///< Number of large spectral value pairs (9-bit field, max 288)
+    uint8_t global_gain = 0;        ///< Quantization step size (8-bit field)
+    uint16_t scalefac_compress = 0; ///< Bits used for scalefactors (4-bit MPEG1, 9-bit MPEG2)
+    bool window_switching_flag = false; ///< True if block type is not normal
+    uint8_t block_type = 0;         ///< 0: normal, 1: start, 2: short, 3: end
+    bool mixed_block_flag = false;  ///< True if low frequencies use long blocks, high use short
+    uint8_t table_select[3] = {0, 0, 0}; ///< Huffman table indices for the three regions (5-bit each)
+    uint8_t subblock_gain[3] = {0, 0, 0};///< Gain offset for each short-block window (3-bit each)
+    uint8_t region0_count = 0;      ///< Size of the first scalefactor band region (4-bit field)
+    uint8_t region1_count = 0;      ///< Size of the second scalefactor band region (3-bit field)
+    bool preflag = false;           ///< Pre-emphasis flag
+    bool scalefac_scale = false;    ///< Scale of the scalefactors
+    bool count1table_select = false;///< True if count1 region uses Huffman table 33 (false → 32)
+    std::vector<int> scalefactors{};///< Decoded scalefactors for the granule/channel
 };
 
 /**
@@ -77,10 +77,10 @@ struct GrChInfo {
  * Contains structural pointers and decoding info for the main data.
  */
 struct SideInfo {
-    int main_data_begin = 0; ///< Negative offset in bytes indicating where the main data begins (bit reservoir)
-    int private_bits = 0;    ///< Application-specific private bits
-    uint8_t scfsi[2][4] = {{0, 0, 0, 0}, {0, 0, 0, 0}}; ///< Scalefactor selection information [channel][band]
-    GrChInfo gr[2][2];       ///< Granule and channel specific decoding info [granule][channel]
+    uint16_t main_data_begin = 0; ///< Bytes to backstep into the bit reservoir (9-bit MPEG1, 8-bit MPEG2)
+    uint8_t private_bits = 0;     ///< Application-specific private bits
+    bool scfsi[2][4] = {{false, false, false, false}, {false, false, false, false}}; ///< Scalefactor selection info [channel][band]
+    GrChInfo gr[2][2];            ///< Granule and channel specific decoding info [granule][channel]
 };
 
 /**

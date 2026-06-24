@@ -58,12 +58,6 @@ public:
      */
     [[nodiscard]] size_t tell_bit() const { return bit_pos_; }
 
-    /**
-     * @brief Checks if the reader has reached or exceeded the end of the data.
-     * @return True if the current bit position is beyond the underlying byte vector.
-     */
-    [[nodiscard]] bool eof() const { return (bit_pos_ / 8) >= data_.size(); }
-
 private:
     const std::vector<uint8_t>& data_; ///< Reference to the byte stream being read
     size_t bit_pos_ = 0;               ///< Current absolute bit position

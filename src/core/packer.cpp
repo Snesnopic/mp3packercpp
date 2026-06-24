@@ -17,7 +17,7 @@ namespace mp3packer {
 Packer::Packer() = default;
 
 // Takes the original raw side_info bytes and sets only the main_data_begin field.
-static std::vector<uint8_t> patch_mdb(const std::vector<uint8_t>& raw, MpegVersion version, int new_mdb) {
+static std::vector<uint8_t> patch_mdb(const std::vector<uint8_t>& raw, MpegVersion version, uint16_t new_mdb) {
     std::vector<uint8_t> out = raw;
     if (version == MpegVersion::MPEG1) {
         // main_data_begin is 9 bits (bits 0-8 MSB first)
@@ -57,7 +57,7 @@ static std::vector<uint8_t> serialize_side_info(const Mp3Header& h, const SideIn
                 writer.write_bits(g.mixed_block_flag, 1);
                 writer.write_bits(g.table_select[0], 5);
                 writer.write_bits(g.table_select[1], 5);
-                for (const int i : g.subblock_gain) {
+                for (const uint8_t i : g.subblock_gain) {
                     writer.write_bits(i, 3);
                 }
             } else {
@@ -77,7 +77,7 @@ static std::vector<uint8_t> serialize_side_info(const Mp3Header& h, const SideIn
     return writer.data();
 }
 
-static uint32_t get_samplerate_index(const MpegVersion v, const int sr) {
+static uint32_t get_samplerate_index(const MpegVersion v, const uint32_t sr) {
     if (v == MpegVersion::MPEG1) {
         if (sr == 44100) return 0;
         if (sr == 48000) return 1;
@@ -109,7 +109,7 @@ struct ChosenBitrate {
     int index;
 };
 
-static ChosenBitrate bytes_to_bitrate(MpegVersion version, int samplerate, ChannelMode channel_mode, int bytes) {
+static ChosenBitrate bytes_to_bitrate(MpegVersion version, uint32_t samplerate, ChannelMode channel_mode, int bytes) {
     static const int mpeg1_bitrates[] = {0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320};
     static const int mpeg2_bitrates[] = {0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160};
     
@@ -123,9 +123,9 @@ static ChosenBitrate bytes_to_bitrate(MpegVersion version, int samplerate, Chann
         // unpadded frame size
         int unpadded_frame_size = 0;
         if (version == MpegVersion::MPEG1) {
-            unpadded_frame_size = (144 * br * 1000 / samplerate);
+            unpadded_frame_size = (144 * br * 1000 / static_cast<int>(samplerate));
         } else {
-            unpadded_frame_size = (72 * br * 1000 / samplerate);
+            unpadded_frame_size = (72 * br * 1000 / static_cast<int>(samplerate));
         }
         
         int unpadded_data_size = unpadded_frame_size - 4 - side_info_size;
@@ -140,8 +140,8 @@ static ChosenBitrate bytes_to_bitrate(MpegVersion version, int samplerate, Chann
     // fallback to max bitrate if not found
     int max_br = bitrates[14];
     int max_frame_size = (version == MpegVersion::MPEG1) ?
-                         (144 * max_br * 1000 / samplerate) + 1 :
-                         (72 * max_br * 1000 / samplerate) + 1;
+                         (144 * max_br * 1000 / static_cast<int>(samplerate)) + 1 :
+                         (72 * max_br * 1000 / static_cast<int>(samplerate)) + 1;
     return {true, max_frame_size - 4 - side_info_size, 14};
 }
 
@@ -278,19 +278,19 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
                         }
                     } else {
                         for (int k = 0; k < 6; ++k) {
-                            if (gr == 0 || frame.side_info.scfsi[ch][0] == 0) scfs.push_back(data_reader.read_bits(slen1));
+                            if (gr == 0 || !frame.side_info.scfsi[ch][0]) scfs.push_back(data_reader.read_bits(slen1));
                             else scfs.push_back(0);
                         }
                         for (int k = 6; k < 11; ++k) {
-                            if (gr == 0 || frame.side_info.scfsi[ch][1] == 0) scfs.push_back(data_reader.read_bits(slen1));
+                            if (gr == 0 || !frame.side_info.scfsi[ch][1]) scfs.push_back(data_reader.read_bits(slen1));
                             else scfs.push_back(0);
                         }
                         for (int k = 11; k < 16; ++k) {
-                            if (gr == 0 || frame.side_info.scfsi[ch][2] == 0) scfs.push_back(data_reader.read_bits(slen2));
+                            if (gr == 0 || !frame.side_info.scfsi[ch][2]) scfs.push_back(data_reader.read_bits(slen2));
                             else scfs.push_back(0);
                         }
                         for (int k = 16; k < 21; ++k) {
-                            if (gr == 0 || frame.side_info.scfsi[ch][3] == 0) scfs.push_back(data_reader.read_bits(slen2));
+                            if (gr == 0 || !frame.side_info.scfsi[ch][3]) scfs.push_back(data_reader.read_bits(slen2));
                             else scfs.push_back(0);
                         }
                     }
@@ -303,10 +303,10 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
                         g.table_select[0],
                         g.table_select[1],
                         g.table_select[2],
-                        g.count1table_select != 0,
-                        g.window_switching_flag != 0,
+                        g.count1table_select,
+                        g.window_switching_flag,
                         g.block_type,
-                        g.mixed_block_flag != 0
+                        g.mixed_block_flag
                     };
                     int scalefac_bits = static_cast<int>(data_reader.tell_bit() - gc_orig_start);
                     int max_huff_bits = side_copy.gr[gr][ch].part2_3_length - scalefac_bits;
@@ -326,16 +326,16 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
                         }
                     } else {
                         for (int k = 0; k < 6; ++k) {
-                            if (gr == 0 || frame.side_info.scfsi[ch][0] == 0) writer.write_bits(scfs[k], slen1);
+                            if (gr == 0 || !frame.side_info.scfsi[ch][0]) writer.write_bits(scfs[k], slen1);
                         }
                         for (int k = 6; k < 11; ++k) {
-                            if (gr == 0 || frame.side_info.scfsi[ch][1] == 0) writer.write_bits(scfs[k], slen1);
+                            if (gr == 0 || !frame.side_info.scfsi[ch][1]) writer.write_bits(scfs[k], slen1);
                         }
                         for (int k = 11; k < 16; ++k) {
-                            if (gr == 0 || frame.side_info.scfsi[ch][2] == 0) writer.write_bits(scfs[k], slen2);
+                            if (gr == 0 || !frame.side_info.scfsi[ch][2]) writer.write_bits(scfs[k], slen2);
                         }
                         for (int k = 16; k < 21; ++k) {
-                            if (gr == 0 || frame.side_info.scfsi[ch][3] == 0) writer.write_bits(scfs[k], slen2);
+                            if (gr == 0 || !frame.side_info.scfsi[ch][3]) writer.write_bits(scfs[k], slen2);
                         }
                     }
                     
@@ -362,10 +362,10 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
                     g.table_select[0] = best_cfg.table0;
                     g.table_select[1] = best_cfg.table1;
                     g.table_select[2] = best_cfg.table2;
-                    g.count1table_select = best_cfg.count1_table_select ? 1 : 0;
+                    g.count1table_select = best_cfg.count1_table_select;
                     
                     int orig_part2_3 = side_copy.gr[gr][ch].part2_3_length;
-                    g.part2_3_length = static_cast<int>(writer.tell_bit() - out_start);
+                    g.part2_3_length = static_cast<uint16_t>(writer.tell_bit() - out_start);
 
                     data_reader.seek_bit(gc_orig_start + orig_part2_3);
                 }
@@ -410,7 +410,7 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
     
     // backward pass (constraint solver for carry-over reservoir)
     MpegVersion version = all_frames[0].header.version;
-    int samplerate = all_frames[0].header.samplerate;
+    uint32_t samplerate = all_frames[0].header.samplerate;
     ChannelMode channel_mode = all_frames[0].header.channel_mode;
     
     DEBUG_LOG("Reservoir carryover calculated. Writing output stream...");
