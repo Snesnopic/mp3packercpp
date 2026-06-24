@@ -30,7 +30,7 @@ void Mp3Reader::skip_id3v2_tag() {
     }
 
     if (header[0] == 'I' && header[1] == 'D' && header[2] == '3') {
-        uint32_t size = (static_cast<uint32_t>(header[6] & 0x7F) << 21) |
+        const uint32_t size = (static_cast<uint32_t>(header[6] & 0x7F) << 21) |
                         (static_cast<uint32_t>(header[7] & 0x7F) << 14) |
                         (static_cast<uint32_t>(header[8] & 0x7F) << 7)  |
                         static_cast<uint32_t>(header[9] & 0x7F);
@@ -49,7 +49,7 @@ void Mp3Reader::skip_id3v2_tag() {
     }
 }
 
-std::optional<Mp3Header> Mp3Reader::parse_header(uint32_t header_bits) {
+std::optional<Mp3Header> Mp3Reader::parse_header(const uint32_t header_bits) {
     if ((header_bits & 0xFFE00000) != 0xFFE00000) return std::nullopt;
 
     Mp3Header header{};

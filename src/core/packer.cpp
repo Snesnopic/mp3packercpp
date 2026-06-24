@@ -17,7 +17,7 @@ namespace mp3packer {
 Packer::Packer() = default;
 
 // Takes the original raw side_info bytes and sets only the main_data_begin field.
-static std::vector<uint8_t> patch_mdb(const std::vector<uint8_t>& raw, MpegVersion version, uint16_t new_mdb) {
+static std::vector<uint8_t> patch_mdb(const std::vector<uint8_t>& raw, const MpegVersion version, const uint16_t new_mdb) {
     std::vector<uint8_t> out = raw;
     if (version == MpegVersion::MPEG1) {
         // main_data_begin is 9 bits (bits 0-8 MSB first)
@@ -109,17 +109,17 @@ struct ChosenBitrate {
     int index;
 };
 
-static ChosenBitrate bytes_to_bitrate(MpegVersion version, uint32_t samplerate, ChannelMode channel_mode, int bytes) {
+static ChosenBitrate bytes_to_bitrate(const MpegVersion version, const uint32_t samplerate, const ChannelMode channel_mode, const int bytes) {
     static const int mpeg1_bitrates[] = {0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320};
     static const int mpeg2_bitrates[] = {0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160};
     
     const int* bitrates = (version == MpegVersion::MPEG1) ? mpeg1_bitrates : mpeg2_bitrates;
-    int side_info_size = (version == MpegVersion::MPEG1) ?
+    const int side_info_size = (version == MpegVersion::MPEG1) ?
                          (channel_mode == ChannelMode::Mono ? 17 : 32) :
                          (channel_mode == ChannelMode::Mono ? 9 : 17);
                          
     for (int index = 1; index <= 14; ++index) {
-        int br = bitrates[index];
+        const int br = bitrates[index];
         // unpadded frame size
         int unpadded_frame_size = 0;
         if (version == MpegVersion::MPEG1) {
@@ -128,7 +128,7 @@ static ChosenBitrate bytes_to_bitrate(MpegVersion version, uint32_t samplerate, 
             unpadded_frame_size = (72 * br * 1000 / static_cast<int>(samplerate));
         }
         
-        int unpadded_data_size = unpadded_frame_size - 4 - side_info_size;
+        const int unpadded_data_size = unpadded_frame_size - 4 - side_info_size;
         if (unpadded_data_size >= bytes) {
             return {false, unpadded_data_size, index};
         }
@@ -138,8 +138,8 @@ static ChosenBitrate bytes_to_bitrate(MpegVersion version, uint32_t samplerate, 
     }
     
     // fallback to max bitrate if not found
-    int max_br = bitrates[14];
-    int max_frame_size = (version == MpegVersion::MPEG1) ?
+    const int max_br = bitrates[14];
+    const int max_frame_size = (version == MpegVersion::MPEG1) ?
                          (144 * max_br * 1000 / static_cast<int>(samplerate)) + 1 :
                          (72 * max_br * 1000 / static_cast<int>(samplerate)) + 1;
     return {true, max_frame_size - 4 - side_info_size, 14};
@@ -257,8 +257,8 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
                     // read scalefactors
                     int slen1 = 0, slen2 = 0;
                     if (frame.header.version == MpegVersion::MPEG1) {
-                        static const int slen1_tab[] = {0, 0, 0, 0, 3, 1, 1, 1, 2, 2, 2, 3, 3, 3, 4, 4};
-                        static const int slen2_tab[] = {0, 1, 2, 3, 0, 1, 2, 3, 1, 2, 3, 1, 2, 3, 2, 3};
+                        static constexpr int slen1_tab[] = {0, 0, 0, 0, 3, 1, 1, 1, 2, 2, 2, 3, 3, 3, 4, 4};
+                        static constexpr int slen2_tab[] = {0, 1, 2, 3, 0, 1, 2, 3, 1, 2, 3, 1, 2, 3, 2, 3};
                         slen1 = slen1_tab[g.scalefac_compress];
                         slen2 = slen2_tab[g.scalefac_compress];
                     }
@@ -453,7 +453,7 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
 
         int max_reservoir = (version == MpegVersion::MPEG1) ? 511 : 255;
 
-        ChosenBitrate bitrate_use;
+        ChosenBitrate bitrate_use{};
         if (has_xing && i == 0) {
             // use minimum bitrate that fits the trimmed Xing tag content
             int needed = static_cast<int>(optimized_main_data[0].size());
@@ -501,7 +501,7 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
         if (chosen_bitrates[i].index == 14) {
             break;
         }
-        if (optimized_main_data[i].size() > 0) {
+        if (!optimized_main_data[i].empty()) {
             break;
         }
         if (i == 0) break;

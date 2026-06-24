@@ -29,8 +29,8 @@ public:
 
         uint32_t result = 0;
         for (int i = 0; i < num_bits; ++i) {
-            size_t byte_idx = bit_pos_ / 8;
-            int bit_idx = 7 - (bit_pos_ % 8);
+            const size_t byte_idx = bit_pos_ / 8;
+            const int bit_idx = 7 - (bit_pos_ % 8);
             
             if (byte_idx >= data_.size()) {
                 result <<= (num_bits - i);
@@ -50,7 +50,7 @@ public:
      * @brief Seeks to a specific bit position in the stream.
      * @param pos Absolute bit position to seek to.
      */
-    void seek_bit(size_t pos) { bit_pos_ = pos; }
+    void seek_bit(const size_t pos) { bit_pos_ = pos; }
 
     /**
      * @brief Gets the current bit position.
@@ -80,8 +80,8 @@ public:
         if (num_bits > 32) throw std::invalid_argument("Cannot write more than 32 bits");
 
         for (int i = 0; i < num_bits; ++i) {
-            size_t byte_idx = bit_pos_ / 8;
-            int bit_idx = 7 - (bit_pos_ % 8);
+            const size_t byte_idx = bit_pos_ / 8;
+            const int bit_idx = 7 - (bit_pos_ % 8);
 
             if (byte_idx >= data_.size()) {
                 data_.push_back(0);

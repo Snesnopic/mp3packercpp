@@ -15,7 +15,7 @@ struct SymbolCode {
 
 class HuffmanTableManager {
 public:
-    static const std::array<SymbolCode, 256>& get_encoding_map(uint8_t table_idx) {
+    static const std::array<SymbolCode, 256>& get_encoding_map(const uint8_t table_idx) {
         static std::array<std::array<SymbolCode, 256>, 34> cache;
         static std::array<bool, 34> initialized{};
         if (!initialized[table_idx]) {
@@ -26,7 +26,7 @@ public:
     }
 
 private:
-    static std::array<SymbolCode, 256> build_map(uint8_t table_idx) {
+    static std::array<SymbolCode, 256> build_map(const uint8_t table_idx) {
         std::array<SymbolCode, 256> arr{};
         for (auto& sym : arr) sym.valid = false;
 
@@ -41,10 +41,10 @@ private:
         stack.push_back({tab, 0, 0});
 
         while (!stack.empty()) {
-            State state = stack.back();
+            const State state = stack.back();
             stack.pop_back();
 
-            int16_t val = *state.pos;
+            const int16_t val = *state.pos;
             if (val < 0) {
                 // interior node: push left (bit=0) and right (bit=1) children
                 stack.push_back({state.pos + 1,        static_cast<uint32_t>(state.code << 1),       state.length + 1});
@@ -59,7 +59,7 @@ private:
     }
 };
 
-static std::vector<int> get_sf_bands(uint32_t samplerate) {
+static std::vector<int> get_sf_bands(const uint32_t samplerate) {
     if (samplerate == 48000) return { 0, 4, 8, 12, 16, 20, 24, 30, 36, 42, 50, 60, 72, 88, 106, 128, 156, 190, 230, 276, 330, 384, 576 };
     if (samplerate == 44100) return { 0, 4, 8, 12, 16, 20, 24, 30, 36, 44, 52, 62, 74, 90, 110, 134, 162, 196, 238, 288, 342, 418, 576 };
     if (samplerate == 32000) return { 0, 4, 8, 12, 16, 20, 24, 30, 36, 44, 54, 66, 82, 102, 126, 156, 194, 240, 296, 364, 448, 550, 576 };
@@ -70,7 +70,7 @@ static std::vector<int> get_sf_bands(uint32_t samplerate) {
     return { 0, 4, 8, 12, 16, 20, 24, 30, 36, 44, 52, 62, 74, 90, 110, 134, 162, 196, 238, 288, 342, 418, 576 };
 }
 
-static std::vector<int> get_sf_bands_short(uint32_t samplerate) {
+static std::vector<int> get_sf_bands_short(const uint32_t samplerate) {
     if (samplerate == 48000) return { 0, 4, 8, 12, 16, 22, 28, 38, 50, 64, 80, 100, 126, 192 };
     if (samplerate == 44100) return { 0, 4, 8, 12, 16, 22, 30, 40, 52, 66, 84, 106, 136, 192 };
     if (samplerate == 32000) return { 0, 4, 8, 12, 16, 22, 30, 42, 58, 78, 104, 138, 180, 192 };
@@ -85,7 +85,7 @@ HuffmanOptimizer::HuffmanOptimizer() = default;
 
 std::vector<int16_t> HuffmanOptimizer::decode_quantized_coefficients(
         const HuffmanConfig& config, BitstreamReader& reader,
-        uint32_t samplerate, int max_huffman_bits) {
+        const uint32_t samplerate, const int max_huffman_bits) {
     std::vector<int16_t> coeffs(576, 0);
     int out_off = 0;
     const auto sf_bands = get_sf_bands(samplerate);
@@ -94,7 +94,7 @@ std::vector<int16_t> HuffmanOptimizer::decode_quantized_coefficients(
                              : SIZE_MAX;
 
     // decode one full huffman symbol; never aborts mid-traversal (matches mp3packer's decode_big_quants)
-    auto decode_symbol = [&](uint8_t table_idx) -> int16_t {
+    auto decode_symbol = [&](const uint8_t table_idx) -> int16_t {
         if (table_idx == 0) return 0;
         const int16_t* tab = huffman_tables[table_idx].table;
         int16_t got = 0;
@@ -105,12 +105,12 @@ std::vector<int16_t> HuffmanOptimizer::decode_quantized_coefficients(
     };
 
     // big region: boundary checked only at the start of each pair; the symbol is then read whole
-    auto decode_region = [&](int count_pairs, uint8_t table_idx) -> bool {
-        int linbits = huffman_tables[table_idx].linbits;
-        int target = out_off + count_pairs * 2;
+    auto decode_region = [&](const int count_pairs, const uint8_t table_idx) -> bool {
+        const int linbits = huffman_tables[table_idx].linbits;
+        const int target = out_off + count_pairs * 2;
         while (out_off < target && out_off < 575) {
             if (table_idx != 0 && reader.tell_bit() >= bit_limit) return false;
-            int got = decode_symbol(table_idx);
+            const int got = decode_symbol(table_idx);
             int y = got & 0xF;
             int x = (got >> 4) & 0xF;
             if (x > 0) {
@@ -131,7 +131,7 @@ std::vector<int16_t> HuffmanOptimizer::decode_quantized_coefficients(
     if (config.window_switching_flag) {
         int region0;
         if (config.block_type == 2 && !config.mixed_block_flag) {
-            auto sf_bands_short = get_sf_bands_short(samplerate);
+            const auto sf_bands_short = get_sf_bands_short(samplerate);
             region0 = (sf_bands_short[3] / 2) * 3;
         } else {
             region0 = sf_bands[8] / 2;
@@ -150,9 +150,9 @@ std::vector<int16_t> HuffmanOptimizer::decode_quantized_coefficients(
     if (cont) decode_region(r2_pairs, config.table2);
 
     // count1 region: boundary checked only at the start of each quad
-    uint8_t count1_table = config.count1_table_select ? 33 : 32;
+    const uint8_t count1_table = config.count1_table_select ? 33 : 32;
     while (out_off <= 572 && reader.tell_bit() < bit_limit) {
-        int got = decode_symbol(count1_table);
+        const int got = decode_symbol(count1_table);
         coeffs[out_off++] = static_cast<int16_t>((got & 8) ? (reader.read_bits(1) ? -1 : 1) : 0);
         coeffs[out_off++] = static_cast<int16_t>((got & 4) ? (reader.read_bits(1) ? -1 : 1) : 0);
         coeffs[out_off++] = static_cast<int16_t>((got & 2) ? (reader.read_bits(1) ? -1 : 1) : 0);
@@ -217,17 +217,17 @@ HuffmanConfig HuffmanOptimizer::find_best_config(
 
     for (int pair = 0; pair < max_possible_bv; ++pair) {
         for (int tab = 0; tab < 32; ++tab) {
-            uint32_t cost = static_cast<uint32_t>(pair_costs[pair][tab]);
+            const uint32_t cost = static_cast<uint32_t>(pair_costs[pair][tab]);
             prefix_costs[pair + 1][tab] = std::min(prefix_costs[pair][tab] + cost, static_cast<uint32_t>(10000000));
         }
     }
 
-    auto get_best_region = [&](int start_pair, int end_pair, int& best_tab) -> uint32_t {
+    auto get_best_region = [&](const int start_pair, const int end_pair, int& best_tab) -> uint32_t {
         if (start_pair >= end_pair) { best_tab = 0; return 0; }
         uint32_t best_cost = 0xFFFFFFFF;
         best_tab = 0;
         for (int tab = 0; tab < 32; ++tab) {
-            uint32_t cost = prefix_costs[end_pair][tab] - prefix_costs[start_pair][tab];
+            const uint32_t cost = prefix_costs[end_pair][tab] - prefix_costs[start_pair][tab];
             if (cost < best_cost) {
                 best_cost = cost;
                 best_tab = tab;
@@ -314,17 +314,17 @@ HuffmanConfig HuffmanOptimizer::find_best_config(
 
 void HuffmanOptimizer::encode_quantized_coefficients(
         const std::vector<int16_t>& coeffs, const HuffmanConfig& config,
-        BitstreamWriter& writer, uint32_t samplerate) {
+        BitstreamWriter& writer, const uint32_t samplerate) {
     int cur = 0;
-    auto sf_bands = get_sf_bands(samplerate);
+    const auto sf_bands = get_sf_bands(samplerate);
 
-    auto encode_pair = [&](int x, int y, uint8_t table_idx) {
+    auto encode_pair = [&](const int x, const int y, const uint8_t table_idx) {
         if (table_idx == 0) return;
-        int linbits = huffman_tables[table_idx].linbits;
-        int abs_x = std::min(15, std::abs(x));
-        int abs_y = std::min(15, std::abs(y));
+        const int linbits = huffman_tables[table_idx].linbits;
+        const int abs_x = std::min(15, std::abs(x));
+        const int abs_y = std::min(15, std::abs(y));
         const auto& map = HuffmanTableManager::get_encoding_map(table_idx);
-        int idx = (abs_x << 4) | abs_y;
+        const int idx = (abs_x << 4) | abs_y;
         if (!map[idx].valid) return;
         writer.write_bits(map[idx].code, map[idx].length);
         if (abs_x == 15 && linbits > 0) writer.write_bits(static_cast<uint32_t>(std::abs(x) - 15), linbits);
@@ -337,7 +337,7 @@ void HuffmanOptimizer::encode_quantized_coefficients(
     if (config.window_switching_flag) {
         int region0;
         if (config.block_type == 2 && !config.mixed_block_flag) {
-            auto sf_bands_short = get_sf_bands_short(samplerate);
+            const auto sf_bands_short = get_sf_bands_short(samplerate);
             region0 = (sf_bands_short[3] / 2) * 3;
         } else {
             region0 = sf_bands[8] / 2;
@@ -360,12 +360,15 @@ void HuffmanOptimizer::encode_quantized_coefficients(
         if (coeffs[i] != 0) { last_nonzero = i + 1; break; }
     }
 
-    uint8_t count1_table = config.count1_table_select ? 33 : 32;
+    const uint8_t count1_table = config.count1_table_select ? 33 : 32;
     const auto& c1_map = HuffmanTableManager::get_encoding_map(count1_table);
     while (cur <= 572) {
         if (cur >= last_nonzero) break;
-        int v = coeffs[cur], w = coeffs[cur+1], x = coeffs[cur+2], y = coeffs[cur+3];
-        int symbol = ((v != 0) << 3) | ((w != 0) << 2) | ((x != 0) << 1) | (y != 0);
+        const int v = coeffs[cur];
+        const int x = coeffs[cur+2];
+        const int y = coeffs[cur+3];
+        const int w = coeffs[cur+1];
+        const int symbol = ((v != 0) << 3) | ((w != 0) << 2) | ((x != 0) << 1) | (y != 0);
         if (!c1_map[symbol].valid || c1_map[symbol].length == 0) break;
         writer.write_bits(c1_map[symbol].code, c1_map[symbol].length);
         if (v != 0) writer.write_bits(v < 0 ? 1u : 0u, 1);
