@@ -138,8 +138,9 @@ std::optional<Mp3Frame> Mp3Reader::read_next_frame() {
                                  (header->channel_mode == ChannelMode::Mono ? 17 : 32) :
                                  (header->channel_mode == ChannelMode::Mono ? 9 : 17);
             
+            uint8_t crc_bytes[2] = {0, 0};
             if (header->has_crc) {
-                file_.read(reinterpret_cast<char*>(frame.crc_raw), 2);
+                file_.read(reinterpret_cast<char*>(crc_bytes), 2);
             }
 
             frame.side_info_raw.resize(static_cast<size_t>(side_info_size));
@@ -180,7 +181,10 @@ std::optional<Mp3Frame> Mp3Reader::read_next_frame() {
                         for (int i = 0; i < 2; ++i) gi.table_select[i] = static_cast<int>(side_reader.read_bits(5));
                         gi.table_select[2] = 0; // not used
                         for (int & i : gi.subblock_gain) i = static_cast<int>(side_reader.read_bits(3));
-                        
+                        // preflag, scalefac_scale, count1table_select follow the window block (same as wsf=0)
+                        gi.preflag = static_cast<int>((header->version == MpegVersion::MPEG1) ? side_reader.read_bits(1) : 0);
+                        gi.scalefac_scale = static_cast<int>(side_reader.read_bits(1));
+                        gi.count1table_select = static_cast<int>(side_reader.read_bits(1));
                         if (gi.block_type == 2 && gi.mixed_block_flag == 0) gi.region0_count = 8;
                         else gi.region0_count = 7;
                         gi.region1_count = 20 - gi.region0_count;
@@ -190,10 +194,10 @@ std::optional<Mp3Frame> Mp3Reader::read_next_frame() {
                         gi.region1_count = static_cast<int>(side_reader.read_bits(3));
                         gi.block_type = 0;
                         gi.mixed_block_flag = 0;
+                        gi.preflag = static_cast<int>((header->version == MpegVersion::MPEG1) ? side_reader.read_bits(1) : 0);
+                        gi.scalefac_scale = static_cast<int>(side_reader.read_bits(1));
+                        gi.count1table_select = static_cast<int>(side_reader.read_bits(1));
                     }
-                    gi.preflag = static_cast<int>((header->version == MpegVersion::MPEG1) ? side_reader.read_bits(1) : 0);
-                    gi.scalefac_scale = static_cast<int>(side_reader.read_bits(1));
-                    gi.count1table_select = static_cast<int>(side_reader.read_bits(1));
                 }
             }
 
@@ -203,6 +207,16 @@ std::optional<Mp3Frame> Mp3Reader::read_next_frame() {
             
             frame.main_data_raw.resize(static_cast<size_t>(main_data_size));
             file_.read(reinterpret_cast<char*>(frame.main_data_raw.data()), main_data_size);
+
+            // build raw_bytes: header + crc (if any) + side_info + main_data
+            frame.raw_bytes.reserve(4 + (header->has_crc ? 2 : 0) + side_info_size + main_data_size);
+            frame.raw_bytes.insert(frame.raw_bytes.end(), buf, buf + 4);
+            if (header->has_crc) {
+                frame.raw_bytes.push_back(crc_bytes[0]);
+                frame.raw_bytes.push_back(crc_bytes[1]);
+            }
+            frame.raw_bytes.insert(frame.raw_bytes.end(), frame.side_info_raw.begin(), frame.side_info_raw.end());
+            frame.raw_bytes.insert(frame.raw_bytes.end(), frame.main_data_raw.begin(), frame.main_data_raw.end());
 
             return frame;
         }

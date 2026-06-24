@@ -80,13 +80,15 @@ static std::vector<int> get_sf_bands_short(int samplerate) {
 
 HuffmanOptimizer::HuffmanOptimizer() = default;
 
-std::vector<int16_t> HuffmanOptimizer::decode_quantized_coefficients(const HuffmanConfig& config, BitstreamReader& reader, int samplerate, size_t bit_limit) {
+std::vector<int16_t> HuffmanOptimizer::decode_quantized_coefficients(const HuffmanConfig& config, BitstreamReader& reader, int samplerate, int max_huffman_bits) {
     std::vector<int16_t> coeffs(576, 0);
     int out_off = 0;
     const auto sf_bands = get_sf_bands(samplerate);
+    const size_t bit_limit = (max_huffman_bits >= 0) ? (reader.tell_bit() + static_cast<size_t>(max_huffman_bits)) : SIZE_MAX;
 
-    auto decode_symbol = [&](const int table_idx) {
-        if (table_idx == 0) return static_cast<int16_t>(0);
+    // decode one full huffman symbol; never aborts mid-traversal (matches mp3packer's decode_big_quants)
+    auto decode_symbol = [&](const int table_idx) -> int16_t {
+        if (table_idx == 0) return 0;
         const int16_t* tab = huffman_tables[table_idx].table;
         int16_t got;
         while ((got = *tab++) < 0) {
@@ -95,9 +97,12 @@ std::vector<int16_t> HuffmanOptimizer::decode_quantized_coefficients(const Huffm
         return got;
     };
 
-    auto decode_region = [&](int count_pairs, int table_idx) {
+    // big region: boundary checked only at the start of each pair; the symbol is then read whole
+    auto decode_region = [&](int count_pairs, int table_idx) -> bool {
         int linbits = huffman_tables[table_idx].linbits;
-        for (int i = 0; i < count_pairs && out_off < 575; ++i) {
+        int target = out_off + count_pairs * 2;
+        while (out_off < target && out_off < 575) {
+            if (table_idx != 0 && reader.tell_bit() >= bit_limit) return false;
             int got = decode_symbol(table_idx);
             int y = got & 0xF;
             int x = (got >> 4) & 0xF;
@@ -112,6 +117,7 @@ std::vector<int16_t> HuffmanOptimizer::decode_quantized_coefficients(const Huffm
             coeffs[out_off++] = static_cast<int16_t>(x);
             coeffs[out_off++] = static_cast<int16_t>(y);
         }
+        return true;
     };
 
     int r0_pairs, r1_pairs, r2_pairs;
@@ -132,14 +138,14 @@ std::vector<int16_t> HuffmanOptimizer::decode_quantized_coefficients(const Huffm
         r2_pairs = config.big_values - r0_pairs - r1_pairs;
     }
 
-    decode_region(r0_pairs, config.table0);
-    decode_region(r1_pairs, config.table1);
-    decode_region(r2_pairs, config.table2);
+    bool cont = decode_region(r0_pairs, config.table0);
+    if (cont) cont = decode_region(r1_pairs, config.table1);
+    if (cont) decode_region(r2_pairs, config.table2);
 
+    // count1 region: boundary checked only at the start of each quad
     int count1_table = config.count1_table_select ? 33 : 32;
-    while (out_off <= 572 && reader.get_bits_read() < bit_limit) {
+    while (out_off <= 572 && reader.tell_bit() < bit_limit) {
         int got = decode_symbol(count1_table);
-        if (got == 0 && reader.eof()) break;
         coeffs[out_off++] = (got & 8) ? (reader.read_bits(1) ? -1 : 1) : 0;
         coeffs[out_off++] = (got & 4) ? (reader.read_bits(1) ? -1 : 1) : 0;
         coeffs[out_off++] = (got & 2) ? (reader.read_bits(1) ? -1 : 1) : 0;
@@ -280,34 +286,6 @@ HuffmanConfig HuffmanOptimizer::find_best_config(const std::vector<int16_t>& coe
                     best = {r0_idx, r1_idx, bv, t0, t1, t2, c1_best_is_33[bv], false, 0, 0};
                 }
             }
-        }
-    }
-    
-    // calculate cost of orig_config manually to see why it was rejected or overpriced
-    int orig_bv = orig_config.big_values;
-    if (!orig_config.window_switching_flag && orig_bv <= max_possible_bv) {
-        int r0 = std::min(orig_bv, sf_bands[orig_config.region0_count + 1] / 2);
-        int r1 = std::min(orig_bv, sf_bands[orig_config.region0_count + orig_config.region1_count + 2] / 2);
-        uint32_t c0 = prefix_costs[r0][orig_config.table0] - prefix_costs[0][orig_config.table0];
-        uint32_t c1 = prefix_costs[r1][orig_config.table1] - prefix_costs[r0][orig_config.table1];
-        uint32_t c2 = prefix_costs[orig_bv][orig_config.table2] - prefix_costs[r1][orig_config.table2];
-        
-        int c1_cost = 0;
-        int cur = orig_bv * 2;
-        int count1_table = orig_config.count1_table_select ? 33 : 32;
-        const auto& c1_arr = HuffmanTableManager::get_encoding_map(count1_table);
-        while (cur <= 572) {
-            if (cur >= last_nonzero_coeff) break;
-            int v = coeffs[cur], w = coeffs[cur+1], x = coeffs[cur+2], y = coeffs[cur+3];
-            int symbol = ((v != 0) << 3) | ((w != 0) << 2) | ((x != 0) << 1) | (y != 0);
-            if (!c1_arr[symbol].valid || c1_arr[symbol].length == 0) { c1_cost += 10000; break; }
-            c1_cost += c1_arr[symbol].length + (v!=0) + (w!=0) + (x!=0) + (y!=0);
-            cur += 4;
-        }
-
-        uint32_t orig_cost = c0 + c1 + c2 + c1_cost;
-        if (orig_cost >= 10000) {
-            orig_cost = 99999;
         }
     }
     

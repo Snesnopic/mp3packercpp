@@ -19,12 +19,6 @@ public:
     explicit BitstreamReader(const std::vector<uint8_t>& data) : data_(data) {}
 
     /**
-     * @brief Gets the number of bits read so far.
-     * @return Number of bits read.
-     */
-    size_t get_bits_read() const { return bit_pos_; }
-
-    /**
      * @brief Reads a specified number of bits from the stream.
      * @param num_bits Number of bits to read (maximum 32).
      * @return The read bits as a 32-bit unsigned integer.

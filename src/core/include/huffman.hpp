@@ -31,12 +31,19 @@ public:
 
     /**
      * @brief Decodes raw bitstream data into 576 quantized spectral coefficients.
+     *
+     * The part2_3 bit limit is checked only at the start of each big-values pair and
+     * each count1 quad, never mid-symbol. This matches mp3packer's decode behaviour.
+     *
      * @param config The original Huffman configuration from the side info.
-     * @param reader Bitstream reader positioned at the start of the main data.
+     * @param reader Bitstream reader positioned at the start of the Huffman data
+     *               (i.e. after scalefactors, at bit offset part2_length).
      * @param samplerate Sampling rate of the frame.
-     * @return A vector of exactly 576 decoded integer coefficients.
+     * @param max_huffman_bits Maximum bits to consume (part2_3_length - part2_length).
+     *                         Pass -1 to decode until big_values/count1 are exhausted.
+     * @return A vector of 576 integer coefficients (zero-padded beyond the last decoded value).
      */
-    static std::vector<int16_t> decode_quantized_coefficients(const HuffmanConfig& config, BitstreamReader& reader, int samplerate, size_t bit_limit);
+    static std::vector<int16_t> decode_quantized_coefficients(const HuffmanConfig& config, BitstreamReader& reader, int samplerate, int max_huffman_bits = -1);
 
     /**
      * @brief Performs brute-force search to find the optimal Huffman table combination.

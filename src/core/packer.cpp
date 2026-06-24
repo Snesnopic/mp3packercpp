@@ -2,9 +2,8 @@
 #include "include/huffman.hpp"
 #include "include/logger.hpp"
 #include "include/mp3_reader.hpp"
+#include "include/huffman.hpp"
 #include "include/bitstream.hpp"
-#include "include/crc.hpp"
-
 #include <iostream>
 #include <algorithm>
 #include <vector>
@@ -16,6 +15,20 @@
 namespace mp3packer {
 
 Packer::Packer() = default;
+
+// Takes the original raw side_info bytes and sets only the main_data_begin field.
+static std::vector<uint8_t> patch_mdb(const std::vector<uint8_t>& raw, MpegVersion version, int new_mdb) {
+    std::vector<uint8_t> out = raw;
+    if (version == MpegVersion::MPEG1) {
+        // main_data_begin is 9 bits (bits 0-8 MSB first)
+        out[0] = static_cast<uint8_t>((new_mdb >> 1) & 0xFF);
+        out[1] = static_cast<uint8_t>((out[1] & 0x7F) | ((new_mdb & 1) << 7));
+    } else {
+        // main_data_begin is 8 bits
+        out[0] = static_cast<uint8_t>(new_mdb & 0xFF);
+    }
+    return out;
+}
 
 static std::vector<uint8_t> serialize_side_info(const Mp3Header& h, const SideInfo& si) {
     BitstreamWriter writer;
@@ -54,6 +67,7 @@ static std::vector<uint8_t> serialize_side_info(const Mp3Header& h, const SideIn
                 writer.write_bits(g.region0_count, 4);
                 writer.write_bits(g.region1_count, 3);
             }
+            // preflag, scalefac_scale, count1table_select follow for both window types
             if (h.version == MpegVersion::MPEG1) writer.write_bits(g.preflag, 1);
             writer.write_bits(g.scalefac_scale, 1);
             writer.write_bits(g.count1table_select, 1);
@@ -81,21 +95,12 @@ static uint32_t get_samplerate_index(const MpegVersion v, const int sr) {
 }
 
 static bool is_xing_frame(const Mp3Frame& frame) {
-    std::string s;
-    s.insert(s.end(), frame.side_info_raw.begin(), frame.side_info_raw.end());
-    s.insert(s.end(), frame.main_data_raw.begin(), frame.main_data_raw.end());
-    
-    if (s.size() < 4) return false;
-    
-    for (size_t i = 0; i < s.size() - 3; ++i) {
-        if (s[i] == 'X' && s[i+1] == 'i' && s[i+2] == 'n' && s[i+3] == 'g') {
-            return true;
-        }
-        if (s[i] == 'I' && s[i+1] == 'n' && s[i+2] == 'f' && s[i+3] == 'o') {
-            return true;
-        }
-    }
-    return false;
+    std::vector<uint8_t> full_frame;
+    full_frame.insert(full_frame.end(), frame.side_info_raw.begin(), frame.side_info_raw.end());
+    full_frame.insert(full_frame.end(), frame.main_data_raw.begin(), frame.main_data_raw.end());
+    if (full_frame.size() < 100) return false;
+    const std::string s(full_frame.begin(), full_frame.begin() + std::min(static_cast<size_t>(100), full_frame.size()));
+    return (s.find("Xing") != std::string::npos || s.find("Info") != std::string::npos);
 }
 
 struct ChosenBitrate {
@@ -104,7 +109,7 @@ struct ChosenBitrate {
     int index;
 };
 
-static ChosenBitrate bytes_to_bitrate(MpegVersion version, int samplerate, ChannelMode channel_mode, bool has_crc, int bytes) {
+static ChosenBitrate bytes_to_bitrate(MpegVersion version, int samplerate, ChannelMode channel_mode, int bytes) {
     static const int mpeg1_bitrates[] = {0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320};
     static const int mpeg2_bitrates[] = {0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160};
     
@@ -112,7 +117,6 @@ static ChosenBitrate bytes_to_bitrate(MpegVersion version, int samplerate, Chann
     int side_info_size = (version == MpegVersion::MPEG1) ?
                          (channel_mode == ChannelMode::Mono ? 17 : 32) :
                          (channel_mode == ChannelMode::Mono ? 9 : 17);
-    int crc_size = has_crc ? 2 : 0;
                          
     for (int index = 1; index <= 14; ++index) {
         int br = bitrates[index];
@@ -124,7 +128,7 @@ static ChosenBitrate bytes_to_bitrate(MpegVersion version, int samplerate, Chann
             unpadded_frame_size = (72 * br * 1000 / samplerate);
         }
         
-        int unpadded_data_size = unpadded_frame_size - 4 - crc_size - side_info_size;
+        int unpadded_data_size = unpadded_frame_size - 4 - side_info_size;
         if (unpadded_data_size >= bytes) {
             return {false, unpadded_data_size, index};
         }
@@ -138,22 +142,22 @@ static ChosenBitrate bytes_to_bitrate(MpegVersion version, int samplerate, Chann
     int max_frame_size = (version == MpegVersion::MPEG1) ?
                          (144 * max_br * 1000 / samplerate) + 1 :
                          (72 * max_br * 1000 / samplerate) + 1;
-    return {true, max_frame_size - 4 - crc_size - side_info_size, 14};
+    return {true, max_frame_size - 4 - side_info_size, 14};
 }
 
 void Packer::process(const std::string& input_file, const std::string& output_file) const {
     DEBUG_LOG("Reading input file " << input_file << "...");
     Mp3Reader reader(input_file);
-    
+
     std::vector<Mp3Frame> all_frames;
     while (auto opt_frame = reader.read_next_frame()) {
         all_frames.push_back(*opt_frame);
     }
-    
+
     if (all_frames.empty()) {
         throw std::runtime_error("No valid MP3 frames found!");
     }
-    
+
     bool has_xing = false;
     // removed unused xing_frame here
     if (is_xing_frame(all_frames[0])) {
@@ -168,6 +172,7 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
 
     std::vector<std::vector<uint8_t>> optimized_main_data(N);
     std::vector<SideInfo> optimized_side_info(N);
+    std::vector<bool> frame_was_optimized(N, false);
     
     std::vector<uint8_t> global_res;
     std::vector<size_t> frame_main_starts(N);
@@ -177,8 +182,7 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
     }
 
     std::atomic<size_t> current_frame{0};
-    unsigned int active_threads = this->num_threads > 0 ? this->num_threads : std::thread::hardware_concurrency();
-    if (active_threads == 0) active_threads = 4;
+    unsigned int active_threads = std::max(1u, std::thread::hardware_concurrency());
 
     auto worker = [&]() {
         while (true) {
@@ -186,10 +190,47 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
             if (i >= N) break;
 
             if (has_xing && i == 0) {
-            optimized_main_data[i] = all_frames[i].main_data_raw;
-            optimized_side_info[i] = all_frames[i].side_info;
-            continue;
-        }
+                // output frames are always written without CRC, so "Xing"/"Info" must be at
+                // output mdr[0..3].
+                //   No-CRC file: copy mdr verbatim (extended headers like "Lavf" at byte 120+
+                //                contain gapless timing info that decoders rely on).
+                //   CRC file:    "Xi"/"In" is in si[-2:], "ng"/"fo" at mdr[0].
+                //                Prepend si[-2:] and copy standard Xing content (through LAME
+                //                extension if present), trimming trailing zeros to save space.
+                const auto& mdr = all_frames[i].main_data_raw;
+                if (!all_frames[i].header.has_crc) {
+                    optimized_main_data[i].assign(mdr.begin(), mdr.end());
+                } else {
+                    // CRC: recover "Xi"/"In" from the last 2 bytes of the original side_info
+                    const auto& sir = all_frames[i].side_info_raw;
+                    uint8_t b0 = (sir.size() >= 2) ? sir[sir.size() - 2] : 0x58;
+                    uint8_t b1 = (sir.size() >= 1) ? sir[sir.size() - 1] : 0x69;
+                    // mdr[0..1]="ng"/"fo", content (flags, counts...) at mdr[2..]
+                    size_t keep = 2;
+                    if (mdr.size() >= 6) {
+                        uint32_t fl = (static_cast<uint32_t>(mdr[2]) << 24) |
+                                      (static_cast<uint32_t>(mdr[3]) << 16) |
+                                      (static_cast<uint32_t>(mdr[4]) << 8) |
+                                      static_cast<uint32_t>(mdr[5]);
+                        keep += 4; // flags word
+                        if (fl & 1) keep += 4;   // frame count
+                        if (fl & 2) keep += 4;   // byte count
+                        if (fl & 4) keep += 100; // TOC
+                        if (fl & 8) keep += 4;   // quality
+                        if (mdr.size() >= keep + 4 &&
+                            mdr[keep] == 'L' && mdr[keep+1] == 'A' &&
+                            mdr[keep+2] == 'M' && mdr[keep+3] == 'E')
+                            keep += 36; // LAME extension tag
+                    }
+                    keep = std::min(keep, mdr.size());
+                    optimized_main_data[i] = {b0, b1};
+                    optimized_main_data[i].insert(optimized_main_data[i].end(),
+                                                  mdr.begin(), mdr.begin() + static_cast<ptrdiff_t>(keep));
+                }
+                SideInfo clean_si{};
+                optimized_side_info[i] = clean_si;
+                continue;
+            }
         auto& frame = all_frames[i];
 
         int n_ch = (frame.header.channel_mode == ChannelMode::Mono) ? 1 : 2;
@@ -198,9 +239,6 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
         BitstreamReader data_reader(global_res);
         size_t frame_main_start = frame_main_starts[i];
         size_t start_byte = (frame_main_start >= static_cast<size_t>(frame.side_info.main_data_begin)) ? (frame_main_start - static_cast<size_t>(frame.side_info.main_data_begin)) : 0;
-        if (i < 5) {
-            printf("Frame %zu: frame_main_start=%zu, main_data_begin=%d, start_byte=%zu\n", i, frame_main_start, frame.side_info.main_data_begin, start_byte);
-        }
         data_reader.seek_bit(start_byte * 8);
 
         BitstreamWriter writer;
@@ -219,32 +257,21 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
                     // read scalefactors
                     int slen1 = 0, slen2 = 0;
                     if (frame.header.version == MpegVersion::MPEG1) {
-                        if (g.window_switching_flag && g.block_type == 2) {
-                            if (g.mixed_block_flag) {
-                                static const int slen1_tab[] = {0, 1, 2, 2, 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3};
-                                static const int slen2_tab[] = {0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3};
-                                slen1 = slen1_tab[g.scalefac_compress];
-                                slen2 = slen2_tab[g.scalefac_compress];
-                            } else {
-                                static const int slen1_tab[] = {0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3};
-                                static const int slen2_tab[] = {0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3};
-                                slen1 = slen1_tab[g.scalefac_compress];
-                                slen2 = slen2_tab[g.scalefac_compress];
-                            }
-                        } else {
-                            static const int slen1_tab[] = {0, 0, 0, 0, 3, 1, 1, 1, 2, 2, 2, 3, 3, 3, 4, 4};
-                            static const int slen2_tab[] = {0, 1, 2, 3, 0, 1, 2, 3, 1, 2, 3, 1, 2, 3, 2, 3};
-                            slen1 = slen1_tab[g.scalefac_compress];
-                            slen2 = slen2_tab[g.scalefac_compress];
-                        }
+                        static const int slen1_tab[] = {0, 0, 0, 0, 3, 1, 1, 1, 2, 2, 2, 3, 3, 3, 4, 4};
+                        static const int slen2_tab[] = {0, 1, 2, 3, 0, 1, 2, 3, 1, 2, 3, 1, 2, 3, 2, 3};
+                        slen1 = slen1_tab[g.scalefac_compress];
+                        slen2 = slen2_tab[g.scalefac_compress];
                     }
                     
                     std::vector<int> scfs;
                     if (g.window_switching_flag && g.block_type == 2) {
-                        if (g.mixed_block_flag) { // NOLINT(bugprone-branch-clone)
+                        if (g.mixed_block_flag) {
+                            // 8 long-window sfb (0-7) at slen1
                             for (int k = 0; k < 8; ++k) scfs.push_back(data_reader.read_bits(slen1));
-                            for (int k = 8; k < 11; ++k) scfs.push_back(data_reader.read_bits(slen1));
-                            for (int k = 11; k < 17; ++k) scfs.push_back(data_reader.read_bits(slen2));
+                            // short sfb 3-5: 3 bands × 3 windows at slen1
+                            for (int k = 0; k < 9; ++k) scfs.push_back(data_reader.read_bits(slen1));
+                            // short sfb 6-11: 6 bands × 3 windows at slen2
+                            for (int k = 0; k < 18; ++k) scfs.push_back(data_reader.read_bits(slen2));
                         } else {
                             for (int k = 0; k < 18; ++k) scfs.push_back(data_reader.read_bits(slen1));
                             for (int k = 18; k < 36; ++k) scfs.push_back(data_reader.read_bits(slen2));
@@ -281,7 +308,9 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
                         g.block_type,
                         g.mixed_block_flag != 0
                     };
-                    auto coeffs = HuffmanOptimizer::decode_quantized_coefficients(orig_cfg, data_reader, frame.header.samplerate, static_cast<size_t>(g.part2_3_length));
+                    int scalefac_bits = static_cast<int>(data_reader.tell_bit() - gc_orig_start);
+                    int max_huff_bits = side_copy.gr[gr][ch].part2_3_length - scalefac_bits;
+                    auto coeffs = HuffmanOptimizer::decode_quantized_coefficients(orig_cfg, data_reader, frame.header.samplerate, max_huff_bits);
                     auto best_cfg = HuffmanOptimizer::find_best_config(coeffs, orig_cfg, frame.header.samplerate);
                     
                     // re-encode
@@ -289,8 +318,8 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
                     if (g.window_switching_flag && g.block_type == 2) {
                         if (g.mixed_block_flag) {
                             for (int k = 0; k < 8; ++k) writer.write_bits(scfs[k], slen1);
-                            for (int k = 8; k < 11; ++k) writer.write_bits(scfs[k], slen1);
-                            for (int k = 11; k < 17; ++k) writer.write_bits(scfs[k], slen2);
+                            for (int k = 8; k < 17; ++k) writer.write_bits(scfs[k], slen1);
+                            for (int k = 17; k < 35; ++k) writer.write_bits(scfs[k], slen2);
                         } else {
                             for (int k = 0; k < 18; ++k) writer.write_bits(scfs[k], slen1);
                             for (int k = 18; k < 36; ++k) writer.write_bits(scfs[k], slen2);
@@ -309,9 +338,24 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
                             if (gr == 0 || frame.side_info.scfsi[ch][3] == 0) writer.write_bits(scfs[k], slen2);
                         }
                     }
-                    HuffmanOptimizer::encode_quantized_coefficients(coeffs, best_cfg, writer, frame.header.samplerate);
                     
-                    // update side info
+                    size_t scalefac_end_bit = writer.tell_bit();
+                    HuffmanOptimizer::encode_quantized_coefficients(coeffs, best_cfg, writer, frame.header.samplerate);
+
+                    // round-trip verification: re-decode the bytes we just wrote and compare
+                    {
+                        int huff_bits = static_cast<int>(writer.tell_bit() - scalefac_end_bit);
+                        BitstreamReader vrdr(writer.data());
+                        vrdr.seek_bit(scalefac_end_bit);
+                        auto vcoeffs = HuffmanOptimizer::decode_quantized_coefficients(best_cfg, vrdr, frame.header.samplerate, huff_bits);
+                        for (int ci = 0; ci < 576; ++ci) {
+                            if (vcoeffs[ci] != coeffs[ci]) {
+                                optimization_failed = true;
+                                break;
+                            }
+                        }
+                    }
+
                     g.big_values = best_cfg.big_values;
                     g.region0_count = best_cfg.region0_count;
                     g.region1_count = best_cfg.region1_count;
@@ -320,9 +364,10 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
                     g.table_select[2] = best_cfg.table2;
                     g.count1table_select = best_cfg.count1_table_select ? 1 : 0;
                     
+                    int orig_part2_3 = side_copy.gr[gr][ch].part2_3_length;
                     g.part2_3_length = static_cast<int>(writer.tell_bit() - out_start);
-                    
-                    data_reader.seek_bit(gc_orig_start + frame.side_info.gr[gr][ch].part2_3_length);
+
+                    data_reader.seek_bit(gc_orig_start + orig_part2_3);
                 }
             }
             }
@@ -339,22 +384,13 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
         int total_orig_bytes = (total_orig_bits + 7) / 8;
 
         std::vector<uint8_t> new_main = writer.data();
-        if (optimization_failed || new_main.size() > static_cast<size_t>(total_orig_bytes)) {
-            // fallback to EXACT original bits from the logical bitstream
-            data_reader.seek_bit(start_byte * 8);
-            BitstreamWriter raw_writer;
-            for (int bit = 0; bit < total_orig_bits; ++bit) {
-                raw_writer.write_bits(data_reader.read_bits(1), 1);
-            }
-            new_main = raw_writer.data();
+        if (optimization_failed || new_main.size() >= static_cast<size_t>(total_orig_bytes)) {
+            // fallback: no improvement or failure — preserve original side_info bits via patch_mdb
+            new_main.assign(global_res.begin() + start_byte, global_res.begin() + start_byte + total_orig_bytes);
             frame.side_info = side_copy;
-        }
-        
-        if (i == 1) {
-            printf("Frame 1: total_orig_bits=%d\n", total_orig_bits);
-            printf("Frame 1 new_main: ");
-            for (size_t b = 0; b < new_main.size() && b < 100; ++b) printf("%02x", new_main[b]);
-            printf("\n");
+        } else {
+            // strictly smaller: use compressed data and re-serialize updated side_info
+            frame_was_optimized[i] = true;
         }
 
         optimized_main_data[i] = new_main;
@@ -391,8 +427,7 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
     }
     
     // track where the xing frame starts in the file
-    size_t xing_header_file_pos = out.tellp(); // usually right after id3v2
-    if (!has_xing) xing_header_file_pos = 0;
+    const size_t xing_header_file_pos = has_xing ? static_cast<size_t>(out.tellp()) : SIZE_MAX;
     
     // backward pass constraint solver
     std::vector<int> required_carryover(N, 0);
@@ -401,13 +436,12 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
         int space_needed = static_cast<int>(optimized_main_data[i].size()) + current_req;
         
         // we allow the forward pass to use up to 320 kbps if needed, so the backward pass should assume max capacity.
-        ChosenBitrate max_br = bytes_to_bitrate(version, samplerate, channel_mode, all_frames[i].header.has_crc, 9999);
+        ChosenBitrate max_br = bytes_to_bitrate(version, samplerate, channel_mode, 9999);
         int max_data_per_frame = max_br.data_size;
         
         current_req = std::max(0, space_needed - max_data_per_frame);
         required_carryover[i] = current_req;
     }
-    
     std::vector<uint8_t> global_main_data;
     int current_reservoir = 0; // free space in past payloads
     
@@ -416,33 +450,43 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
     // pass 1: build global_main_data and calculate main_data_begin
     for (size_t i = 0; i < N; ++i) {
         auto& side = optimized_side_info[i];
-        
+
         int max_reservoir = (version == MpegVersion::MPEG1) ? 511 : 255;
-        
-        if (current_reservoir > max_reservoir) {
-            int stuffing_len = current_reservoir - max_reservoir;
-            for (int j = 0; j < stuffing_len; ++j) {
-                global_main_data.push_back(0xFF); // stuffing byte
-            }
-            current_reservoir = max_reservoir;
+
+        ChosenBitrate bitrate_use;
+        if (has_xing && i == 0) {
+            // use minimum bitrate that fits the trimmed Xing tag content
+            int needed = static_cast<int>(optimized_main_data[0].size());
+            bitrate_use = bytes_to_bitrate(version, samplerate, channel_mode, needed);
+        } else {
+            int req_for_next = (i + 1 < N) ? required_carryover[i + 1] : 0;
+            int bytes_needed = std::max(0, static_cast<int>(optimized_main_data[i].size()) + req_for_next - current_reservoir);
+            bitrate_use = bytes_to_bitrate(version, samplerate, channel_mode, bytes_needed);
         }
-        
+
+        int data_size = bitrate_use.data_size;
+
+        // if this frame would push reservoir past 511, absorb excess as ancillary zeros
+        // (guaranteed to fit: excess = proj - max <= data_size - main_size since current_reservoir <= max)
+        int projected_reservoir = current_reservoir + data_size - static_cast<int>(optimized_main_data[i].size());
+        if (projected_reservoir > max_reservoir) {
+            int excess = projected_reservoir - max_reservoir;
+            optimized_main_data[i].resize(optimized_main_data[i].size() + excess, 0x00);
+            projected_reservoir = max_reservoir;
+        }
+
+        // for the Xing frame, pad to data_size before pushing so pass 2
+        // doesn't read audio bytes to fill the remainder of the payload
+        if (has_xing && i == 0 && static_cast<int>(optimized_main_data[0].size()) < data_size)
+            optimized_main_data[0].resize(static_cast<size_t>(data_size), 0x00);
+
         side.main_data_begin = static_cast<uint16_t>(current_reservoir);
         global_main_data.insert(global_main_data.end(), optimized_main_data[i].begin(), optimized_main_data[i].end());
-        
-        // vbr logic: pick the smallest bitrate that gives us enough data_size
-        // we must ensure that we leave at least required_carryover[i + 1] in the reservoir for the next frames!
-        int req_for_next = (i + 1 < N) ? required_carryover[i + 1] : 0;
-        int bytes_to_store = std::max(0, static_cast<int>(optimized_main_data[i].size()) + req_for_next - current_reservoir);
-        ChosenBitrate bitrate_use = bytes_to_bitrate(version, samplerate, channel_mode, all_frames[i].header.has_crc, bytes_to_store);
-        
-        int data_size = bitrate_use.data_size;
-        current_reservoir = current_reservoir + data_size - static_cast<int>(optimized_main_data[i].size());
-        
+        current_reservoir = projected_reservoir;
         chosen_bitrates[i] = bitrate_use;
-        
-        // always print
-        printf("Pass 2 Frame %zu: new main_data_begin=%d, data_size=%d, opt_main_size=%zu, new_reservoir=%d\n", i, side.main_data_begin, data_size, optimized_main_data[i].size(), current_reservoir);
+
+        if (has_xing && i == 0)
+            current_reservoir = 0;
     }
     
     if (current_reservoir > 0) {
@@ -451,19 +495,36 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
     }
     
     // pass 2: write physical file
+    // find the last frame that actually contains non-zero data
     size_t N_out = N;
+    for (int i = static_cast<int>(N) - 1; i >= 0; --i) {
+        if (chosen_bitrates[i].index == 14) {
+            break;
+        }
+        if (optimized_main_data[i].size() > 0) {
+            break;
+        }
+        if (i == 0) break;
+        N_out = static_cast<size_t>(i);
+    }
     
     size_t global_main_data_ptr = 0;
-    
+
+    // audio frame byte positions in the output file (index 0 = first audio frame, i.e. frame 1 if has_xing)
+    std::vector<size_t> audio_frame_file_pos;
+
     for (size_t i = 0; i < N_out; ++i) {
         const auto& frame = all_frames[i];
         const auto& side = optimized_side_info[i];
-        
+
+        if (has_xing && i > 0)
+            audio_frame_file_pos.push_back(static_cast<size_t>(out.tellp()));
+
         ChosenBitrate bitrate_use = chosen_bitrates[i];
-        
+
         uint32_t h = 0xFFE00000;
         h |= (static_cast<uint32_t>(version == MpegVersion::MPEG1 ? 3 : 2) << 19);
-        h |= (1 << 17) | (frame.header.has_crc ? 0 : (1 << 16));
+        h |= (1 << 17) | (1 << 16);
         h |= (static_cast<uint32_t>(bitrate_use.index) << 12) | (get_samplerate_index(version, samplerate) << 10);
         h |= static_cast<uint32_t>(bitrate_use.padding ? 1 : 0) << 9 | (static_cast<uint32_t>(channel_mode) << 6);
         uint32_t mode_ext = 0;
@@ -474,38 +535,31 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
         h |= static_cast<uint32_t>(frame.header.copyright ? 1 : 0) << 3;
         h |= static_cast<uint32_t>(frame.header.original ? 1 : 0) << 2;
         h |= static_cast<uint32_t>(frame.header.emphasis);
-        
+
         uint8_t head[4];
         head[0] = static_cast<uint8_t>(h >> 24); head[1] = static_cast<uint8_t>(h >> 16); head[2] = static_cast<uint8_t>(h >> 8); head[3] = static_cast<uint8_t>(h);
 
-        std::vector<uint8_t> new_side = serialize_side_info(frame.header, side);
-        
+        std::vector<uint8_t> new_side;
         if (has_xing && i == 0) {
-            new_side = all_frames[i].side_info_raw;
+            new_side.assign(frame.side_info_raw.size(), 0);
+        } else if (frame_was_optimized[i]) {
+            new_side = serialize_side_info(frame.header, side);
+        } else {
+            new_side = patch_mdb(frame.side_info_raw, version, side.main_data_begin);
         }
-        
 
         out.write(reinterpret_cast<const char*>(head), 4);
-        
-        if (frame.header.has_crc) {
-            uint16_t mpeg_crc = 0xFFFF;
-            mpeg_crc = Crc::calc_mpeg_crc(&head[2], 2, mpeg_crc);
-            mpeg_crc = Crc::calc_mpeg_crc(new_side.data(), new_side.size(), mpeg_crc);
-            uint8_t crc_bytes[2] = { static_cast<uint8_t>(mpeg_crc >> 8), static_cast<uint8_t>(mpeg_crc & 0xFF) };
-            out.write(reinterpret_cast<const char*>(crc_bytes), 2);
-        }
-
         out.write(reinterpret_cast<const char*>(new_side.data()), static_cast<std::streamsize>(new_side.size()));
-        
+
         int data_size = bitrate_use.data_size;
         int avail = static_cast<int>(global_main_data.size() - global_main_data_ptr);
         int write_len = std::min(data_size, avail);
-        
+
         if (write_len > 0) {
             out.write(reinterpret_cast<const char*>(&global_main_data[global_main_data_ptr]), write_len);
             global_main_data_ptr += static_cast<size_t>(write_len);
         }
-        
+
         if (data_size > write_len) {
             std::vector<uint8_t> pad(static_cast<size_t>(data_size - write_len), 0x00);
             out.write(reinterpret_cast<const char*>(pad.data()), static_cast<std::streamsize>(pad.size()));
@@ -521,56 +575,53 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
         out.write(reinterpret_cast<const char*>(end_junk.data()), static_cast<std::streamsize>(end_junk.size()));
     }
     
-    // patch xing header 'bytes' field if present
+    // patch xing header fields (bytes count + TOC) if present
     if (has_xing) {
-        out.close();
-        
-        std::fstream patch_stream(output_file, std::ios::in | std::ios::out | std::ios::binary);
-        if (patch_stream) {
-            patch_stream.seekg(static_cast<std::streamoff>(xing_header_file_pos), std::ios::beg);
-            
-            // Read enough of the frame to find Xing
-            std::vector<uint8_t> frame_buf(1024, 0);
-            patch_stream.read(reinterpret_cast<char*>(frame_buf.data()), 1024);
-            std::string s(frame_buf.begin(), frame_buf.begin() + patch_stream.gcount());
-            
-            size_t xing_start = s.find("Xing");
-            if (xing_start == std::string::npos) xing_start = s.find("Info");
-            
-            if (xing_start != std::string::npos && xing_start + 7 < s.size()) {
-                uint32_t flags = (static_cast<uint32_t>(s[xing_start + 4]) << 24) |
-                                 (static_cast<uint32_t>(s[xing_start + 5]) << 16) |
-                                 (static_cast<uint32_t>(s[xing_start + 6]) << 8)  |
-                                 static_cast<uint32_t>(s[xing_start + 7]);
-                                 
-                size_t bytes_offset = xing_start + 8;
-                if (flags & 1) bytes_offset += 4; // skip frames field
-                
-                if (flags & 2) { // bytes field
-                    size_t physical_bytes_pos = xing_header_file_pos + bytes_offset;
-                    size_t total_mp3_bytes = mp3_end_pos - xing_header_file_pos;
-                    uint8_t bytes_buf[4];
-                    bytes_buf[0] = (total_mp3_bytes >> 24) & 0xFF;
-                    bytes_buf[1] = (total_mp3_bytes >> 16) & 0xFF;
-                    bytes_buf[2] = (total_mp3_bytes >> 8) & 0xFF;
-                    bytes_buf[3] = (total_mp3_bytes >> 0) & 0xFF;
-                    
-                    patch_stream.seekp(static_cast<std::streamoff>(physical_bytes_pos), std::ios::beg);
-                    patch_stream.write(reinterpret_cast<const char*>(bytes_buf), 4);
-                    DEBUG_LOG("Patched Xing header Bytes field at offset " << bytes_offset << " to " << total_mp3_bytes << " bytes.");
+        // optimized_main_data[0] always has "Xing"/"Info" at bytes 0-3, flags at 4-7
+        // (regardless of whether the source was CRC or no-CRC)
+        const auto& xing_out = optimized_main_data[0];
+        if (xing_out.size() >= 8) {
+            uint32_t flags = (static_cast<uint32_t>(xing_out[4]) << 24) |
+                             (static_cast<uint32_t>(xing_out[5]) << 16) |
+                             (static_cast<uint32_t>(xing_out[6]) << 8) |
+                             static_cast<uint32_t>(xing_out[7]);
+
+            int side_info_size = (version == MpegVersion::MPEG1) ?
+                                 (channel_mode == ChannelMode::Mono ? 17 : 32) :
+                                 (channel_mode == ChannelMode::Mono ? 9 : 17);
+            // base = start of output main_data = after header(4) + side_info
+            size_t main_data_base = xing_header_file_pos + 4 + static_cast<size_t>(side_info_size);
+            // in output: 'Xing'(4) + flags(4) = offset 8
+            size_t field_offset = 8;
+
+            size_t total_mp3_bytes = mp3_end_pos - xing_header_file_pos;
+
+            if (flags & 1) field_offset += 4; // frames field: skip it
+            if (flags & 2) {
+                out.seekp(static_cast<std::streamoff>(main_data_base + field_offset), std::ios::beg);
+                uint8_t buf[4];
+                buf[0] = (total_mp3_bytes >> 24) & 0xFF;
+                buf[1] = (total_mp3_bytes >> 16) & 0xFF;
+                buf[2] = (total_mp3_bytes >> 8) & 0xFF;
+                buf[3] = (total_mp3_bytes >> 0) & 0xFF;
+                out.write(reinterpret_cast<const char*>(buf), 4);
+                field_offset += 4;
+            }
+
+            if ((flags & 4) && !audio_frame_file_pos.empty()) {
+                // recalculate 100-entry TOC; toc[0] is always 0 (LAME convention)
+                size_t n_audio = audio_frame_file_pos.size();
+                uint8_t toc[100];
+                toc[0] = 0;
+                for (int k = 1; k < 100; ++k) {
+                    size_t fi = (static_cast<size_t>(k) * n_audio) / 100;
+                    if (fi >= n_audio) fi = n_audio - 1;
+                    size_t pos = audio_frame_file_pos[fi] - xing_header_file_pos;
+                    int v = static_cast<int>(256.0 * static_cast<double>(pos) / static_cast<double>(total_mp3_bytes));
+                    toc[k] = static_cast<uint8_t>(std::min(v, 255));
                 }
-                
-                // Recalculate LAME CRC
-                patch_stream.seekg(static_cast<std::streamoff>(xing_header_file_pos), std::ios::beg);
-                uint8_t lame_header_buf[190];
-                patch_stream.read(reinterpret_cast<char*>(lame_header_buf), 190);
-                if (patch_stream.gcount() == 190) {
-                    uint16_t lame_crc = Crc::calc_lame_crc(lame_header_buf, 190);
-                    uint8_t crc_bytes[2] = { static_cast<uint8_t>(lame_crc >> 8), static_cast<uint8_t>(lame_crc & 0xFF) };
-                    patch_stream.seekp(static_cast<std::streamoff>(xing_header_file_pos + 190), std::ios::beg);
-                    patch_stream.write(reinterpret_cast<const char*>(crc_bytes), 2);
-                    DEBUG_LOG("Patched LAME CRC to " << std::hex << lame_crc << std::dec);
-                }
+                out.seekp(static_cast<std::streamoff>(main_data_base + field_offset), std::ios::beg);
+                out.write(reinterpret_cast<const char*>(toc), 100);
             }
         }
     }
