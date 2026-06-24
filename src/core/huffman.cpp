@@ -164,13 +164,9 @@ std::vector<int16_t> HuffmanOptimizer::decode_quantized_coefficients(
 HuffmanConfig HuffmanOptimizer::find_best_config(
         const std::vector<int16_t>& coeffs,
         const HuffmanConfig& orig_config, uint32_t samplerate) {
-    if (orig_config.window_switching_flag) {
-        return orig_config;
-    }
-
     HuffmanConfig best = orig_config;
     uint32_t min_total_bits = 0xFFFFFFFF;
-    auto sf_bands = get_sf_bands(samplerate);
+    const auto sf_bands = get_sf_bands(samplerate);
 
     // pre-calculate bit costs for each coefficient pair in every table
     std::vector<std::array<int, 32>> pair_costs(288);
@@ -269,41 +265,85 @@ HuffmanConfig HuffmanOptimizer::find_best_config(
         }
     }
 
-    for (int bv = last_bv_pair; bv <= max_possible_bv; ++bv) {
-        if (c1_min_bits[bv] == 0xFFFFFFFF) continue;
+    if (orig_config.window_switching_flag) {
+        // region boundaries are fixed by the standard for short/mixed blocks:
+        //   pure short (block_type=2, mixed=0): region0 = (sf_bands_short[3]/2)*3 pairs
+        //   mixed or start/end blocks:           region0 = sf_bands[8]/2 pairs
+        // only two tables (table0, table1); no region2; region0_count/region1_count unused.
+        int region0_boundary;
+        if (orig_config.block_type == 2 && !orig_config.mixed_block_flag) {
+            const auto sf_bands_s = get_sf_bands_short(samplerate);
+            region0_boundary = (sf_bands_s[3] / 2) * 3;
+        } else {
+            region0_boundary = sf_bands[8] / 2;
+        }
 
-        for (int r0_idx = 0; r0_idx < 16; ++r0_idx) {
-            int r0_end = std::min(bv, sf_bands[r0_idx + 1] / 2);
+        for (int bv = last_bv_pair; bv <= max_possible_bv; ++bv) {
+            if (c1_min_bits[bv] == 0xFFFFFFFF) continue;
+
+            const int r0_end = std::min(bv, region0_boundary);
             int t0;
-            uint32_t r0_bits = get_best_region(0, r0_end, t0);
+            const uint32_t r0_bits = get_best_region(0, r0_end, t0);
             if (r0_bits >= 10000) continue;
 
-            for (int r1_idx = 0; r1_idx < 8; ++r1_idx) {
-                int idx = std::min(r0_idx + r1_idx + 2, static_cast<int>(sf_bands.size()) - 1);
-                int r1_end = std::min(bv, sf_bands[idx] / 2);
-                int t1;
-                uint32_t r1_bits = get_best_region(r0_end, r1_end, t1);
-                if (r1_bits >= 10000) continue;
+            int t1;
+            const uint32_t r1_bits = get_best_region(r0_end, bv, t1);
+            if (r1_bits >= 10000) continue;
 
-                int t2;
-                uint32_t r2_bits = get_best_region(r1_end, bv, t2);
-                if (r2_bits >= 10000) continue;
+            const uint32_t total = r0_bits + r1_bits + c1_min_bits[bv];
+            if (total < min_total_bits) {
+                min_total_bits = total;
+                best = {
+                    orig_config.region0_count,
+                    orig_config.region1_count,
+                    static_cast<uint16_t>(bv),
+                    static_cast<uint8_t>(t0),
+                    static_cast<uint8_t>(t1),
+                    uint8_t{0},
+                    c1_best_is_33[bv],
+                    true,
+                    orig_config.block_type,
+                    orig_config.mixed_block_flag
+                };
+            }
+        }
+    } else {
+        for (int bv = last_bv_pair; bv <= max_possible_bv; ++bv) {
+            if (c1_min_bits[bv] == 0xFFFFFFFF) continue;
 
-                uint32_t total = r0_bits + r1_bits + r2_bits + c1_min_bits[bv];
-                if (total < min_total_bits) {
-                    min_total_bits = total;
-                    best = {
-                        static_cast<uint8_t>(r0_idx),
-                        static_cast<uint8_t>(r1_idx),
-                        static_cast<uint16_t>(bv),
-                        static_cast<uint8_t>(t0),
-                        static_cast<uint8_t>(t1),
-                        static_cast<uint8_t>(t2),
-                        c1_best_is_33[bv],
-                        false,
-                        uint8_t{0},
-                        false
-                    };
+            for (int r0_idx = 0; r0_idx < 16; ++r0_idx) {
+                int r0_end = std::min(bv, sf_bands[r0_idx + 1] / 2);
+                int t0;
+                uint32_t r0_bits = get_best_region(0, r0_end, t0);
+                if (r0_bits >= 10000) continue;
+
+                for (int r1_idx = 0; r1_idx < 8; ++r1_idx) {
+                    int idx = std::min(r0_idx + r1_idx + 2, static_cast<int>(sf_bands.size()) - 1);
+                    int r1_end = std::min(bv, sf_bands[idx] / 2);
+                    int t1;
+                    uint32_t r1_bits = get_best_region(r0_end, r1_end, t1);
+                    if (r1_bits >= 10000) continue;
+
+                    int t2;
+                    uint32_t r2_bits = get_best_region(r1_end, bv, t2);
+                    if (r2_bits >= 10000) continue;
+
+                    uint32_t total = r0_bits + r1_bits + r2_bits + c1_min_bits[bv];
+                    if (total < min_total_bits) {
+                        min_total_bits = total;
+                        best = {
+                            static_cast<uint8_t>(r0_idx),
+                            static_cast<uint8_t>(r1_idx),
+                            static_cast<uint16_t>(bv),
+                            static_cast<uint8_t>(t0),
+                            static_cast<uint8_t>(t1),
+                            static_cast<uint8_t>(t2),
+                            c1_best_is_33[bv],
+                            false,
+                            uint8_t{0},
+                            false
+                        };
+                    }
                 }
             }
         }
