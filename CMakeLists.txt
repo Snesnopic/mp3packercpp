@@ -32,6 +32,7 @@ target_link_libraries(mp3packercpp_core PRIVATE Threads::Threads)
 add_executable(mp3packercpp src/cli/main.cpp)
 target_link_libraries(mp3packercpp PRIVATE mp3packercpp_core)
 target_include_directories(mp3packercpp PRIVATE src/cli)
+target_compile_definitions(mp3packercpp PRIVATE MP3PACKERCPP_VERSION="${PROJECT_VERSION}")
 
 include(GNUInstallDirs)
 install(TARGETS mp3packercpp DESTINATION ${CMAKE_INSTALL_BINDIR})

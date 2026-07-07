@@ -18,7 +18,13 @@ int main(int argc, const char* argv[]) {
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
-        if (arg == "-z") {
+        if (arg == "--version") {
+            std::cout << MP3PACKERCPP_VERSION << "\n";
+            return EXIT_SUCCESS;
+        } else if (arg == "-h" || arg == "--help") {
+            printUsage();
+            return EXIT_SUCCESS;
+        } else if (arg == "-z") {
             recompress_huffman = true;
         } else if (arg == "-v") {
             verbose = true;
