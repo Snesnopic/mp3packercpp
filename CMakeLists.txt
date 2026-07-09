@@ -34,5 +34,12 @@ target_link_libraries(mp3packercpp PRIVATE mp3packercpp_core)
 target_include_directories(mp3packercpp PRIVATE src/cli)
 target_compile_definitions(mp3packercpp PRIVATE MP3PACKERCPP_VERSION="${PROJECT_VERSION}")
 
+if(MSVC)
+    # re-assert static runtime on both targets directly, in case find_package(Threads)
+    # interfered with the CMAKE_MSVC_RUNTIME_LIBRARY variable set above
+    set_target_properties(mp3packercpp_core mp3packercpp PROPERTIES
+        MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+endif()
+
 include(GNUInstallDirs)
 install(TARGETS mp3packercpp DESTINATION ${CMAKE_INSTALL_BINDIR})
