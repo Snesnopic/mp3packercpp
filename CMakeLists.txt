@@ -1,13 +1,10 @@
-cmake_minimum_required(VERSION 3.12..4.3)
+cmake_minimum_required(VERSION 3.15...4.3)
 
 project(mp3packercpp VERSION 1.1.1 LANGUAGES CXX)
 
 if(MSVC)
     # force static msvc runtime linkage (/mt for release, /mtd for debug)
-    if(POLICY CMP0091)
-        cmake_policy(SET CMP0091 NEW)
-        set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
-    endif()
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif()
 
 set(CMAKE_CXX_STANDARD 17)
@@ -33,13 +30,6 @@ add_executable(mp3packercpp src/cli/main.cpp)
 target_link_libraries(mp3packercpp PRIVATE mp3packercpp_core)
 target_include_directories(mp3packercpp PRIVATE src/cli)
 target_compile_definitions(mp3packercpp PRIVATE MP3PACKERCPP_VERSION="${PROJECT_VERSION}")
-
-if(MSVC)
-    # re-assert static runtime on both targets directly, in case find_package(Threads)
-    # interfered with the CMAKE_MSVC_RUNTIME_LIBRARY variable set above
-    set_target_properties(mp3packercpp_core mp3packercpp PROPERTIES
-        MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
-endif()
 
 include(GNUInstallDirs)
 install(TARGETS mp3packercpp DESTINATION ${CMAKE_INSTALL_BINDIR})
