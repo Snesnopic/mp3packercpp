@@ -20,9 +20,11 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 add_library(mp3packercpp_core STATIC
             src/core/huffman.cpp
             src/core/mp3_reader.cpp
-            src/core/packer.cpp)
+            src/core/packer.cpp
+            src/core/decoder.cpp)
 
 target_include_directories(mp3packercpp_core PUBLIC src/core/include)
+target_include_directories(mp3packercpp_core PRIVATE third_party/minimp3)
 target_link_libraries(mp3packercpp_core PRIVATE Threads::Threads)
 
 # --- CLI Executable ---
