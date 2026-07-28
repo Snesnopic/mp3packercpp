@@ -16,16 +16,22 @@ struct SymbolCode {
 class HuffmanTableManager {
 public:
     static const std::array<SymbolCode, 256>& get_encoding_map(const uint8_t table_idx) {
-        static std::array<std::array<SymbolCode, 256>, 34> cache;
-        static std::array<bool, 34> initialized{};
-        if (!initialized[table_idx]) {
-            cache[table_idx] = build_map(table_idx);
-            initialized[table_idx] = true;
-        }
+        // a single function-local static gets the C++11 magic-statics guarantee: the
+        // first caller (from any thread) builds all 34 maps once under the compiler's
+        // hidden guard, every other caller just reads the finished const array — no
+        // per-table locking needed, unlike the old per-index lazy cache which raced
+        // across worker threads.
+        static const std::array<std::array<SymbolCode, 256>, 34> cache = build_all_maps();
         return cache[table_idx];
     }
 
 private:
+    static std::array<std::array<SymbolCode, 256>, 34> build_all_maps() {
+        std::array<std::array<SymbolCode, 256>, 34> all{};
+        for (uint8_t idx = 0; idx < 34; ++idx) all[idx] = build_map(idx);
+        return all;
+    }
+
     static std::array<SymbolCode, 256> build_map(const uint8_t table_idx) {
         std::array<SymbolCode, 256> arr{};
         for (auto& sym : arr) sym.valid = false;
@@ -344,7 +350,15 @@ HuffmanConfig HuffmanOptimizer::find_best_config(
                             false
                         };
                     }
+
+                    // sf_bands is monotone, so r1_end saturates at bv and stays there for
+                    // every larger r1_idx: region1/region2 would be identical, so stop here.
+                    if (r1_end == bv) break;
                 }
+
+                // same saturation argument for r0_end: once it hits bv, every larger r0_idx
+                // reproduces the exact same r0_bits/t0 and an immediately-saturated inner loop.
+                if (r0_end == bv) break;
             }
         }
     }

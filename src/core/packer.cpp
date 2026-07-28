@@ -172,7 +172,10 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
 
     std::vector<std::vector<uint8_t>> optimized_main_data(N);
     std::vector<SideInfo> optimized_side_info(N);
-    std::vector<bool> frame_was_optimized(N, false);
+    // plain uint8_t, not vector<bool>: worker threads write distinct indices concurrently,
+    // and vector<bool>'s packed-bit storage would make that a genuine data race (RMW on a
+    // shared word) even though each thread only touches its own logical element.
+    std::vector<uint8_t> frame_was_optimized(N, 0);
     
     std::vector<uint8_t> global_res;
     std::vector<size_t> frame_main_starts(N);
@@ -182,7 +185,7 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
     }
 
     std::atomic<size_t> current_frame{0};
-    unsigned int active_threads = std::max(1u, std::thread::hardware_concurrency());
+    unsigned int active_threads = num_threads > 0 ? num_threads : std::max(1u, std::thread::hardware_concurrency());
 
     auto worker = [&]() {
         while (true) {
@@ -246,7 +249,11 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
         bool optimization_failed = false;
         
         try {
-            if (!this->recompress_huffman) {
+            if (!this->recompress_huffman || frame.header.version != MpegVersion::MPEG1) {
+                // MPEG2/2.5 LSF scalefactor compression uses a different band-group
+                // layout and slen decomposition (ISO 13818-3 Annex B) than MPEG1's fixed
+                // 6/5/5/5 table with granule-1 scfsi copying; not implemented yet, so
+                // fall back to a verbatim copy rather than risk desyncing the bitstream.
                 optimization_failed = true; // fallback to raw copy of original data
             } else {
                 for (int gr = 0; gr < n_gr; ++gr) {
@@ -523,7 +530,10 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
         ChosenBitrate bitrate_use = chosen_bitrates[i];
 
         uint32_t h = 0xFFE00000;
-        h |= (static_cast<uint32_t>(version == MpegVersion::MPEG1 ? 3 : 2) << 19);
+        uint32_t version_bits = 2; // MPEG2
+        if (version == MpegVersion::MPEG1) version_bits = 3;
+        else if (version == MpegVersion::MPEG25) version_bits = 0;
+        h |= (version_bits << 19);
         h |= (1 << 17) | (1 << 16);
         h |= (static_cast<uint32_t>(bitrate_use.index) << 12) | (get_samplerate_index(version, samplerate) << 10);
         h |= static_cast<uint32_t>(bitrate_use.padding ? 1 : 0) << 9 | (static_cast<uint32_t>(channel_mode) << 6);
