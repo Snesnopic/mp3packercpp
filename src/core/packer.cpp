@@ -409,12 +409,20 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
         }
     };
 
-    std::vector<std::thread> threads;
-    for (unsigned int t = 0; t < active_threads; ++t) {
-        threads.emplace_back(worker);
-    }
-    for (auto& thread : threads) {
-        thread.join();
+    // Spawning and joining threads costs more than the work when there is no
+    // Huffman search to do: without -z a frame's worth of work is a slice copy, and
+    // sixteen threads were being created to share it.
+    if (active_threads == 1 || !this->recompress_huffman) {
+        worker();
+    } else {
+        std::vector<std::thread> threads;
+        threads.reserve(active_threads);
+        for (unsigned int t = 0; t < active_threads; ++t) {
+            threads.emplace_back(worker);
+        }
+        for (auto& thread : threads) {
+            thread.join();
+        }
     }
     
     DEBUG_LOG("Huffman optimization completed. Running reservoir constraint solver...");
