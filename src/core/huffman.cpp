@@ -441,12 +441,15 @@ static void accumulate_costs(int32_t* acc, const uint32_t* keys, const int n, co
 /// so that the lowest table index wins a tie — the order the original's ascending
 /// scan with a strict comparison settled on.
 static inline uint32_t best_span(const int32_t* from, const int32_t* to) {
-    int32_t best = INT32_MAX;
+    // Written as an unsigned minimum over the 32 lanes so that it vectorises:
+    // costs are non-negative, so unsigned and signed order agree, and a signed
+    // shift that might overflow is enough to stop the vectoriser cold.
+    uint32_t best = UINT32_MAX;
     for (int t = 0; t < kNumTables; ++t) {
-        const int32_t k = (to[t] - from[t]) << 5 | t;
-        if (k < best) best = k;
+        const uint32_t k = static_cast<uint32_t>(to[t] - from[t]) << 5 | static_cast<uint32_t>(t);
+        best = std::min(best, k);
     }
-    return static_cast<uint32_t>(best);
+    return best;
 }
 
 /// Working set of one search. Thread-local because the search runs once per
