@@ -77,6 +77,26 @@ public:
      */
     static void encode_quantized_coefficients(const Spectrum& coeffs, const HuffmanConfig& config, BitstreamWriter& writer, uint32_t samplerate);
 
+    /**
+     * @brief Resolves one prefix of one big-value table exactly as the decoder does.
+     *
+     * Exposed for the tests: the decoder trusts the probe table for 99% of what it
+     * reads, and one wrong entry would decode a pair to the wrong magnitudes or
+     * desynchronise the region, so every entry is held against a walk of the tree.
+     *
+     * @param table_idx Big-value table index (0-31).
+     * @param prefix    The next probe_bits() bits of the stream, most significant first.
+     * @param x         Clamped magnitude of the first value, or unset if deferred.
+     * @param y         Clamped magnitude of the second value, or unset if deferred.
+     * @param length    Codeword length in bits, or unset if deferred.
+     * @param signs     Number of sign bits the pair takes, or unset if deferred.
+     * @return False if the codeword is longer than the probe, which defers to a tree walk.
+     */
+    static bool probe_pair(int table_idx, unsigned prefix, int& x, int& y, int& length, int& signs);
+
+    /** @brief How many bits of the stream index the big-value probe. */
+    static int probe_bits();
+
 };
 
 } // namespace mp3packer

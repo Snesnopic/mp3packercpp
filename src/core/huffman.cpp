@@ -147,6 +147,70 @@ constexpr uint8_t kLongCode = 0xFF;
 
 using DecodeLut = DecodeEntry[256];
 
+// --- big-value pair probe --------------------------------------------------
+//
+// How many bits of the stream index the probe. Measured here rather than inherited:
+// against a ten-bit table, eight bits costs 4.9%, nine 5.8%, eleven 4.7% and twelve
+// 5.1%, each losing every one of eight interleaved pairs, with a ten-against-ten
+// control at +0.15%. Narrower defers more codewords to a tree walk; wider stops
+// fitting alongside the search's cost tables.
+//
+// Worth noting because the same idea in the Go implementation of this tool, measured
+// on this same machine, found eleven bits a tie with ten. The tables there are the
+// same size, so the difference is this program's other resident tables, not the
+// cache: an inherited constant would have been the wrong one.
+constexpr int kProbeBits = 10;
+constexpr size_t kProbeSize = size_t{1} << kProbeBits;
+
+/// A resolved big-value pair: not the symbol, but the two magnitudes it stands
+/// for, the codeword's length, and each magnitude's sign-bit count.
+///
+/// The point of packing all of that into one entry is that decoding a pair becomes
+/// a single load and some shifts. Reading a symbol and then looking up what it
+/// means put two dependent loads on the critical path, once per pair, and the
+/// second could not begin until the first had landed.
+///
+///   bits 0-3   x, clamped to 15
+///   bits 4-7   y, clamped to 15
+///   bits 8-11  codeword length, which is at most kProbeBits here
+///   bit 12     whether x takes a sign bit
+///   bit 13     whether y takes a sign bit
+///   bit 14     set when the codeword is longer than the probe
+using PairEntry = uint16_t;
+constexpr PairEntry kPairSlow = 1 << 14;
+
+using PairProbe = PairEntry[kProbeSize];
+
+static const PairProbe* pair_probes() {
+    static const std::array<std::array<PairEntry, kProbeSize>, 32> tables = [] {
+        std::array<std::array<PairEntry, kProbeSize>, 32> all{};
+        for (int idx = 0; idx < 32; ++idx) {
+            const int16_t* tab = huffman_tables[idx].table;
+            for (size_t prefix = 0; prefix < kProbeSize; ++prefix) {
+                int node = 0, used = 0;
+                for (;;) {
+                    const int16_t v = tab[node];
+                    if (v >= 0) { // leaf: the codeword fits in the probe
+                        const int x = (v >> 4) & 0xF, y = v & 0xF;
+                        all[idx][prefix] = static_cast<PairEntry>(
+                            x | y << 4 | used << 8 | (x != 0) << 12 | (y != 0) << 13);
+                        break;
+                    }
+                    if (used == kProbeBits) { // longer than the probe: walk it instead
+                        all[idx][prefix] = kPairSlow;
+                        break;
+                    }
+                    ++node;
+                    if (prefix >> (kProbeBits - 1 - used) & 1) node -= v;
+                    ++used;
+                }
+            }
+        }
+        return all;
+    }();
+    return reinterpret_cast<const PairProbe*>(tables.data());
+}
+
 /// One count1 quadruple, signs applied. Indexed by the codeword's non-zero pattern
 /// together with the four bits that follow it, so the pattern and its signs come
 /// out of a single lookup however many of those bits are really consumed.
@@ -214,6 +278,7 @@ void HuffmanOptimizer::decode_quantized_coefficients(
     int out_off = 0;
     const auto sf_bands = get_sf_bands(samplerate);
     const DecodeLut* luts = decode_luts();
+    const PairProbe* probes = pair_probes();
     const Count1Quad* quads = count1_quad_table();
     // The bit position is carried in a local rather than in the reader: going
     // through it for every bit of every symbol put a store-to-load turnaround on
@@ -264,7 +329,7 @@ void HuffmanOptimizer::decode_quantized_coefficients(
     auto decode_region = [&](const int count_pairs, const uint8_t table_idx) -> bool {
         const int linbits = huffman_tables[table_idx].linbits;
         const int16_t* tree = huffman_tables[table_idx].table;
-        const DecodeEntry* lut = luts[table_idx];
+        const PairEntry* probe = probes[table_idx];
         // A magnitude of 15 escapes to linbits, but only for tables that have any.
         // Putting the trigger out of range for the others folds "does this table
         // escape" into the comparison the loop was making anyway.
@@ -287,47 +352,61 @@ void HuffmanOptimizer::decode_quantized_coefficients(
             if (bp >= bit_limit) return false;
             if (bp > fast_until) { decode_pair_slow(table_idx, linbits); continue; }
             uint64_t w = reader.peek_at(bp);
-            int used;
-            int sym;
-            const DecodeEntry& e = lut[w >> 56];
-            if (e.length != kLongCode) {
-                sym = e.symbol;
-                used = e.length;
+            const PairEntry e = probe[w >> (64 - kProbeBits)];
+            int used, x, y;
+            unsigned nx, ny;
+            if (e < kPairSlow) {
+                // The codeword length is taken out first: everything after this
+                // waits on the window having moved past the codeword, and nothing
+                // waits on the magnitudes.
+                used = e >> 8 & 0xF;
                 w <<= used;
+                x = e & 0xF;
+                y = e >> 4 & 0xF;
+                nx = e >> 12 & 1;
+                ny = e >> 13 & 1;
             } else {
-                int node = e.node;
-                used = 8;
-                w <<= 8;
+                // One codeword in a hundred is longer than the probe. Walking it
+                // from the root is cheaper than keeping a table of positions to
+                // resume from — measured, in the implementation this follows.
+                int node = 0;
+                int sym = 0;
+                used = 0;
                 for (;;) {
                     const int16_t v = tree[node];
                     if (v >= 0) { sym = v; break; }
                     ++node;
-                    if (w >> 63) node -= v;
-                    w <<= 1;
+                    if (w >> (63 - used) & 1) node -= v;
                     ++used;
                 }
+                w <<= used;
+                x = (sym >> 4) & 0xF;
+                y = sym & 0xF;
+                nx = static_cast<unsigned>(x != 0);
+                ny = static_cast<unsigned>(y != 0);
             }
-            int y = sym & 0xF;
-            int x = (sym >> 4) & 0xF;
-            if (x > 0) {
-                if (x == escape) {
-                    x += static_cast<int>(w >> (64 - linbits));
-                    w <<= linbits;
-                    used += linbits;
-                }
-                if (w >> 63) x = -x;
-                w <<= 1;
-                ++used;
+            // Neither a sign bit nor whether a value is zero can be predicted, so
+            // neither is branched on now that the sign counts arrive with the pair.
+            // Applying a sign is an xor and an add — v^-1+1 is -v, v^0+0 is v — and
+            // it is a no-op on zero for either sign bit, so only the bit advance
+            // depends on the value: a shift by the sign count, zero or one.
+            if (x == escape) {
+                x += static_cast<int>(w >> (64 - linbits));
+                w <<= linbits;
+                used += linbits;
             }
-            if (y > 0) {
-                if (y == escape) {
-                    y += static_cast<int>(w >> (64 - linbits));
-                    w <<= linbits;
-                    used += linbits;
-                }
-                if (w >> 63) y = -y;
-                ++used;
+            const int sx = static_cast<int>(w >> 63);
+            x = (x ^ -sx) + sx;
+            w <<= nx;
+            used += static_cast<int>(nx);
+            if (y == escape) {
+                y += static_cast<int>(w >> (64 - linbits));
+                w <<= linbits;
+                used += linbits;
             }
+            const int sy = static_cast<int>(w >> 63);
+            y = (y ^ -sy) + sy;
+            used += static_cast<int>(ny);
             coeffs[out_off++] = static_cast<int16_t>(x);
             coeffs[out_off++] = static_cast<int16_t>(y);
             bp += static_cast<size_t>(used);
@@ -928,6 +1007,19 @@ HuffmanConfig HuffmanOptimizer::find_best_config(
     return best;
 }
 
+int HuffmanOptimizer::probe_bits() { return kProbeBits; }
+
+bool HuffmanOptimizer::probe_pair(const int table_idx, const unsigned prefix,
+                                  int& x, int& y, int& length, int& signs) {
+    const PairEntry e = pair_probes()[table_idx][prefix];
+    if (e >= kPairSlow) return false;
+    x = e & 0xF;
+    y = e >> 4 & 0xF;
+    length = e >> 8 & 0xF;
+    signs = (e >> 12 & 1) + (e >> 13 & 1);
+    return true;
+}
+
 void HuffmanOptimizer::encode_quantized_coefficients(
         const Spectrum& coeffs, const HuffmanConfig& config,
         BitstreamWriter& writer, const uint32_t samplerate) {
@@ -1028,3 +1120,7 @@ void HuffmanOptimizer::encode_quantized_coefficients(
 }
 
 } // namespace mp3packer
+
+/// Gives the tests the tree a big-value table is built from, so that the probe can
+/// be held against it without publishing the table header.
+const int16_t* huffman_tree_for_test(const int idx) { return mp3packer::huffman_tables[idx].table; }
