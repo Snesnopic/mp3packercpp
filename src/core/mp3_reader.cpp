@@ -1,6 +1,7 @@
 #include "include/mp3_reader.hpp"
 #include "include/logger.hpp"
 #include "include/bitstream.hpp"
+#include <algorithm>
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -24,6 +25,17 @@ Mp3Reader::Mp3Reader(const std::string& filename) : start_junk_(), end_junk_() {
 }
 
 Mp3Reader::~Mp3Reader() = default;
+
+bool Mp3Reader::skip(const size_t n) {
+    if (exhausted_) return false;
+    if (data_.size() - pos_ < n) {
+        pos_ = data_.size();
+        exhausted_ = true;
+        return false;
+    }
+    pos_ += n;
+    return true;
+}
 
 bool Mp3Reader::take(uint8_t* dst, const size_t n) {
     if (exhausted_) {
@@ -169,10 +181,10 @@ std::optional<Mp3Frame> Mp3Reader::read_next_frame() {
             take(crc_bytes, 2);
         }
 
-        frame.side_info_raw.resize(static_cast<size_t>(side_info_size));
-        take(frame.side_info_raw.data(), static_cast<size_t>(side_info_size));
+        frame.side_info_size = static_cast<uint8_t>(side_info_size);
+        take(frame.side_info_raw, static_cast<size_t>(side_info_size));
 
-        BitstreamReader side_reader(frame.side_info_raw);
+        BitstreamReader side_reader(frame.side_info_raw, static_cast<size_t>(side_info_size));
         SideInfo& si = frame.side_info;
         const int num_channels = (header->channel_mode == ChannelMode::Mono) ? 1 : 2;
         const int num_granules = (header->version == MpegVersion::MPEG1) ? 2 : 1;
@@ -243,8 +255,14 @@ std::optional<Mp3Frame> Mp3Reader::read_next_frame() {
         const int crc_size      = header->has_crc ? 2 : 0;
         const int main_data_size = static_cast<int>(header->bitrate.frame_size) - 4 - crc_size - side_info_size;
 
-        frame.main_data_raw.resize(static_cast<size_t>(main_data_size));
-        take(frame.main_data_raw.data(), static_cast<size_t>(main_data_size));
+        // The payload stays where it is; a short one at the end of a truncated file
+        // is zero-filled by whoever reads it, as a short read used to leave it.
+        frame.main_data_offset = pos_;
+        frame.main_data_size = static_cast<size_t>(main_data_size);
+        frame.main_data_avail = exhausted_ ? 0 : std::min(frame.main_data_size, data_.size() - pos_);
+        if (!skip(frame.main_data_size)) {
+            // ran off the end: later reads fail as before
+        }
 
         return frame;
     }

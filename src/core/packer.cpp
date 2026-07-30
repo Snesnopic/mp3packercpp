@@ -18,8 +18,8 @@ namespace mp3packer {
 Packer::Packer() = default;
 
 // Takes the original raw side_info bytes and sets only the main_data_begin field.
-static std::vector<uint8_t> patch_mdb(const std::vector<uint8_t>& raw, const MpegVersion version, const uint16_t new_mdb) {
-    std::vector<uint8_t> out = raw;
+static std::vector<uint8_t> patch_mdb(const uint8_t* raw, const size_t size, const MpegVersion version, const uint16_t new_mdb) {
+    std::vector<uint8_t> out(raw, raw + size);
     if (version == MpegVersion::MPEG1) {
         // main_data_begin is 9 bits (bits 0-8 MSB first)
         out[0] = static_cast<uint8_t>((new_mdb >> 1) & 0xFF);
@@ -95,12 +95,12 @@ static uint32_t get_samplerate_index(const MpegVersion v, const uint32_t sr) {
     return 0;
 }
 
-static bool is_xing_frame(const Mp3Frame& frame) {
-    std::vector<uint8_t> full_frame;
-    full_frame.insert(full_frame.end(), frame.side_info_raw.begin(), frame.side_info_raw.end());
-    full_frame.insert(full_frame.end(), frame.main_data_raw.begin(), frame.main_data_raw.end());
-    if (full_frame.size() < 100) return false;
-    const std::string s(full_frame.begin(), full_frame.begin() + std::min(static_cast<size_t>(100), full_frame.size()));
+static bool is_xing_frame(const Mp3Frame& frame, const std::vector<uint8_t>& file) {
+    std::string s;
+    s.append(reinterpret_cast<const char*>(frame.side_info_raw), frame.side_info_size);
+    s.append(reinterpret_cast<const char*>(file.data() + frame.main_data_offset), frame.main_data_avail);
+    if (s.size() < 100) return false;
+    s.resize(100);
     return (s.find("Xing") != std::string::npos || s.find("Info") != std::string::npos);
 }
 
@@ -161,7 +161,8 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
 
     bool has_xing = false;
     // removed unused xing_frame here
-    if (is_xing_frame(all_frames[0])) {
+    const std::vector<uint8_t>& file = reader.data();
+    if (is_xing_frame(all_frames[0], file)) {
         has_xing = true;
         // do not erase it! we must keep it to preserve the lame tag!
         // all_frames.erase(all_frames.begin());
@@ -180,12 +181,17 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
     
     std::vector<uint8_t> global_res;
     size_t total_main = 0;
-    for (const auto& frame : all_frames) total_main += frame.main_data_raw.size();
+    for (const auto& frame : all_frames) total_main += frame.main_data_size;
     global_res.reserve(total_main);
     std::vector<size_t> frame_main_starts(N);
     for (size_t i = 0; i < N; ++i) {
         frame_main_starts[i] = global_res.size();
-        global_res.insert(global_res.end(), all_frames[i].main_data_raw.begin(), all_frames[i].main_data_raw.end());
+        // One copy, out of the file and into the reservoir view. A payload the file
+        // does not hold in full is zero-filled to its declared length.
+        const auto& fr = all_frames[i];
+        global_res.insert(global_res.end(), file.data() + fr.main_data_offset,
+                          file.data() + fr.main_data_offset + fr.main_data_avail);
+        global_res.resize(frame_main_starts[i] + fr.main_data_size, 0x00);
     }
 
     std::atomic<size_t> current_frame{0};
@@ -207,17 +213,19 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
                 //   CRC file:    "Xi"/"In" is in si[-2:], "ng"/"fo" at mdr[0].
                 //                Prepend si[-2:] and copy standard Xing content (through LAME
                 //                extension if present), trimming trailing zeros to save space.
-                const auto& mdr = all_frames[i].main_data_raw;
+                const uint8_t* mdr = file.data() + all_frames[i].main_data_offset;
+                const size_t mdr_size = all_frames[i].main_data_avail;
                 if (!all_frames[i].header.has_crc) {
-                    optimized_main_data[i].assign(mdr.begin(), mdr.end());
+                    optimized_main_data[i].assign(mdr, mdr + mdr_size);
                 } else {
                     // CRC: recover "Xi"/"In" from the last 2 bytes of the original side_info
-                    const auto& sir = all_frames[i].side_info_raw;
-                    uint8_t b0 = (sir.size() >= 2) ? sir[sir.size() - 2] : 0x58;
-                    uint8_t b1 = (sir.size() >= 1) ? sir[sir.size() - 1] : 0x69;
+                    const uint8_t* sir = all_frames[i].side_info_raw;
+                    const size_t sir_size = all_frames[i].side_info_size;
+                    uint8_t b0 = (sir_size >= 2) ? sir[sir_size - 2] : 0x58;
+                    uint8_t b1 = (sir_size >= 1) ? sir[sir_size - 1] : 0x69;
                     // mdr[0..1]="ng"/"fo", content (flags, counts...) at mdr[2..]
                     size_t keep = 2;
-                    if (mdr.size() >= 6) {
+                    if (mdr_size >= 6) {
                         uint32_t fl = (static_cast<uint32_t>(mdr[2]) << 24) |
                                       (static_cast<uint32_t>(mdr[3]) << 16) |
                                       (static_cast<uint32_t>(mdr[4]) << 8) |
@@ -227,15 +235,14 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
                         if (fl & 2) keep += 4;   // byte count
                         if (fl & 4) keep += 100; // TOC
                         if (fl & 8) keep += 4;   // quality
-                        if (mdr.size() >= keep + 4 &&
+                        if (mdr_size >= keep + 4 &&
                             mdr[keep] == 'L' && mdr[keep+1] == 'A' &&
                             mdr[keep+2] == 'M' && mdr[keep+3] == 'E')
                             keep += 36; // LAME extension tag
                     }
-                    keep = std::min(keep, mdr.size());
+                    keep = std::min(keep, mdr_size);
                     optimized_main_data[i] = {b0, b1};
-                    optimized_main_data[i].insert(optimized_main_data[i].end(),
-                                                  mdr.begin(), mdr.begin() + static_cast<ptrdiff_t>(keep));
+                    optimized_main_data[i].insert(optimized_main_data[i].end(), mdr, mdr + keep);
                 }
                 SideInfo clean_si{};
                 optimized_side_info[i] = clean_si;
@@ -604,11 +611,11 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
 
         std::vector<uint8_t> new_side;
         if (has_xing && i == 0) {
-            new_side.assign(frame.side_info_raw.size(), 0);
+            new_side.assign(frame.side_info_size, 0);
         } else if (frame_was_optimized[i]) {
             new_side = serialize_side_info(frame.header, side);
         } else {
-            new_side = patch_mdb(frame.side_info_raw, version, side.main_data_begin);
+            new_side = patch_mdb(frame.side_info_raw, frame.side_info_size, version, side.main_data_begin);
         }
 
         append(head, 4);

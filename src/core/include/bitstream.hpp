@@ -53,7 +53,15 @@ public:
      * @param data Reference to the vector of bytes to read from.
      */
     explicit BitstreamReader(const std::vector<uint8_t>& data)
-        : data_(data.data()), size_(data.size()) {
+        : BitstreamReader(data.data(), data.size()) {}
+
+    /**
+     * @brief Constructs a BitstreamReader over a plain buffer.
+     * @param data Start of the bytes to read.
+     * @param size How many of them there are.
+     */
+    BitstreamReader(const uint8_t* data, const size_t size)
+        : data_(data), size_(size) {
         // The tail is mirrored into a zero-filled buffer so that a read near the
         // end of the data is the same load as any other: reads past the end yield
         // zero bits, which is how the byte-walking reader behaved, and what a

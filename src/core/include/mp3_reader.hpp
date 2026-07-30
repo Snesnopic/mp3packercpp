@@ -34,6 +34,11 @@ public:
     std::optional<Mp3Frame> read_next_frame();
 
     /**
+     * @brief The whole file, which frames' payload spans point into.
+     */
+    [[nodiscard]] const std::vector<uint8_t>& data() const { return data_; }
+
+    /**
      * @brief Retrieves any junk data found before the first MP3 frame (e.g. ID3v2 tag).
      * @return Constant reference to the prefix junk data.
      */
@@ -61,6 +66,12 @@ private:
      * @return False if the data ran out.
      */
     bool take(uint8_t* dst, size_t n);
+
+    /**
+     * @brief Advances the cursor over n bytes without copying them.
+     * @return False if the data ran out, in which case later reads fail too.
+     */
+    bool skip(size_t n);
     
     /**
      * @brief Parses a 32-bit header into an Mp3Header struct.

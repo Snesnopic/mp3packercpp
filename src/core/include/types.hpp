@@ -83,14 +83,27 @@ struct SideInfo {
     GrChInfo gr[2][2];            ///< Granule and channel specific decoding info [granule][channel]
 };
 
+/// Largest side info there is: MPEG-1 stereo.
+constexpr size_t kMaxSideInfoSize = 32;
+
 /**
  * @brief Encapsulates a complete MP3 frame during the processing pipeline.
+ *
+ * A frame describes its bytes rather than owning copies of them. The reader holds
+ * the whole file, so the payload is a span into that, and the side info — at most
+ * 32 bytes — sits inline. Copying both into vectors per frame cost two allocations
+ * and a copy of the entire audio for a program that only ever reads them.
  */
 struct Mp3Frame {
-    Mp3Header header{};                  ///< Parsed frame header
-    SideInfo side_info{};                ///< Parsed side information
-    std::vector<uint8_t> side_info_raw{};///< Raw bytes of the side info section
-    std::vector<uint8_t> main_data_raw{};///< Raw bytes of the main data (payload)
+    Mp3Header header{};    ///< Parsed frame header
+    SideInfo side_info{};  ///< Parsed side information
+
+    uint8_t side_info_raw[kMaxSideInfoSize] = {}; ///< Raw bytes of the side info section
+    uint8_t side_info_size = 0;                   ///< How many of those bytes there are
+
+    size_t main_data_offset = 0; ///< Where the payload starts in the reader's data
+    size_t main_data_size = 0;   ///< Declared payload length, which may run past the data
+    size_t main_data_avail = 0;  ///< How much of it the file actually holds
 };
 
 } // namespace mp3packer
