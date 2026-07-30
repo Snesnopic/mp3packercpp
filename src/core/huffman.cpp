@@ -545,6 +545,18 @@ static inline uint32_t best_span(const int32_t* from, const int32_t* to) {
 #endif
 }
 
+/// The cheapest two-region cover of every pair below a boundary: what it costs,
+/// where region0 ends and the tables both regions use. None of it moves with
+/// big_values, so it is settled once per boundary and only read thereafter.
+struct PrefixSplit {
+    int32_t bits = 0;
+    int16_t k0 = 0;   ///< boundary region0 ends at
+    int8_t t0 = 0;
+    int8_t t1 = 0;
+    bool ok = false;
+    bool done = false;
+};
+
 /// Working set of one search. Thread-local because the search runs once per
 /// granule — hundreds of thousands of times per second — and these arrays are far
 /// too large to keep reallocating.
@@ -555,6 +567,7 @@ struct SearchScratch {
     int32_t rows[kNumBands + 1][kNumTables];      ///< totals at each boundary; slot kNumBands is the short-block region0 boundary
     bool row_valid[kNumBands + 1];
 
+    PrefixSplit prefix[kNumBands];                ///< best two-region cover below a boundary, fixed across candidates
     uint32_t head[kNumBands + 1];                 ///< span [0, boundary), fixed across candidates
     bool head_done[kNumBands + 1];
     uint32_t mid[kNumBands + 1][kNumBands + 1];   ///< span between two boundaries, likewise fixed
@@ -647,6 +660,7 @@ HuffmanConfig HuffmanOptimizer::find_best_config(
     std::fill(std::begin(sc.head_done), std::end(sc.head_done), false);
     std::fill(std::begin(sc.tail_bv), std::end(sc.tail_bv), -1);
     for (auto& row : sc.mid_done) std::fill(std::begin(row), std::end(row), false);
+    for (auto& p : sc.prefix) p = PrefixSplit{};
 
     // The accumulator walks the pairs once, in step with big_values, snapshotting
     // each boundary as it passes: every prefix the search can ask about is either
@@ -687,6 +701,35 @@ HuffmanConfig HuffmanOptimizer::find_best_config(
         }
         return sc.mid[a][b];
     };
+
+    // The best two-region cover below a boundary. Both spans it considers are
+    // between snapshots, so neither moves with big_values and the answer is
+    // computed the first time a candidate can reach the boundary at all. On a tie
+    // the lower region0 boundary wins, which is the order the enumeration it
+    // replaces would have found them in.
+    auto span_prefix = [&](const int k1) -> const PrefixSplit& {
+        PrefixSplit& p = sc.prefix[k1];
+        if (p.done) return p;
+        p.done = true;
+        for (int k0 = std::max(1, k1 - 8); k0 <= std::min(k1 - 1, 16); ++k0) {
+            const uint32_t packed0 = span_head(k0);
+            const uint32_t bits0 = packed0 >> kCostShift;
+            if (bits0 >= static_cast<uint32_t>(kPenalty)) continue;
+            const uint32_t packed1 = span_mid(k0, k1);
+            const uint32_t bits1 = packed1 >> kCostShift;
+            if (bits1 >= static_cast<uint32_t>(kPenalty)) continue;
+            const int32_t total = static_cast<int32_t>(bits0 + bits1);
+            if (!p.ok || total < p.bits) {
+                p.ok = true;
+                p.bits = total;
+                p.k0 = static_cast<int16_t>(k0);
+                p.t0 = static_cast<int8_t>(packed0 & 31);
+                p.t1 = static_cast<int8_t>(packed1 & 31);
+            }
+        }
+        return p;
+    };
+
 
     if (orig_config.window_switching_flag) {
         // region boundaries are fixed by the standard for short/mixed blocks:
@@ -731,57 +774,98 @@ HuffmanConfig HuffmanOptimizer::find_best_config(
             }
         }
     } else {
+        // Candidates are enumerated by shape rather than by (region0_count,
+        // region1_count). Every candidate splits the pairs below big_values into
+        // one, two or three regions at band boundaries, and which shape a
+        // (region0_count, region1_count) pair produces depends only on how many
+        // boundaries lie below big_values:
+        //
+        //   nTail is that count, and because the boundaries are sorted,
+        //   "boundary[k] >= big_values" — the test that used to saturate the two
+        //   loops — is exactly "k >= nTail".
+        //
+        // What that buys is the three-region case. Regions 0 and 1 cover
+        // everything below their upper boundary and neither moves with
+        // big_values, so the cheapest pair of them is settled once per granule per
+        // boundary and only the tail is recomputed per candidate. The old nested
+        // loops re-derived it for every candidate: 113 combinations per
+        // big_values, where this is one per boundary.
+        //
+        // Ties are resolved exactly as the nested loops did — lowest total, then
+        // lowest region0_count, then lowest region1_count — which is why the
+        // prefix search below prefers the lowest region0 boundary on a tie and why
+        // the shapes are offered in that order.
+        int n_tail = 0;
         for (bv = last_bv_pair; bv <= max_possible_bv; ++bv) {
             if (!sc.c1_ok[2 * bv]) continue;
             const bool use_33 = sc.c1_bits33[2 * bv] < sc.c1_bits32[2 * bv];
             const uint32_t c1_bits = static_cast<uint32_t>(use_33 ? sc.c1_bits33[2 * bv] : sc.c1_bits32[2 * bv]);
             advance(bv);
+            // big_values only grows, so this is carried across candidates rather
+            // than recounted.
+            while (n_tail < kNumBands && boundary[n_tail] < bv) ++n_tail;
 
-            for (int r0_idx = 0; r0_idx < 16; ++r0_idx) {
-                const int k0 = r0_idx + 1;
-                const bool clip0 = boundary[k0] >= bv; // region0 covers every pair there is
-                const uint32_t packed0 = clip0 ? span_to_bv(0) : span_head(k0);
-                const uint32_t r0_bits = packed0 >> kCostShift;
-                if (r0_bits >= static_cast<uint32_t>(kPenalty)) continue;
+            uint32_t cand_total = UINT32_MAX;
+            int cand_r0 = 0, cand_r1 = 0, cand_t0 = 0, cand_t1 = 0, cand_t2 = 0;
+            const auto offer = [&](const uint32_t total, const int r0_idx, const int r1_idx,
+                                   const int t0, const int t1, const int t2) {
+                if (total > cand_total) return;
+                if (total == cand_total && (r0_idx > cand_r0 || (r0_idx == cand_r0 && r1_idx >= cand_r1))) return;
+                cand_total = total;
+                cand_r0 = r0_idx; cand_r1 = r1_idx;
+                cand_t0 = t0; cand_t1 = t1; cand_t2 = t2;
+            };
 
-                for (int r1_idx = 0; r1_idx < 8; ++r1_idx) {
-                    const int k1 = std::min(r0_idx + r1_idx + 2, kNumBands - 1);
-                    const bool clip1 = boundary[k1] >= bv;
-                    // An empty region costs nothing and takes table 0, whichever
-                    // end of the span saturated.
-                    const uint32_t packed1 = clip0 ? 0u : (clip1 ? span_to_bv(k0) : span_mid(k0, k1));
-                    const uint32_t r1_bits = packed1 >> kCostShift;
-                    if (r1_bits >= static_cast<uint32_t>(kPenalty)) continue;
-
-                    const uint32_t packed2 = clip1 ? 0u : span_to_bv(k1);
-                    const uint32_t r2_bits = packed2 >> kCostShift;
-                    if (r2_bits >= static_cast<uint32_t>(kPenalty)) continue;
-
-                    const uint32_t total = r0_bits + r1_bits + r2_bits + c1_bits;
-                    if (total < min_total_bits) {
-                        min_total_bits = total;
-                        best = {
-                            static_cast<uint8_t>(r0_idx),
-                            static_cast<uint8_t>(r1_idx),
-                            static_cast<uint16_t>(bv),
-                            static_cast<uint8_t>(packed0 & 31),
-                            static_cast<uint8_t>(packed1 & 31),
-                            static_cast<uint8_t>(packed2 & 31),
-                            use_33,
-                            false,
-                            uint8_t{0},
-                            false
-                        };
-                    }
-
-                    // sf_bands is monotone, so r1_end saturates at bv and stays there for
-                    // every larger r1_idx: region1/region2 would be identical, so stop here.
-                    if (clip1) break;
+            // One region: the first region0 boundary at or beyond big_values
+            // swallows every pair, and no larger region0_count can do anything
+            // different. Its region1_count is 0, since the inner loop broke at once.
+            const int only = std::max(0, n_tail - 1);
+            if (only < 16) {
+                const uint32_t packed = span_to_bv(0);
+                if ((packed >> kCostShift) < static_cast<uint32_t>(kPenalty)) {
+                    offer((packed >> kCostShift) + c1_bits, only, 0, static_cast<int>(packed & 31), 0, 0);
                 }
+            }
 
-                // same saturation argument for r0_end: once it hits bv, every larger r0_idx
-                // reproduces the exact same r0_bits/t0 and an immediately-saturated inner loop.
-                if (clip0) break;
+            // Two regions: region1 runs from a boundary up to big_values, which
+            // needs the smallest region1_count whose own boundary reaches it.
+            for (int k0 = 1; k0 <= std::min(n_tail - 1, 16); ++k0) {
+                const int r1_idx = std::max(0, n_tail - k0 - 1);
+                if (r1_idx > 7) continue; // region1_count cannot stretch that far
+                const uint32_t packed0 = span_head(k0);
+                if ((packed0 >> kCostShift) >= static_cast<uint32_t>(kPenalty)) continue;
+                const uint32_t packed1 = span_to_bv(k0);
+                if ((packed1 >> kCostShift) >= static_cast<uint32_t>(kPenalty)) continue;
+                offer((packed0 >> kCostShift) + (packed1 >> kCostShift) + c1_bits,
+                      k0 - 1, r1_idx, static_cast<int>(packed0 & 31), static_cast<int>(packed1 & 31), 0);
+            }
+
+            // Three regions: the pairs below a boundary are covered by regions 0
+            // and 1 at their settled best, and region2 runs from there to
+            // big_values.
+            for (int k1 = 2; k1 < n_tail; ++k1) {
+                const PrefixSplit& p = span_prefix(k1);
+                if (!p.ok) continue;
+                const uint32_t packed2 = span_to_bv(k1);
+                if ((packed2 >> kCostShift) >= static_cast<uint32_t>(kPenalty)) continue;
+                offer(static_cast<uint32_t>(p.bits) + (packed2 >> kCostShift) + c1_bits,
+                      p.k0 - 1, k1 - p.k0 - 1, p.t0, p.t1, static_cast<int>(packed2 & 31));
+            }
+
+            if (cand_total < min_total_bits) {
+                min_total_bits = cand_total;
+                best = {
+                    static_cast<uint8_t>(cand_r0),
+                    static_cast<uint8_t>(cand_r1),
+                    static_cast<uint16_t>(bv),
+                    static_cast<uint8_t>(cand_t0),
+                    static_cast<uint8_t>(cand_t1),
+                    static_cast<uint8_t>(cand_t2),
+                    use_33,
+                    false,
+                    uint8_t{0},
+                    false
+                };
             }
         }
     }
