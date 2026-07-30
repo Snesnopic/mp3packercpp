@@ -142,6 +142,56 @@ constexpr uint8_t kLongCode = 0xFF;
 
 using DecodeLut = DecodeEntry[256];
 
+/// A big-values symbol split into what the decoder needs: the two magnitudes, and
+/// how many sign bits they consume. Reading them from a table means the loop
+/// branches on neither magnitude being zero nor its sign, both unpredictable.
+struct PairDecode {
+    int8_t x = 0, y = 0;   ///< magnitudes before any escape or sign
+    uint8_t nx = 0, ny = 0; ///< sign bits each consumes: one unless the value is zero
+};
+
+static const PairDecode* pair_decode_table() {
+    static const std::array<PairDecode, 256> table = [] {
+        std::array<PairDecode, 256> all{};
+        for (int sym = 0; sym < 256; ++sym) {
+            const int x = sym >> 4, y = sym & 15;
+            all[sym] = {static_cast<int8_t>(x), static_cast<int8_t>(y),
+                        static_cast<uint8_t>(x != 0), static_cast<uint8_t>(y != 0)};
+        }
+        return all;
+    }();
+    return table.data();
+}
+
+/// One count1 quadruple, signs applied. Indexed by the codeword's non-zero pattern
+/// together with the four bits that follow it, so the pattern and its signs come
+/// out of a single lookup however many of those bits are really consumed.
+struct Count1Quad { int16_t v[4]; };
+
+static const Count1Quad* count1_quad_table() {
+    static const std::array<Count1Quad, 16 * 16> table = [] {
+        std::array<Count1Quad, 16 * 16> all{};
+        for (int sym = 0; sym < 16; ++sym) {
+            for (int signs = 0; signs < 16; ++signs) {
+                Count1Quad q{};
+                int bit = 3; // sign bits are taken from the top of the four
+                for (int i = 0; i < 4; ++i) {
+                    if (sym & (8 >> i)) {
+                        q.v[i] = (signs >> bit & 1) ? int16_t{-1} : int16_t{1};
+                        --bit;
+                    }
+                }
+                all[sym << 4 | signs] = q;
+            }
+        }
+        return all;
+    }();
+    return table.data();
+}
+
+/// How many sign bits a count1 quadruple with this non-zero pattern consumes.
+static constexpr uint8_t count1_signs[16] = {0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4};
+
 static const DecodeLut* decode_luts() {
     static const std::array<std::array<DecodeEntry, 256>, 34> luts = [] {
         std::array<std::array<DecodeEntry, 256>, 34> all{};
@@ -180,6 +230,8 @@ void HuffmanOptimizer::decode_quantized_coefficients(
     int out_off = 0;
     const auto sf_bands = get_sf_bands(samplerate);
     const DecodeLut* luts = decode_luts();
+    const PairDecode* pairs = pair_decode_table();
+    const Count1Quad* quads = count1_quad_table();
     // The bit position is carried in a local rather than in the reader: going
     // through it for every bit of every symbol put a store-to-load turnaround on
     // the loop's critical path. The reader is resynchronised at each exit.
@@ -231,6 +283,10 @@ void HuffmanOptimizer::decode_quantized_coefficients(
         const int16_t* tree = huffman_tables[table_idx].table;
         const DecodeEntry* lut = luts[table_idx];
         const bool check_limit = table_idx != 0;
+        // A magnitude of 15 escapes to linbits, but only for tables that have any.
+        // Putting the trigger out of range for the others folds "does this table
+        // escape" into the comparison the loop was making anyway.
+        const int escape = linbits > 0 ? 15 : 16;
         const int target = out_off + count_pairs * 2;
         while (out_off < target && out_off < 575) {
             if (check_limit && bp >= bit_limit) return false;
@@ -259,7 +315,7 @@ void HuffmanOptimizer::decode_quantized_coefficients(
             int y = sym & 0xF;
             int x = (sym >> 4) & 0xF;
             if (x > 0) {
-                if (x == 15 && linbits > 0) {
+                if (x == escape) {
                     x += static_cast<int>(w >> (64 - linbits));
                     w <<= linbits;
                     used += linbits;
@@ -269,7 +325,7 @@ void HuffmanOptimizer::decode_quantized_coefficients(
                 ++used;
             }
             if (y > 0) {
-                if (y == 15 && linbits > 0) {
+                if (y == escape) {
                     y += static_cast<int>(w >> (64 - linbits));
                     w <<= linbits;
                     used += linbits;
@@ -330,18 +386,16 @@ void HuffmanOptimizer::decode_quantized_coefficients(
             const DecodeEntry& e = lut[w >> 56];
             if (e.length == kLongCode) break; // unreachable: no count1 codeword exceeds six bits
             const int got = e.symbol;
-            int used = e.length;
-            w <<= used;
-            for (int mask = 8; mask != 0; mask >>= 1) {
-                int v = 0;
-                if (got & mask) {
-                    v = (w >> 63) ? -1 : 1;
-                    w <<= 1;
-                    ++used;
-                }
-                coeffs[out_off++] = static_cast<int16_t>(v);
-            }
-            bp += static_cast<size_t>(used);
+            w <<= e.length;
+            // One lookup covers the pattern and its signs together; the sign bits
+            // sit at the top of w now that the codeword has been shifted off.
+            const Count1Quad& q = quads[got << 4 | static_cast<int>(w >> 60)];
+            coeffs[out_off + 0] = q.v[0];
+            coeffs[out_off + 1] = q.v[1];
+            coeffs[out_off + 2] = q.v[2];
+            coeffs[out_off + 3] = q.v[3];
+            out_off += 4;
+            bp += static_cast<size_t>(e.length) + count1_signs[got];
         }
     }
     reader.seek_bit(bp);
