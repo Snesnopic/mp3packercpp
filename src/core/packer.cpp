@@ -10,6 +10,7 @@
 #include <fstream>
 #include <stdexcept>
 #include <atomic>
+#include <cstring>
 #include <thread>
 
 namespace mp3packer {
@@ -432,15 +433,24 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
     if (!out) {
         throw std::runtime_error("Could not open output file: " + output_file);
     }
-    
+
+    // The file is assembled in memory and written once at the end. Writing it
+    // frame by frame meant three stream writes per frame, and the Xing patch-up
+    // then had to seek back through them.
+    std::vector<uint8_t> out_bytes;
+    out_bytes.reserve(total_main + N * 40 + reader.get_start_junk().size() + reader.get_end_junk().size());
+    const auto append = [&out_bytes](const uint8_t* p, const size_t n) {
+        out_bytes.insert(out_bytes.end(), p, p + n);
+    };
+
     // write start junk (id3v2)
     const auto& start_junk = reader.get_start_junk();
     if (!start_junk.empty()) {
-        out.write(reinterpret_cast<const char*>(start_junk.data()), static_cast<std::streamsize>(start_junk.size()));
+        append(start_junk.data(), start_junk.size());
     }
     
     // track where the xing frame starts in the file
-    const size_t xing_header_file_pos = has_xing ? static_cast<size_t>(out.tellp()) : SIZE_MAX;
+    const size_t xing_header_file_pos = has_xing ? out_bytes.size() : SIZE_MAX;
     
     // backward pass constraint solver
     std::vector<int> required_carryover(N, 0);
@@ -532,7 +542,7 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
         const auto& side = optimized_side_info[i];
 
         if (has_xing && i > 0)
-            audio_frame_file_pos.push_back(static_cast<size_t>(out.tellp()));
+            audio_frame_file_pos.push_back(out_bytes.size());
 
         ChosenBitrate bitrate_use = chosen_bitrates[i];
 
@@ -565,38 +575,36 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
             new_side = patch_mdb(frame.side_info_raw, version, side.main_data_begin);
         }
 
-        out.write(reinterpret_cast<const char*>(head), 4);
-        out.write(reinterpret_cast<const char*>(new_side.data()), static_cast<std::streamsize>(new_side.size()));
+        append(head, 4);
+        append(new_side.data(), new_side.size());
 
         int data_size = bitrate_use.data_size;
         int avail = static_cast<int>(global_main_data.size() - global_main_data_ptr);
         int write_len = std::min(data_size, avail);
 
         if (write_len > 0) {
-            out.write(reinterpret_cast<const char*>(&global_main_data[global_main_data_ptr]), write_len);
+            append(&global_main_data[global_main_data_ptr], static_cast<size_t>(write_len));
             global_main_data_ptr += static_cast<size_t>(write_len);
         }
 
         if (data_size > write_len) {
-            static constexpr uint8_t zeros[2048] = {};
-            for (int left = data_size - write_len; left > 0;) {
-                const int chunk = std::min(left, static_cast<int>(sizeof zeros));
-                out.write(reinterpret_cast<const char*>(zeros), chunk);
-                left -= chunk;
-            }
+            out_bytes.resize(out_bytes.size() + static_cast<size_t>(data_size - write_len), 0x00);
         }
     }
     
     // save position before end_junk to calculate total mp3 stream size
-    size_t mp3_end_pos = static_cast<size_t>(out.tellp());
+    size_t mp3_end_pos = out_bytes.size();
     
     // write end junk (id3v1)
     const auto& end_junk = reader.get_end_junk();
     if (!end_junk.empty()) {
-        out.write(reinterpret_cast<const char*>(end_junk.data()), static_cast<std::streamsize>(end_junk.size()));
+        append(end_junk.data(), end_junk.size());
     }
     
     // patch xing header fields (bytes count + TOC) if present
+    const auto patch = [&out_bytes](const size_t at, const uint8_t* p, const size_t n) {
+        if (at + n <= out_bytes.size()) std::memcpy(out_bytes.data() + at, p, n);
+    };
     if (has_xing) {
         // optimized_main_data[0] always has "Xing"/"Info" at bytes 0-3, flags at 4-7
         // (regardless of whether the source was CRC or no-CRC)
@@ -619,13 +627,12 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
 
             if (flags & 1) field_offset += 4; // frames field: skip it
             if (flags & 2) {
-                out.seekp(static_cast<std::streamoff>(main_data_base + field_offset), std::ios::beg);
                 uint8_t buf[4];
                 buf[0] = (total_mp3_bytes >> 24) & 0xFF;
                 buf[1] = (total_mp3_bytes >> 16) & 0xFF;
                 buf[2] = (total_mp3_bytes >> 8) & 0xFF;
                 buf[3] = (total_mp3_bytes >> 0) & 0xFF;
-                out.write(reinterpret_cast<const char*>(buf), 4);
+                patch(main_data_base + field_offset, buf, 4);
                 field_offset += 4;
             }
 
@@ -641,10 +648,14 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
                     int v = static_cast<int>(256.0 * static_cast<double>(pos) / static_cast<double>(total_mp3_bytes));
                     toc[k] = static_cast<uint8_t>(std::min(v, 255));
                 }
-                out.seekp(static_cast<std::streamoff>(main_data_base + field_offset), std::ios::beg);
-                out.write(reinterpret_cast<const char*>(toc), 100);
+                patch(main_data_base + field_offset, toc, 100);
             }
         }
+    }
+
+    out.write(reinterpret_cast<const char*>(out_bytes.data()), static_cast<std::streamsize>(out_bytes.size()));
+    if (!out) {
+        throw std::runtime_error("Could not write output file: " + output_file);
     }
 }
 
