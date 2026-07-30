@@ -444,6 +444,7 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
     // then had to seek back through them.
     std::vector<uint8_t> out_bytes;
     out_bytes.reserve(total_main + N * 40 + reader.get_start_junk().size() + reader.get_end_junk().size());
+    (void)total_main;
     const auto append = [&out_bytes](const uint8_t* p, const size_t n) {
         out_bytes.insert(out_bytes.end(), p, p + n);
     };
@@ -470,8 +471,13 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
         current_req = std::max(0, space_needed - max_data_per_frame);
         required_carryover[i] = current_req;
     }
-    std::vector<uint8_t> global_main_data;
-    global_main_data.reserve(total_main);
+    // The reservoir is described rather than built. Deciding a frame's size and its
+    // reservoir offset takes lengths only, so the first pass records the pieces —
+    // each frame's data, and the run of zeros left at the end where the reservoir
+    // cannot be read back — and the second pass reads them straight out of the
+    // frames' own buffers. Concatenating them first was a second copy of the whole
+    // audio and an allocation to hold it.
+    size_t reservoir_bytes = 0;
     int current_reservoir = 0; // free space in past payloads
     
     std::vector<ChosenBitrate> chosen_bitrates(N);
@@ -510,7 +516,7 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
             optimized_main_data[0].resize(static_cast<size_t>(data_size), 0x00);
 
         side.main_data_begin = static_cast<uint16_t>(current_reservoir);
-        global_main_data.insert(global_main_data.end(), optimized_main_data[i].begin(), optimized_main_data[i].end());
+        reservoir_bytes += optimized_main_data[i].size();
         current_reservoir = projected_reservoir;
         chosen_bitrates[i] = bitrate_use;
 
@@ -518,10 +524,9 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
             current_reservoir = 0;
     }
     
-    if (current_reservoir > 0) {
-        std::vector<uint8_t> end_pad(static_cast<size_t>(current_reservoir), 0x00);
-        global_main_data.insert(global_main_data.end(), end_pad.begin(), end_pad.end());
-    }
+    // Whatever the last frame leaves unread is emitted as zeros.
+    const size_t reservoir_tail_zeros = static_cast<size_t>(std::max(0, current_reservoir));
+    reservoir_bytes += reservoir_tail_zeros;
     
     // pass 2: write physical file
     // find the last frame that actually contains non-zero data
@@ -537,7 +542,33 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
         N_out = static_cast<size_t>(i);
     }
     
-    size_t global_main_data_ptr = 0;
+    // A frame's slot is a window over that sequence and generally spans more than one
+    // piece — that is what a bit reservoir is for — so the read side is a cursor.
+    size_t cursor_frame = 0, cursor_offset = 0, cursor_read = 0;
+    const auto emit_reservoir = [&](size_t want) {
+        while (want > 0 && cursor_read < reservoir_bytes) {
+            if (cursor_frame < N) {
+                const auto& piece = optimized_main_data[cursor_frame];
+                if (cursor_offset >= piece.size()) {
+                    ++cursor_frame;
+                    cursor_offset = 0;
+                    continue;
+                }
+                const size_t take = std::min(want, piece.size() - cursor_offset);
+                append(piece.data() + cursor_offset, take);
+                cursor_offset += take;
+                cursor_read += take;
+                want -= take;
+                continue;
+            }
+            // Past the last frame's data: the tail the reservoir never gives back.
+            const size_t take = std::min(want, reservoir_bytes - cursor_read);
+            out_bytes.resize(out_bytes.size() + take, 0x00);
+            cursor_read += take;
+            want -= take;
+        }
+        return want; // whatever the reservoir could not supply
+    };
 
     // audio frame byte positions in the output file (index 0 = first audio frame, i.e. frame 1 if has_xing)
     std::vector<size_t> audio_frame_file_pos;
@@ -583,17 +614,10 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
         append(head, 4);
         append(new_side.data(), new_side.size());
 
-        int data_size = bitrate_use.data_size;
-        int avail = static_cast<int>(global_main_data.size() - global_main_data_ptr);
-        int write_len = std::min(data_size, avail);
-
-        if (write_len > 0) {
-            append(&global_main_data[global_main_data_ptr], static_cast<size_t>(write_len));
-            global_main_data_ptr += static_cast<size_t>(write_len);
-        }
-
-        if (data_size > write_len) {
-            out_bytes.resize(out_bytes.size() + static_cast<size_t>(data_size - write_len), 0x00);
+        const int data_size = bitrate_use.data_size;
+        const size_t short_by = emit_reservoir(static_cast<size_t>(data_size));
+        if (short_by > 0) {
+            out_bytes.resize(out_bytes.size() + short_by, 0x00);
         }
     }
     
