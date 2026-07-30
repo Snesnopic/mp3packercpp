@@ -165,6 +165,22 @@ public:
     }
 
     /**
+     * @brief Moves n bits from a reader to this writer without interpreting them.
+     *
+     * Used for scalefactors, which are re-emitted verbatim: their layout depends on
+     * scalefac_compress tables we only need to size, never to decode. The caller
+     * must have established that the whole span is inside the reader's data, since
+     * a read past the end has a value only field-by-field reading reproduces.
+     */
+    void copy_from(BitstreamReader& reader, size_t num_bits) {
+        while (num_bits >= 32) {
+            put(reader.read_bits(32), 32);
+            num_bits -= 32;
+        }
+        if (num_bits > 0) put(reader.read_bits(static_cast<int>(num_bits)), static_cast<int>(num_bits));
+    }
+
+    /**
      * @brief Takes the pending bits so a caller can append to them in registers.
      *
      * put() keeps its state in memory, so a long run of fields pays a load and a

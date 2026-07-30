@@ -277,35 +277,58 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
                         slen2 = slen2_tab[g.scalefac_compress];
                     }
                     
-                    std::vector<int> scfs;
+                    // Scalefactors are re-emitted exactly as they arrived, so only
+                    // their total length matters. Copying the bits is what Go's
+                    // reference implementation does; reading each field into a
+                    // vector and writing it back cost an allocation per granule and
+                    // some seventy calls through the bit machinery.
+                    size_t sf_bits = 0;
                     if (g.window_switching_flag && g.block_type == 2) {
-                        if (g.mixed_block_flag) {
-                            // 8 long-window sfb (0-7) at slen1
-                            for (int k = 0; k < 8; ++k) scfs.push_back(data_reader.read_bits(slen1));
-                            // short sfb 3-5: 3 bands × 3 windows at slen1
-                            for (int k = 0; k < 9; ++k) scfs.push_back(data_reader.read_bits(slen1));
-                            // short sfb 6-11: 6 bands × 3 windows at slen2
-                            for (int k = 0; k < 18; ++k) scfs.push_back(data_reader.read_bits(slen2));
-                        } else {
-                            for (int k = 0; k < 18; ++k) scfs.push_back(data_reader.read_bits(slen1));
-                            for (int k = 18; k < 36; ++k) scfs.push_back(data_reader.read_bits(slen2));
-                        }
+                        sf_bits = g.mixed_block_flag
+                                  ? static_cast<size_t>(17 * slen1 + 18 * slen2)
+                                  : static_cast<size_t>(18 * slen1 + 18 * slen2);
                     } else {
-                        for (int k = 0; k < 6; ++k) {
-                            if (gr == 0 || !frame.side_info.scfsi[ch][0]) scfs.push_back(data_reader.read_bits(slen1));
-                            else scfs.push_back(0);
-                        }
-                        for (int k = 6; k < 11; ++k) {
-                            if (gr == 0 || !frame.side_info.scfsi[ch][1]) scfs.push_back(data_reader.read_bits(slen1));
-                            else scfs.push_back(0);
-                        }
-                        for (int k = 11; k < 16; ++k) {
-                            if (gr == 0 || !frame.side_info.scfsi[ch][2]) scfs.push_back(data_reader.read_bits(slen2));
-                            else scfs.push_back(0);
-                        }
-                        for (int k = 16; k < 21; ++k) {
-                            if (gr == 0 || !frame.side_info.scfsi[ch][3]) scfs.push_back(data_reader.read_bits(slen2));
-                            else scfs.push_back(0);
+                        // A band group whose scfsi bit is set in granule 1 reuses
+                        // granule 0's values and occupies no bits at all.
+                        if (gr == 0 || !frame.side_info.scfsi[ch][0]) sf_bits += static_cast<size_t>(6 * slen1);
+                        if (gr == 0 || !frame.side_info.scfsi[ch][1]) sf_bits += static_cast<size_t>(5 * slen1);
+                        if (gr == 0 || !frame.side_info.scfsi[ch][2]) sf_bits += static_cast<size_t>(5 * slen2);
+                        if (gr == 0 || !frame.side_info.scfsi[ch][3]) sf_bits += static_cast<size_t>(5 * slen2);
+                    }
+
+                    size_t out_start = writer.tell_bit();
+                    if (data_reader.tell_bit() + sf_bits <= data_reader.size_bits()) {
+                        writer.copy_from(data_reader, sf_bits);
+                    } else {
+                        // The span reaches past the end of the reservoir data, where
+                        // what a read returns depends on the width it was made at, so
+                        // the fields are read and written one at a time as before.
+                        int scfs[36] = {};
+                        if (g.window_switching_flag && g.block_type == 2) {
+                            if (g.mixed_block_flag) {
+                                for (int k = 0; k < 17; ++k) scfs[k] = static_cast<int>(data_reader.read_bits(slen1));
+                                for (int k = 17; k < 35; ++k) scfs[k] = static_cast<int>(data_reader.read_bits(slen2));
+                                for (int k = 0; k < 17; ++k) writer.write_bits(static_cast<uint32_t>(scfs[k]), slen1);
+                                for (int k = 17; k < 35; ++k) writer.write_bits(static_cast<uint32_t>(scfs[k]), slen2);
+                            } else {
+                                for (int k = 0; k < 18; ++k) scfs[k] = static_cast<int>(data_reader.read_bits(slen1));
+                                for (int k = 18; k < 36; ++k) scfs[k] = static_cast<int>(data_reader.read_bits(slen2));
+                                for (int k = 0; k < 18; ++k) writer.write_bits(static_cast<uint32_t>(scfs[k]), slen1);
+                                for (int k = 18; k < 36; ++k) writer.write_bits(static_cast<uint32_t>(scfs[k]), slen2);
+                            }
+                        } else {
+                            static constexpr int group_first[4] = {0, 6, 11, 16};
+                            static constexpr int group_last[4] = {6, 11, 16, 21};
+                            for (int grp = 0; grp < 4; ++grp) {
+                                const int slen = grp < 2 ? slen1 : slen2;
+                                if (gr != 0 && frame.side_info.scfsi[ch][grp]) continue;
+                                for (int k = group_first[grp]; k < group_last[grp]; ++k) {
+                                    scfs[k] = static_cast<int>(data_reader.read_bits(slen));
+                                }
+                                for (int k = group_first[grp]; k < group_last[grp]; ++k) {
+                                    writer.write_bits(static_cast<uint32_t>(scfs[k]), slen);
+                                }
+                            }
                         }
                     }
 
@@ -326,32 +349,6 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
                     int max_huff_bits = side_copy.gr[gr][ch].part2_3_length - scalefac_bits;
                     HuffmanOptimizer::decode_quantized_coefficients(coeffs, orig_cfg, data_reader, frame.header.samplerate, max_huff_bits);
                     auto best_cfg = HuffmanOptimizer::find_best_config(coeffs, orig_cfg, frame.header.samplerate);
-                    
-                    // re-encode
-                    size_t out_start = writer.tell_bit();
-                    if (g.window_switching_flag && g.block_type == 2) {
-                        if (g.mixed_block_flag) {
-                            for (int k = 0; k < 8; ++k) writer.write_bits(scfs[k], slen1);
-                            for (int k = 8; k < 17; ++k) writer.write_bits(scfs[k], slen1);
-                            for (int k = 17; k < 35; ++k) writer.write_bits(scfs[k], slen2);
-                        } else {
-                            for (int k = 0; k < 18; ++k) writer.write_bits(scfs[k], slen1);
-                            for (int k = 18; k < 36; ++k) writer.write_bits(scfs[k], slen2);
-                        }
-                    } else {
-                        for (int k = 0; k < 6; ++k) {
-                            if (gr == 0 || !frame.side_info.scfsi[ch][0]) writer.write_bits(scfs[k], slen1);
-                        }
-                        for (int k = 6; k < 11; ++k) {
-                            if (gr == 0 || !frame.side_info.scfsi[ch][1]) writer.write_bits(scfs[k], slen1);
-                        }
-                        for (int k = 11; k < 16; ++k) {
-                            if (gr == 0 || !frame.side_info.scfsi[ch][2]) writer.write_bits(scfs[k], slen2);
-                        }
-                        for (int k = 16; k < 21; ++k) {
-                            if (gr == 0 || !frame.side_info.scfsi[ch][3]) writer.write_bits(scfs[k], slen2);
-                        }
-                    }
                     
                     size_t scalefac_end_bit = writer.tell_bit();
                     HuffmanOptimizer::encode_quantized_coefficients(coeffs, best_cfg, writer, frame.header.samplerate);
