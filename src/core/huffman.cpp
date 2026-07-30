@@ -5,6 +5,19 @@
 #include <iostream>
 #include <array>
 
+// The cost machinery keeps all 32 code tables side by side, so its two kernels are
+// pure 32-lane vector work: eight vectors cover a whole row, and the only scalar
+// work is deriving two table addresses from a packed key. Written by hand rather
+// than left to the auto-vectoriser, which will not keep the accumulators live
+// across the loop; that is worth 8-9% of a recompressing run on its own. Define
+// MP3PACKER_NO_SIMD to build the portable form, which is what the kernels are held
+// against.
+#if !defined(MP3PACKER_NO_SIMD) && (defined(__ARM_NEON) || defined(__ARM_NEON__) || defined(_M_ARM64))
+#define MP3PACKER_NEON 1
+#include <arm_neon.h>
+#endif
+
+
 namespace mp3packer {
 
 struct SymbolCode {
@@ -367,6 +380,13 @@ constexpr int kNumTables = 32;
 // is at most 288 pairs, so a sum of penalties cannot overflow int32.
 constexpr int32_t kPenalty = 10000;
 
+/// Costs are held pre-scaled by 1<<kCostShift so that the low bits of a span's
+/// cost are free to carry the table index that achieved it. Doing it once in the
+/// cost tables rather than per row saves a shift in the innermost kernel; the
+/// largest total a granule can reach, 288 pairs of penalties, stays far below the
+/// sign bit.
+constexpr int kCostShift = 5;
+
 struct PairCosts {
     /// Cost of a pair by clamped symbol: codeword, escape magnitudes and signs.
     int32_t pair[256][kNumTables];
@@ -386,7 +406,7 @@ static const PairCosts& pair_cost_tables() {
                 const auto& map = HuffmanTableManager::get_encoding_map(static_cast<uint8_t>(tab));
                 const int max_quant = max_quant_per_table[tab];
                 if (max_quant < 0 || !map[sym].valid || sx > max_quant || sy > max_quant) {
-                    t.pair[sym][tab] = kPenalty;
+                    t.pair[sym][tab] = kPenalty << kCostShift;
                     continue;
                 }
                 const int linbits = huffman_tables[tab].linbits;
@@ -395,7 +415,7 @@ static const PairCosts& pair_cost_tables() {
                 if (sy == 15) bits += linbits;
                 if (sx != 0) bits += 1;
                 if (sy != 0) bits += 1;
-                t.pair[sym][tab] = bits;
+                t.pair[sym][tab] = bits << kCostShift;
             }
         }
         // A magnitude m > 15 needs bit_length(m - 15) linbits; max_quant_per_table
@@ -404,7 +424,7 @@ static const PairCosts& pair_cost_tables() {
         for (int need = 0; need < 16; ++need) {
             for (int tab = 0; tab < kNumTables; ++tab) {
                 t.escape[need][tab] = (need <= linbits_per_table[tab] && max_quant_per_table[tab] >= 0)
-                                      ? 0 : (need > 0 ? kPenalty : 0);
+                                      ? 0 : (need > 0 ? kPenalty << kCostShift : 0);
             }
         }
         return t;
@@ -428,28 +448,101 @@ static inline uint32_t pair_key(const int x, const int y) {
     return sym | need << 8;
 }
 
+/// Labels each table's lane, so that a plain minimum over packed
+/// cost<<kCostShift|table values yields both the cheapest cost and which table
+/// achieved it, breaking ties towards the lower index.
+/// Aligned so the span kernel's loads of it are: leaving it to chance cost 10%.
+alignas(16) static constexpr uint32_t lane_index[kNumTables] = {
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+    16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
+};
+
 /// Adds n pairs' costs into the running per-table totals.
+///
+/// Both tables it reads are indexed by small fields of the key, so the whole loop
+/// is 32 lanes of load-add with no gathers — the shape that lets the compiler hold
+/// it in eight vectors. The escape row is all zeros unless the pair's magnitude
+/// escapes to linbits, which is uncommon, so it is skipped rather than added.
 static void accumulate_costs(int32_t* acc, const uint32_t* keys, const int n, const PairCosts& ct) {
+#if defined(MP3PACKER_NEON)
+    // Eight vectors cover all 32 lanes and stay live for the whole loop.
+    int32x4_t a0 = vld1q_s32(acc + 0),  a1 = vld1q_s32(acc + 4);
+    int32x4_t a2 = vld1q_s32(acc + 8),  a3 = vld1q_s32(acc + 12);
+    int32x4_t a4 = vld1q_s32(acc + 16), a5 = vld1q_s32(acc + 20);
+    int32x4_t a6 = vld1q_s32(acc + 24), a7 = vld1q_s32(acc + 28);
     for (int i = 0; i < n; ++i) {
-        const int32_t* base = ct.pair[keys[i] & 0xFF];
-        const int32_t* esc = ct.escape[keys[i] >> 8 & 0xF];
-        for (int t = 0; t < kNumTables; ++t) acc[t] += base[t] + esc[t];
+        const uint32_t key = keys[i];
+        const int32_t* base = ct.pair[key & 0xFF];
+        int32x4_t b0 = vld1q_s32(base + 0),  b1 = vld1q_s32(base + 4);
+        int32x4_t b2 = vld1q_s32(base + 8),  b3 = vld1q_s32(base + 12);
+        int32x4_t b4 = vld1q_s32(base + 16), b5 = vld1q_s32(base + 20);
+        int32x4_t b6 = vld1q_s32(base + 24), b7 = vld1q_s32(base + 28);
+        if (key & 0xF00) {
+            const int32_t* esc = ct.escape[key >> 8 & 0xF];
+            b0 = vaddq_s32(b0, vld1q_s32(esc + 0));
+            b1 = vaddq_s32(b1, vld1q_s32(esc + 4));
+            b2 = vaddq_s32(b2, vld1q_s32(esc + 8));
+            b3 = vaddq_s32(b3, vld1q_s32(esc + 12));
+            b4 = vaddq_s32(b4, vld1q_s32(esc + 16));
+            b5 = vaddq_s32(b5, vld1q_s32(esc + 20));
+            b6 = vaddq_s32(b6, vld1q_s32(esc + 24));
+            b7 = vaddq_s32(b7, vld1q_s32(esc + 28));
+        }
+        a0 = vaddq_s32(a0, b0); a1 = vaddq_s32(a1, b1);
+        a2 = vaddq_s32(a2, b2); a3 = vaddq_s32(a3, b3);
+        a4 = vaddq_s32(a4, b4); a5 = vaddq_s32(a5, b5);
+        a6 = vaddq_s32(a6, b6); a7 = vaddq_s32(a7, b7);
     }
+    vst1q_s32(acc + 0, a0);  vst1q_s32(acc + 4, a1);
+    vst1q_s32(acc + 8, a2);  vst1q_s32(acc + 12, a3);
+    vst1q_s32(acc + 16, a4); vst1q_s32(acc + 20, a5);
+    vst1q_s32(acc + 24, a6); vst1q_s32(acc + 28, a7);
+#else
+    for (int i = 0; i < n; ++i) {
+        const uint32_t key = keys[i];
+        const int32_t* base = ct.pair[key & 0xFF];
+        if (key & 0xF00) {
+            const int32_t* esc = ct.escape[key >> 8 & 0xF];
+            for (int t = 0; t < kNumTables; ++t) acc[t] += base[t] + esc[t];
+        } else {
+            for (int t = 0; t < kNumTables; ++t) acc[t] += base[t];
+        }
+    }
+#endif
 }
 
-/// Cheapest table for the span between two prefix rows, packed as cost<<5|table
-/// so that the lowest table index wins a tie — the order the original's ascending
-/// scan with a strict comparison settled on.
+/// Cheapest table for the span between two prefix rows, packed as
+/// cost<<kCostShift|table so that the lowest table index wins a tie — the order
+/// the original's ascending scan with a strict comparison settled on.
+///
+/// Both rows arrive pre-scaled, so their difference already has room for the lane
+/// label, and the minimum is taken over unsigned values: costs are non-negative,
+/// so the order is the same, and a signed shift that might overflow is enough to
+/// stop a vectoriser cold.
 static inline uint32_t best_span(const int32_t* from, const int32_t* to) {
-    // Written as an unsigned minimum over the 32 lanes so that it vectorises:
-    // costs are non-negative, so unsigned and signed order agree, and a signed
-    // shift that might overflow is enough to stop the vectoriser cold.
+#if defined(MP3PACKER_NEON)
+    const uint32_t* f = reinterpret_cast<const uint32_t*>(from);
+    const uint32_t* t = reinterpret_cast<const uint32_t*>(to);
+    uint32x4_t d0 = vorrq_u32(vsubq_u32(vld1q_u32(t + 0),  vld1q_u32(f + 0)),  vld1q_u32(lane_index + 0));
+    uint32x4_t d1 = vorrq_u32(vsubq_u32(vld1q_u32(t + 4),  vld1q_u32(f + 4)),  vld1q_u32(lane_index + 4));
+    uint32x4_t d2 = vorrq_u32(vsubq_u32(vld1q_u32(t + 8),  vld1q_u32(f + 8)),  vld1q_u32(lane_index + 8));
+    uint32x4_t d3 = vorrq_u32(vsubq_u32(vld1q_u32(t + 12), vld1q_u32(f + 12)), vld1q_u32(lane_index + 12));
+    uint32x4_t d4 = vorrq_u32(vsubq_u32(vld1q_u32(t + 16), vld1q_u32(f + 16)), vld1q_u32(lane_index + 16));
+    uint32x4_t d5 = vorrq_u32(vsubq_u32(vld1q_u32(t + 20), vld1q_u32(f + 20)), vld1q_u32(lane_index + 20));
+    uint32x4_t d6 = vorrq_u32(vsubq_u32(vld1q_u32(t + 24), vld1q_u32(f + 24)), vld1q_u32(lane_index + 24));
+    uint32x4_t d7 = vorrq_u32(vsubq_u32(vld1q_u32(t + 28), vld1q_u32(f + 28)), vld1q_u32(lane_index + 28));
+    d0 = vminq_u32(d0, d1); d2 = vminq_u32(d2, d3);
+    d4 = vminq_u32(d4, d5); d6 = vminq_u32(d6, d7);
+    d0 = vminq_u32(d0, d2); d4 = vminq_u32(d4, d6);
+    return vminvq_u32(vminq_u32(d0, d4));
+#else
     uint32_t best = UINT32_MAX;
     for (int t = 0; t < kNumTables; ++t) {
-        const uint32_t k = static_cast<uint32_t>(to[t] - from[t]) << 5 | static_cast<uint32_t>(t);
+        const uint32_t k = static_cast<uint32_t>(to[t] - from[t]) | lane_index[t];
         best = std::min(best, k);
     }
     return best;
+#endif
 }
 
 /// Working set of one search. Thread-local because the search runs once per
@@ -613,11 +706,11 @@ HuffmanConfig HuffmanOptimizer::find_best_config(
             // original costed as zero bits with table 0.
             const bool clip0 = region0_boundary >= bv;
             const uint32_t packed0 = clip0 ? span_to_bv(0) : span_head(slot);
-            const uint32_t r0_bits = packed0 >> 5;
+            const uint32_t r0_bits = packed0 >> kCostShift;
             if (r0_bits >= static_cast<uint32_t>(kPenalty)) continue;
 
             const uint32_t packed1 = clip0 ? 0u : span_to_bv(slot);
-            const uint32_t r1_bits = packed1 >> 5;
+            const uint32_t r1_bits = packed1 >> kCostShift;
             if (r1_bits >= static_cast<uint32_t>(kPenalty)) continue;
 
             const uint32_t total = r0_bits + r1_bits + c1_bits;
@@ -648,7 +741,7 @@ HuffmanConfig HuffmanOptimizer::find_best_config(
                 const int k0 = r0_idx + 1;
                 const bool clip0 = boundary[k0] >= bv; // region0 covers every pair there is
                 const uint32_t packed0 = clip0 ? span_to_bv(0) : span_head(k0);
-                const uint32_t r0_bits = packed0 >> 5;
+                const uint32_t r0_bits = packed0 >> kCostShift;
                 if (r0_bits >= static_cast<uint32_t>(kPenalty)) continue;
 
                 for (int r1_idx = 0; r1_idx < 8; ++r1_idx) {
@@ -657,11 +750,11 @@ HuffmanConfig HuffmanOptimizer::find_best_config(
                     // An empty region costs nothing and takes table 0, whichever
                     // end of the span saturated.
                     const uint32_t packed1 = clip0 ? 0u : (clip1 ? span_to_bv(k0) : span_mid(k0, k1));
-                    const uint32_t r1_bits = packed1 >> 5;
+                    const uint32_t r1_bits = packed1 >> kCostShift;
                     if (r1_bits >= static_cast<uint32_t>(kPenalty)) continue;
 
                     const uint32_t packed2 = clip1 ? 0u : span_to_bv(k1);
-                    const uint32_t r2_bits = packed2 >> 5;
+                    const uint32_t r2_bits = packed2 >> kCostShift;
                     if (r2_bits >= static_cast<uint32_t>(kPenalty)) continue;
 
                     const uint32_t total = r0_bits + r1_bits + r2_bits + c1_bits;
