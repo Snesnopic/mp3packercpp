@@ -7,6 +7,10 @@
 #include <stdexcept>
 #include <vector>
 
+#if defined(_MSC_VER)
+#include <intrin.h> // _byteswap_uint64
+#endif
+
 namespace mp3packer {
 
 /**

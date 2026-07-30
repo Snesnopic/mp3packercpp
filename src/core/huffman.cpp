@@ -12,7 +12,12 @@
 // across the loop; that is worth 8-9% of a recompressing run on its own. Define
 // MP3PACKER_NO_SIMD to build the portable form, which is what the kernels are held
 // against.
-#if !defined(MP3PACKER_NO_SIMD) && (defined(__ARM_NEON) || defined(__ARM_NEON__) || defined(_M_ARM64))
+//
+// AArch64 with a GNU-style compiler only: the horizontal minimum the span kernel
+// ends in has no 32-bit NEON encoding, so __ARM_NEON alone is not enough of a
+// test, and MSVC spells its NEON header differently. Everything else builds the
+// portable form, which measured about 9% behind on a recompressing run.
+#if !defined(MP3PACKER_NO_SIMD) && defined(__aarch64__) && (defined(__ARM_NEON) || defined(__ARM_NEON__))
 #define MP3PACKER_NEON 1
 #include <arm_neon.h>
 #endif
