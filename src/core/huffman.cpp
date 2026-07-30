@@ -665,16 +665,22 @@ HuffmanConfig HuffmanOptimizer::find_best_config(
 
     // count1 cost as a backward recurrence: coding the tail from an even position
     // is one quadruple plus the cost four coefficients later, so one walk serves
-    // every candidate big_values instead of a rescan per candidate. The stopping
-    // rules are the original's — a position at or above the last non-zero
-    // coefficient, or past the last quadruple, costs nothing and is usable.
+    // every candidate big_values instead of a rescan per candidate.
     const auto& c1_arr_32 = HuffmanTableManager::get_encoding_map(32);
     const auto& c1_arr_33 = HuffmanTableManager::get_encoding_map(33);
     for (int pos = kNumCoefficients; pos >= 2 * last_bv_pair; pos -= 2) {
-        if (pos >= last_nonzero_coeff || pos > kNumCoefficients - 4) {
+        if (pos >= last_nonzero_coeff) {
+            // Nothing above here needs coding at all.
             sc.c1_bits32[pos] = 0;
             sc.c1_bits33[pos] = 0;
             sc.c1_ok[pos] = true;
+            continue;
+        }
+        if (pos > kNumCoefficients - 4) {
+            // A quadruple cannot start inside the last one, so a split here would
+            // leave the coefficients above it uncoded. That is a big_values the
+            // granule cannot use, not a free tail.
+            sc.c1_ok[pos] = false;
             continue;
         }
         const int v = coeffs[pos], w = coeffs[pos+1], x = coeffs[pos+2], y = coeffs[pos+3];

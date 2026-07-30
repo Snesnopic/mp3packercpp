@@ -33,5 +33,12 @@ target_link_libraries(mp3packercpp PRIVATE mp3packercpp_core)
 target_include_directories(mp3packercpp PRIVATE src/cli)
 target_compile_definitions(mp3packercpp PRIVATE MP3PACKERCPP_VERSION="${PROJECT_VERSION}")
 
+# --- Tests ---
+option(MP3PACKERCPP_BUILD_TESTS "Build the test programs" ${PROJECT_IS_TOP_LEVEL})
+if(MP3PACKERCPP_BUILD_TESTS)
+    enable_testing()
+    add_subdirectory(tests)
+endif()
+
 include(GNUInstallDirs)
 install(TARGETS mp3packercpp DESTINATION ${CMAKE_INSTALL_BINDIR})
