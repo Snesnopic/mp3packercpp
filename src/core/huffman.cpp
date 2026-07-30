@@ -282,14 +282,26 @@ void HuffmanOptimizer::decode_quantized_coefficients(
         const int linbits = huffman_tables[table_idx].linbits;
         const int16_t* tree = huffman_tables[table_idx].table;
         const DecodeEntry* lut = luts[table_idx];
-        const bool check_limit = table_idx != 0;
         // A magnitude of 15 escapes to linbits, but only for tables that have any.
         // Putting the trigger out of range for the others folds "does this table
         // escape" into the comparison the loop was making anyway.
         const int escape = linbits > 0 ? 15 : 16;
         const int target = out_off + count_pairs * 2;
-        while (out_off < target && out_off < 575) {
-            if (check_limit && bp >= bit_limit) return false;
+        // A pair needs two coefficients, so the spectrum's own end bounds the region
+        // as much as the declared pair count does; the first even position at or
+        // past 575 is 576. Folding them together leaves one comparison per pair
+        // instead of two.
+        const int end = std::min(target, 576);
+        // Table 0 codes nothing: every pair is a pair of zeros and no bits are
+        // consumed, so the whole region is a fill rather than a walk. Region 2 uses
+        // it often on quiet material.
+        if (table_idx == 0) {
+            std::fill(coeffs.begin() + out_off, coeffs.begin() + end, int16_t{0});
+            out_off = end;
+            return true;
+        }
+        while (out_off < end) {
+            if (bp >= bit_limit) return false;
             if (bp > fast_until) { decode_pair_slow(table_idx, linbits); continue; }
             uint64_t w = reader.peek_at(bp);
             int used;
