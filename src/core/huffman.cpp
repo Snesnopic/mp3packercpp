@@ -110,6 +110,55 @@ static const int* get_sf_bands_short(const uint32_t samplerate) {
     return sf_bands_short_44100;
 }
 
+// --- decode tables ---------------------------------------------------------
+namespace {
+
+/// One 8-bit prefix of a code table. A codeword of eight bits or fewer resolves
+/// in a single lookup; anything longer hands back the tree node the first eight
+/// bits reached, and the walk carries on from there.
+struct DecodeEntry {
+    int16_t symbol = 0; ///< Decoded table value, unless length is kLongCode
+    uint8_t length = 0; ///< Codeword length in bits, or kLongCode to keep walking
+    uint16_t node = 0;  ///< Tree index the first eight bits reached
+};
+
+/// Marks a prefix whose codeword is longer than eight bits. It cannot be a
+/// length, and in particular is not zero: table 0 codes its single symbol in no
+/// bits at all, so a zero length is a real one.
+constexpr uint8_t kLongCode = 0xFF;
+
+using DecodeLut = DecodeEntry[256];
+
+static const DecodeLut* decode_luts() {
+    static const std::array<std::array<DecodeEntry, 256>, 34> luts = [] {
+        std::array<std::array<DecodeEntry, 256>, 34> all{};
+        for (int idx = 0; idx < 34; ++idx) {
+            const int16_t* tab = huffman_tables[idx].table;
+            for (int prefix = 0; prefix < 256; ++prefix) {
+                int node = 0, len = 0;
+                for (;;) {
+                    const int16_t v = tab[node];
+                    if (v >= 0) { // leaf
+                        all[idx][prefix] = {v, static_cast<uint8_t>(len), 0};
+                        break;
+                    }
+                    ++node;
+                    if (prefix >> (7 - len) & 1) node -= v;
+                    ++len;
+                    if (len == 8) { // longer than the prefix: resume at this node
+                        all[idx][prefix] = {0, kLongCode, static_cast<uint16_t>(node)};
+                        break;
+                    }
+                }
+            }
+        }
+        return all;
+    }();
+    return reinterpret_cast<const DecodeLut*>(luts.data());
+}
+
+} // namespace
+
 HuffmanOptimizer::HuffmanOptimizer() = default;
 
 std::vector<int16_t> HuffmanOptimizer::decode_quantized_coefficients(
@@ -118,40 +167,107 @@ std::vector<int16_t> HuffmanOptimizer::decode_quantized_coefficients(
     std::vector<int16_t> coeffs(576, 0);
     int out_off = 0;
     const auto sf_bands = get_sf_bands(samplerate);
+    const DecodeLut* luts = decode_luts();
+    // The bit position is carried in a local rather than in the reader: going
+    // through it for every bit of every symbol put a store-to-load turnaround on
+    // the loop's critical path. The reader is resynchronised at each exit.
+    size_t bp = reader.tell_bit();
     const size_t bit_limit = (max_huffman_bits >= 0)
-                             ? (reader.tell_bit() + static_cast<size_t>(max_huffman_bits))
+                             ? (bp + static_cast<size_t>(max_huffman_bits))
                              : SIZE_MAX;
 
-    // decode one full huffman symbol; never aborts mid-traversal (matches mp3packer's decode_big_quants)
-    auto decode_symbol = [&](const uint8_t table_idx) -> int16_t {
-        if (table_idx == 0) return 0;
-        const int16_t* tab = huffman_tables[table_idx].table;
+    // A peeked word only holds 57 bits whatever the misalignment, and a read that
+    // reaches past the end of the data has its own behaviour to reproduce, so the
+    // last few bytes are decoded a bit at a time instead. That is at most the final
+    // granule of a file.
+    const size_t fast_until = reader.size_bits() >= 57 ? reader.size_bits() - 57 : 0;
+
+    // One pair, read a bit at a time through the reader. Identical in effect to the
+    // fast path, and the only thing that runs where the fast path's assumptions
+    // stop holding.
+    auto decode_pair_slow = [&](const uint8_t table_idx, const int linbits) {
+        reader.seek_bit(bp);
         int16_t got = 0;
-        while ((got = *tab++) < 0) {
-            if (reader.read_bits(1)) tab -= got;
+        if (table_idx != 0) {
+            const int16_t* tab = huffman_tables[table_idx].table;
+            while ((got = *tab++) < 0) {
+                if (reader.read_bits(1)) tab -= got;
+            }
         }
-        return got;
+        int y = got & 0xF;
+        int x = (got >> 4) & 0xF;
+        if (x > 0) {
+            if (x == 15 && linbits > 0) x += static_cast<int>(reader.read_bits(linbits));
+            if (reader.read_bits(1)) x = -x;
+        }
+        if (y > 0) {
+            if (y == 15 && linbits > 0) y += static_cast<int>(reader.read_bits(linbits));
+            if (reader.read_bits(1)) y = -y;
+        }
+        coeffs[out_off++] = static_cast<int16_t>(x);
+        coeffs[out_off++] = static_cast<int16_t>(y);
+        bp = reader.tell_bit();
     };
 
-    // big region: boundary checked only at the start of each pair; the symbol is then read whole
+    // big region: boundary checked only at the start of each pair; the symbol is
+    // then read whole (matches mp3packer's decode_big_quants). A whole pair —
+    // codeword, escape magnitudes and signs — is at most 47 bits, so it comes out
+    // of one peeked word rather than bit by bit, and the first eight bits usually
+    // resolve the codeword in a single table lookup.
     auto decode_region = [&](const int count_pairs, const uint8_t table_idx) -> bool {
         const int linbits = huffman_tables[table_idx].linbits;
+        const int16_t* tree = huffman_tables[table_idx].table;
+        const DecodeEntry* lut = luts[table_idx];
+        const bool check_limit = table_idx != 0;
         const int target = out_off + count_pairs * 2;
         while (out_off < target && out_off < 575) {
-            if (table_idx != 0 && reader.tell_bit() >= bit_limit) return false;
-            const int got = decode_symbol(table_idx);
-            int y = got & 0xF;
-            int x = (got >> 4) & 0xF;
+            if (check_limit && bp >= bit_limit) return false;
+            if (bp > fast_until) { decode_pair_slow(table_idx, linbits); continue; }
+            uint64_t w = reader.peek_at(bp);
+            int used;
+            int sym;
+            const DecodeEntry& e = lut[w >> 56];
+            if (e.length != kLongCode) {
+                sym = e.symbol;
+                used = e.length;
+                w <<= used;
+            } else {
+                int node = e.node;
+                used = 8;
+                w <<= 8;
+                for (;;) {
+                    const int16_t v = tree[node];
+                    if (v >= 0) { sym = v; break; }
+                    ++node;
+                    if (w >> 63) node -= v;
+                    w <<= 1;
+                    ++used;
+                }
+            }
+            int y = sym & 0xF;
+            int x = (sym >> 4) & 0xF;
             if (x > 0) {
-                if (x == 15 && linbits > 0) x += static_cast<int>(reader.read_bits(linbits));
-                if (reader.read_bits(1)) x = -x;
+                if (x == 15 && linbits > 0) {
+                    x += static_cast<int>(w >> (64 - linbits));
+                    w <<= linbits;
+                    used += linbits;
+                }
+                if (w >> 63) x = -x;
+                w <<= 1;
+                ++used;
             }
             if (y > 0) {
-                if (y == 15 && linbits > 0) y += static_cast<int>(reader.read_bits(linbits));
-                if (reader.read_bits(1)) y = -y;
+                if (y == 15 && linbits > 0) {
+                    y += static_cast<int>(w >> (64 - linbits));
+                    w <<= linbits;
+                    used += linbits;
+                }
+                if (w >> 63) y = -y;
+                ++used;
             }
             coeffs[out_off++] = static_cast<int16_t>(x);
             coeffs[out_off++] = static_cast<int16_t>(y);
+            bp += static_cast<size_t>(used);
         }
         return true;
     };
@@ -176,17 +292,47 @@ std::vector<int16_t> HuffmanOptimizer::decode_quantized_coefficients(
 
     bool cont = decode_region(r0_pairs, config.table0);
     if (cont) cont = decode_region(r1_pairs, config.table1);
-    if (cont) decode_region(r2_pairs, config.table2);
+    if (cont) cont = decode_region(r2_pairs, config.table2);
 
-    // count1 region: boundary checked only at the start of each quad
-    const uint8_t count1_table = config.count1_table_select ? 33 : 32;
-    while (out_off <= 572 && reader.tell_bit() < bit_limit) {
-        const int got = decode_symbol(count1_table);
-        coeffs[out_off++] = static_cast<int16_t>((got & 8) ? (reader.read_bits(1) ? -1 : 1) : 0);
-        coeffs[out_off++] = static_cast<int16_t>((got & 4) ? (reader.read_bits(1) ? -1 : 1) : 0);
-        coeffs[out_off++] = static_cast<int16_t>((got & 2) ? (reader.read_bits(1) ? -1 : 1) : 0);
-        coeffs[out_off++] = static_cast<int16_t>((got & 1) ? (reader.read_bits(1) ? -1 : 1) : 0);
+    // count1 region: boundary checked only at the start of each quad. No count1
+    // codeword exceeds six bits, so the quadruple and its four possible signs come
+    // out of the same peeked word.
+    if (cont) {
+        const uint8_t count1_table = config.count1_table_select ? 33 : 32;
+        const DecodeEntry* lut = luts[count1_table];
+        while (out_off <= 572 && bp < bit_limit) {
+            if (bp > fast_until) { // last bytes of the data: read a bit at a time
+                reader.seek_bit(bp);
+                const int16_t* tab = huffman_tables[count1_table].table;
+                int16_t got = 0;
+                while ((got = *tab++) < 0) {
+                    if (reader.read_bits(1)) tab -= got;
+                }
+                for (int mask = 8; mask != 0; mask >>= 1) {
+                    coeffs[out_off++] = static_cast<int16_t>((got & mask) ? (reader.read_bits(1) ? -1 : 1) : 0);
+                }
+                bp = reader.tell_bit();
+                continue;
+            }
+            uint64_t w = reader.peek_at(bp);
+            const DecodeEntry& e = lut[w >> 56];
+            if (e.length == kLongCode) break; // unreachable: no count1 codeword exceeds six bits
+            const int got = e.symbol;
+            int used = e.length;
+            w <<= used;
+            for (int mask = 8; mask != 0; mask >>= 1) {
+                int v = 0;
+                if (got & mask) {
+                    v = (w >> 63) ? -1 : 1;
+                    w <<= 1;
+                    ++used;
+                }
+                coeffs[out_off++] = static_cast<int16_t>(v);
+            }
+            bp += static_cast<size_t>(used);
+        }
     }
+    reader.seek_bit(bp);
     return coeffs;
 }
 
@@ -551,19 +697,44 @@ void HuffmanOptimizer::encode_quantized_coefficients(
     int cur = 0;
     const auto sf_bands = get_sf_bands(samplerate);
 
-    auto encode_pair = [&](const int x, const int y, const uint8_t table_idx) {
-        if (table_idx == 0) return;
-        const int linbits = huffman_tables[table_idx].linbits;
-        const int abs_x = std::min(15, std::abs(x));
-        const int abs_y = std::min(15, std::abs(y));
+    // The accumulator is carried in these two locals for the whole granule and
+    // handed back at the end, so appending a field is a shift and an or in
+    // registers rather than a call into the writer and a round trip through its
+    // state. A pair's codeword, escape magnitudes and signs come to at most 47
+    // bits, so they are assembled in one word and committed in one step.
+    uint64_t acc;
+    int nacc;
+    writer.pending(acc, nacc);
+    auto emit = [&](const uint64_t word, const int n) {
+        if (nacc + n > 64) writer.store(acc, nacc);
+        acc |= (word & ((uint64_t{1} << n) - 1)) << (64 - nacc - n);
+        nacc += n;
+    };
+
+    auto encode_pair = [&](const int x, const int y, const std::array<SymbolCode, 256>& map, const int linbits) {
+        const int mag_x = std::abs(x), mag_y = std::abs(y);
+        const int abs_x = std::min(15, mag_x), abs_y = std::min(15, mag_y);
+        const SymbolCode& code = map[static_cast<size_t>(abs_x << 4 | abs_y)];
+        if (!code.valid) return;
+        uint64_t word = code.code;
+        int n = code.length;
+        if (abs_x == 15 && linbits > 0) { word = word << linbits | static_cast<uint32_t>(mag_x - 15); n += linbits; }
+        if (x != 0) { word = word << 1 | (x < 0 ? 1u : 0u); n += 1; }
+        if (abs_y == 15 && linbits > 0) { word = word << linbits | static_cast<uint32_t>(mag_y - 15); n += linbits; }
+        if (y != 0) { word = word << 1 | (y < 0 ? 1u : 0u); n += 1; }
+        emit(word, n);
+    };
+
+    // Everything that depends only on the table is settled per region: the
+    // per-pair loop then touches one code entry and nothing else global.
+    auto encode_region = [&](const int pairs, const uint8_t table_idx) {
+        if (table_idx == 0) { cur += 2 * pairs; return; } // table 0 codes nothing
         const auto& map = HuffmanTableManager::get_encoding_map(table_idx);
-        const int idx = (abs_x << 4) | abs_y;
-        if (!map[idx].valid) return;
-        writer.write_bits(map[idx].code, map[idx].length);
-        if (abs_x == 15 && linbits > 0) writer.write_bits(static_cast<uint32_t>(std::abs(x) - 15), linbits);
-        if (x != 0) writer.write_bits(x < 0 ? 1u : 0u, 1);
-        if (abs_y == 15 && linbits > 0) writer.write_bits(static_cast<uint32_t>(std::abs(y) - 15), linbits);
-        if (y != 0) writer.write_bits(y < 0 ? 1u : 0u, 1);
+        const int linbits = huffman_tables[table_idx].linbits;
+        for (int i = 0; i < pairs; ++i) {
+            encode_pair(coeffs[cur], coeffs[cur + 1], map, linbits);
+            cur += 2;
+        }
     };
 
     int r0_pairs, r1_pairs, r2_pairs;
@@ -584,9 +755,9 @@ void HuffmanOptimizer::encode_quantized_coefficients(
         r2_pairs = static_cast<int>(config.big_values) - r0_pairs - r1_pairs;
     }
 
-    for (int i = 0; i < r0_pairs; ++i) { encode_pair(coeffs[cur], coeffs[cur+1], config.table0); cur += 2; }
-    for (int i = 0; i < r1_pairs; ++i) { encode_pair(coeffs[cur], coeffs[cur+1], config.table1); cur += 2; }
-    for (int i = 0; i < r2_pairs; ++i) { encode_pair(coeffs[cur], coeffs[cur+1], config.table2); cur += 2; }
+    encode_region(r0_pairs, config.table0);
+    encode_region(r1_pairs, config.table1);
+    encode_region(r2_pairs, config.table2);
 
     int last_nonzero = 0;
     for (int i = 575; i >= 0; --i) {
@@ -598,18 +769,25 @@ void HuffmanOptimizer::encode_quantized_coefficients(
     while (cur <= 572) {
         if (cur >= last_nonzero) break;
         const int v = coeffs[cur];
+        const int w = coeffs[cur+1];
         const int x = coeffs[cur+2];
         const int y = coeffs[cur+3];
-        const int w = coeffs[cur+1];
         const int symbol = ((v != 0) << 3) | ((w != 0) << 2) | ((x != 0) << 1) | (y != 0);
-        if (!c1_map[symbol].valid || c1_map[symbol].length == 0) break;
-        writer.write_bits(c1_map[symbol].code, c1_map[symbol].length);
-        if (v != 0) writer.write_bits(v < 0 ? 1u : 0u, 1);
-        if (w != 0) writer.write_bits(w < 0 ? 1u : 0u, 1);
-        if (x != 0) writer.write_bits(x < 0 ? 1u : 0u, 1);
-        if (y != 0) writer.write_bits(y < 0 ? 1u : 0u, 1);
+        const SymbolCode& code = c1_map[static_cast<size_t>(symbol)];
+        if (!code.valid || code.length == 0) break;
+        // The quadruple's codeword and its signs, at most ten bits, go over in one
+        // step: a zero coefficient contributes no sign bit and shifts nothing.
+        uint64_t word = code.code;
+        int n = code.length;
+        if (v != 0) { word = word << 1 | (v < 0 ? 1u : 0u); ++n; }
+        if (w != 0) { word = word << 1 | (w < 0 ? 1u : 0u); ++n; }
+        if (x != 0) { word = word << 1 | (x < 0 ? 1u : 0u); ++n; }
+        if (y != 0) { word = word << 1 | (y < 0 ? 1u : 0u); ++n; }
+        emit(word, n);
         cur += 4;
     }
+
+    writer.resume(acc, nacc);
 }
 
 } // namespace mp3packer
