@@ -142,27 +142,6 @@ constexpr uint8_t kLongCode = 0xFF;
 
 using DecodeLut = DecodeEntry[256];
 
-/// A big-values symbol split into what the decoder needs: the two magnitudes, and
-/// how many sign bits they consume. Reading them from a table means the loop
-/// branches on neither magnitude being zero nor its sign, both unpredictable.
-struct PairDecode {
-    int8_t x = 0, y = 0;   ///< magnitudes before any escape or sign
-    uint8_t nx = 0, ny = 0; ///< sign bits each consumes: one unless the value is zero
-};
-
-static const PairDecode* pair_decode_table() {
-    static const std::array<PairDecode, 256> table = [] {
-        std::array<PairDecode, 256> all{};
-        for (int sym = 0; sym < 256; ++sym) {
-            const int x = sym >> 4, y = sym & 15;
-            all[sym] = {static_cast<int8_t>(x), static_cast<int8_t>(y),
-                        static_cast<uint8_t>(x != 0), static_cast<uint8_t>(y != 0)};
-        }
-        return all;
-    }();
-    return table.data();
-}
-
 /// One count1 quadruple, signs applied. Indexed by the codeword's non-zero pattern
 /// together with the four bits that follow it, so the pattern and its signs come
 /// out of a single lookup however many of those bits are really consumed.
@@ -230,7 +209,6 @@ void HuffmanOptimizer::decode_quantized_coefficients(
     int out_off = 0;
     const auto sf_bands = get_sf_bands(samplerate);
     const DecodeLut* luts = decode_luts();
-    const PairDecode* pairs = pair_decode_table();
     const Count1Quad* quads = count1_quad_table();
     // The bit position is carried in a local rather than in the reader: going
     // through it for every bit of every symbol put a store-to-load turnaround on
