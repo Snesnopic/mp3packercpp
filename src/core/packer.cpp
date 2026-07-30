@@ -151,7 +151,7 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
 
     std::vector<Mp3Frame> all_frames;
     while (auto opt_frame = reader.read_next_frame()) {
-        all_frames.push_back(*opt_frame);
+        all_frames.push_back(std::move(*opt_frame)); // a copy here duplicated every frame's payload
     }
 
     if (all_frames.empty()) {
@@ -178,6 +178,9 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
     std::vector<uint8_t> frame_was_optimized(N, 0);
     
     std::vector<uint8_t> global_res;
+    size_t total_main = 0;
+    for (const auto& frame : all_frames) total_main += frame.main_data_raw.size();
+    global_res.reserve(total_main);
     std::vector<size_t> frame_main_starts(N);
     for (size_t i = 0; i < N; ++i) {
         frame_main_starts[i] = global_res.size();
@@ -188,6 +191,9 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
     unsigned int active_threads = num_threads > 0 ? num_threads : std::max(1u, std::thread::hardware_concurrency());
 
     auto worker = [&]() {
+        // One pair of spectra per worker, reused for every granule: the coder fills
+        // them and zeroes only the tail it did not write.
+        Spectrum coeffs{}, vcoeffs{};
         while (true) {
             size_t i = current_frame.fetch_add(1);
             if (i >= N) break;
@@ -317,7 +323,7 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
                     };
                     int scalefac_bits = static_cast<int>(data_reader.tell_bit() - gc_orig_start);
                     int max_huff_bits = side_copy.gr[gr][ch].part2_3_length - scalefac_bits;
-                    auto coeffs = HuffmanOptimizer::decode_quantized_coefficients(orig_cfg, data_reader, frame.header.samplerate, max_huff_bits);
+                    HuffmanOptimizer::decode_quantized_coefficients(coeffs, orig_cfg, data_reader, frame.header.samplerate, max_huff_bits);
                     auto best_cfg = HuffmanOptimizer::find_best_config(coeffs, orig_cfg, frame.header.samplerate);
                     
                     // re-encode
@@ -354,7 +360,7 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
                         int huff_bits = static_cast<int>(writer.tell_bit() - scalefac_end_bit);
                         BitstreamReader vrdr(writer.data());
                         vrdr.seek_bit(scalefac_end_bit);
-                        auto vcoeffs = HuffmanOptimizer::decode_quantized_coefficients(best_cfg, vrdr, frame.header.samplerate, huff_bits);
+                        HuffmanOptimizer::decode_quantized_coefficients(vcoeffs, best_cfg, vrdr, frame.header.samplerate, huff_bits);
                         for (int ci = 0; ci < 576; ++ci) {
                             if (vcoeffs[ci] != coeffs[ci]) {
                                 optimization_failed = true;
@@ -450,6 +456,7 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
         required_carryover[i] = current_req;
     }
     std::vector<uint8_t> global_main_data;
+    global_main_data.reserve(total_main);
     int current_reservoir = 0; // free space in past payloads
     
     std::vector<ChosenBitrate> chosen_bitrates(N);
@@ -571,8 +578,12 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
         }
 
         if (data_size > write_len) {
-            std::vector<uint8_t> pad(static_cast<size_t>(data_size - write_len), 0x00);
-            out.write(reinterpret_cast<const char*>(pad.data()), static_cast<std::streamsize>(pad.size()));
+            static constexpr uint8_t zeros[2048] = {};
+            for (int left = data_size - write_len; left > 0;) {
+                const int chunk = std::min(left, static_cast<int>(sizeof zeros));
+                out.write(reinterpret_cast<const char*>(zeros), chunk);
+                left -= chunk;
+            }
         }
     }
     

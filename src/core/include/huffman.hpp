@@ -2,10 +2,22 @@
 #define MP3PACKERCPP_HUFFMAN_HPP
 
 #include "bitstream.hpp"
+#include <array>
 #include <vector>
 #include <cstdint>
 
 namespace mp3packer {
+
+/// Number of quantized spectral values in one granule.
+constexpr int kNumCoefficients = 576;
+
+/**
+ * @brief One granule's quantized coefficients.
+ *
+ * A fixed array rather than a vector: the coder runs once per granule, hundreds
+ * of thousands of times per second, and the caller reuses one buffer per worker.
+ */
+using Spectrum = std::array<int16_t, kNumCoefficients>;
 
 /**
  * @brief Represents the configuration of Huffman regions and tables for a granule.
@@ -36,15 +48,16 @@ public:
      * The part2_3 bit limit is checked only at the start of each big-values pair and
      * each count1 quad, never mid-symbol. This matches mp3packer's decode behaviour.
      *
+     * @param coeffs Destination for the 576 coefficients, zero-filled past the
+     *               last decoded value.
      * @param config The original Huffman configuration from the side info.
      * @param reader Bitstream reader positioned at the start of the Huffman data
      *               (i.e. after scalefactors, at bit offset part2_length).
      * @param samplerate Sampling rate of the frame in Hz.
      * @param max_huffman_bits Maximum bits to consume (part2_3_length - part2_length).
      *                         Pass -1 to decode until big_values/count1 are exhausted.
-     * @return A vector of 576 integer coefficients (zero-padded beyond the last decoded value).
      */
-    static std::vector<int16_t> decode_quantized_coefficients(const HuffmanConfig& config, BitstreamReader& reader, uint32_t samplerate, int max_huffman_bits = -1);
+    static void decode_quantized_coefficients(Spectrum& coeffs, const HuffmanConfig& config, BitstreamReader& reader, uint32_t samplerate, int max_huffman_bits = -1);
 
     /**
      * @brief Performs brute-force search to find the optimal Huffman table combination.
@@ -53,7 +66,7 @@ public:
      * @param samplerate Sampling rate of the frame in Hz.
      * @return A new HuffmanConfig that yields the smallest bit size for the coefficients.
      */
-    static HuffmanConfig find_best_config(const std::vector<int16_t>& coeffs, const HuffmanConfig& orig_config, uint32_t samplerate);
+    static HuffmanConfig find_best_config(const Spectrum& coeffs, const HuffmanConfig& orig_config, uint32_t samplerate);
 
     /**
      * @brief Re-encodes the coefficients into a bitstream using a given configuration.
@@ -62,7 +75,7 @@ public:
      * @param writer Bitstream writer to output the compressed bits.
      * @param samplerate Sampling rate of the frame in Hz.
      */
-    static void encode_quantized_coefficients(const std::vector<int16_t>& coeffs, const HuffmanConfig& config, BitstreamWriter& writer, uint32_t samplerate);
+    static void encode_quantized_coefficients(const Spectrum& coeffs, const HuffmanConfig& config, BitstreamWriter& writer, uint32_t samplerate);
 
 };
 

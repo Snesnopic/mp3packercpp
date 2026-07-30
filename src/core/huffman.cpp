@@ -161,10 +161,9 @@ static const DecodeLut* decode_luts() {
 
 HuffmanOptimizer::HuffmanOptimizer() = default;
 
-std::vector<int16_t> HuffmanOptimizer::decode_quantized_coefficients(
-        const HuffmanConfig& config, BitstreamReader& reader,
+void HuffmanOptimizer::decode_quantized_coefficients(
+        Spectrum& coeffs, const HuffmanConfig& config, BitstreamReader& reader,
         const uint32_t samplerate, const int max_huffman_bits) {
-    std::vector<int16_t> coeffs(576, 0);
     int out_off = 0;
     const auto sf_bands = get_sf_bands(samplerate);
     const DecodeLut* luts = decode_luts();
@@ -333,7 +332,11 @@ std::vector<int16_t> HuffmanOptimizer::decode_quantized_coefficients(
         }
     }
     reader.seek_bit(bp);
-    return coeffs;
+    // Every coefficient below out_off was written before it could be read, so only
+    // the tail above it has to be cleared: zeroing the whole spectrum up front
+    // rewrote 1.1 kB per granule to no purpose, since a granule that codes half its
+    // coefficients leaves the rest untouched anyway.
+    std::fill(coeffs.begin() + out_off, coeffs.end(), int16_t{0});
 }
 
 // --- search cost machinery -------------------------------------------------
@@ -357,7 +360,6 @@ namespace {
 // recomputed per candidate.
 
 constexpr int kNumTables = 32;
-constexpr int kNumCoefficients = 576; ///< quantized spectral values per granule
 
 // Per-pair cost of a table that cannot represent the pair. Kept at the original
 // value, along with the ">= kPenalty means the region is impossible" test, so
@@ -472,7 +474,7 @@ struct SearchScratch {
 } // namespace
 
 HuffmanConfig HuffmanOptimizer::find_best_config(
-        const std::vector<int16_t>& coeffs,
+        const Spectrum& coeffs,
         const HuffmanConfig& orig_config, uint32_t samplerate) {
     HuffmanConfig best = orig_config;
     uint32_t min_total_bits = 0xFFFFFFFF;
@@ -692,7 +694,7 @@ HuffmanConfig HuffmanOptimizer::find_best_config(
 }
 
 void HuffmanOptimizer::encode_quantized_coefficients(
-        const std::vector<int16_t>& coeffs, const HuffmanConfig& config,
+        const Spectrum& coeffs, const HuffmanConfig& config,
         BitstreamWriter& writer, const uint32_t samplerate) {
     int cur = 0;
     const auto sf_bands = get_sf_bands(samplerate);

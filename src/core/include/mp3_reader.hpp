@@ -2,7 +2,6 @@
 #define MP3PACKERCPP_MP3_READER_HPP
 
 #include "types.hpp"
-#include <fstream>
 #include <vector>
 #include <optional>
 
@@ -13,6 +12,10 @@ namespace mp3packer {
  *
  * It is responsible for bypassing ID3 tags, finding frame headers,
  * and parsing the side info to assemble complete Mp3Frame structs.
+ *
+ * The file is read once into memory and parsed from there: a frame needs three or
+ * four reads of a few bytes each, and going to the stream for them cost more than
+ * the parsing did.
  */
 class Mp3Reader {
 public:
@@ -43,10 +46,21 @@ public:
     [[nodiscard]] const std::vector<uint8_t>& get_end_junk() const { return end_junk_; }
 
 private:
-    std::ifstream file_;                  ///< File stream of the MP3 file
-    size_t file_size_;                    ///< Total size of the file in bytes
+    std::vector<uint8_t> data_;           ///< Whole file contents
+    size_t pos_ = 0;                      ///< Read cursor into data_
+    bool exhausted_ = false;              ///< Set once a read has run off the end
     std::vector<uint8_t> start_junk_;     ///< Buffer storing ID3v2 or pre-audio data
     std::vector<uint8_t> end_junk_;       ///< Buffer storing ID3v1 or post-audio data
+
+    /**
+     * @brief Copies n bytes from the cursor, zero-filling anything past the end.
+     *
+     * Mirrors what a short std::ifstream::read left behind: the bytes that were
+     * there, the rest of a zero-initialised buffer untouched, and every later read
+     * failing too.
+     * @return False if the data ran out.
+     */
+    bool take(uint8_t* dst, size_t n);
     
     /**
      * @brief Parses a 32-bit header into an Mp3Header struct.

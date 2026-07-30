@@ -91,7 +91,6 @@ struct Mp3Frame {
     SideInfo side_info{};                ///< Parsed side information
     std::vector<uint8_t> side_info_raw{};///< Raw bytes of the side info section
     std::vector<uint8_t> main_data_raw{};///< Raw bytes of the main data (payload)
-    std::vector<uint8_t> raw_bytes{};    ///< Complete frame bytes as read from file
 };
 
 } // namespace mp3packer
