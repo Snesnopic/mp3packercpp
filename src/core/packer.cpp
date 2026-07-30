@@ -173,7 +173,10 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
     DEBUG_LOG("Optimizing " << N << " audio frames...");
 
     std::vector<std::vector<uint8_t>> optimized_main_data(N);
-    std::vector<SideInfo> optimized_side_info(N);
+    // The new side info goes into the frame itself. A worker owns its frame, and a
+    // frame it gives up on keeps what it arrived with, which is what the verbatim
+    // path reads — so a parallel array of side info was a copy of something each
+    // frame already had, 200 bytes of it per frame.
     // plain uint8_t, not vector<bool>: worker threads write distinct indices concurrently,
     // and vector<bool>'s packed-bit storage would make that a genuine data race (RMW on a
     // shared word) even though each thread only touches its own logical element.
@@ -205,6 +208,7 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
             size_t i = current_frame.fetch_add(1);
             if (i >= N) break;
 
+            auto& frame = all_frames[i];
             if (has_xing && i == 0) {
                 // output frames are always written without CRC, so "Xing"/"Info" must be at
                 // output mdr[0..3].
@@ -244,12 +248,9 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
                     optimized_main_data[i] = {b0, b1};
                     optimized_main_data[i].insert(optimized_main_data[i].end(), mdr, mdr + keep);
                 }
-                SideInfo clean_si{};
-                optimized_side_info[i] = clean_si;
+                frame.side_info = SideInfo{};
                 continue;
             }
-        auto& frame = all_frames[i];
-
         int n_ch = (frame.header.channel_mode == ChannelMode::Mono) ? 1 : 2;
         int n_gr = (frame.header.version == MpegVersion::MPEG1) ? 2 : 1;
 
@@ -412,7 +413,6 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
         }
 
         optimized_main_data[i] = new_main;
-        optimized_side_info[i] = frame.side_info;
         }
     };
 
@@ -491,7 +491,7 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
     
     // pass 1: build global_main_data and calculate main_data_begin
     for (size_t i = 0; i < N; ++i) {
-        auto& side = optimized_side_info[i];
+        auto& side = all_frames[i].side_info;
 
         int max_reservoir = (version == MpegVersion::MPEG1) ? 511 : 255;
 
@@ -582,7 +582,7 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
 
     for (size_t i = 0; i < N_out; ++i) {
         const auto& frame = all_frames[i];
-        const auto& side = optimized_side_info[i];
+        const auto& side = frame.side_info;
 
         if (has_xing && i > 0)
             audio_frame_file_pos.push_back(out_bytes.size());

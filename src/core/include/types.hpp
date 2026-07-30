@@ -1,7 +1,7 @@
 #ifndef MP3PACKERCPP_TYPES_HPP
 #define MP3PACKERCPP_TYPES_HPP
 
-#include <vector>
+#include <cstddef>
 #include <cstdint>
 
 namespace mp3packer {
@@ -68,7 +68,6 @@ struct GrChInfo {
     bool preflag = false;           ///< Pre-emphasis flag
     bool scalefac_scale = false;    ///< Scale of the scalefactors
     bool count1table_select = false;///< True if count1 region uses Huffman table 33 (false → 32)
-    std::vector<int> scalefactors{};///< Decoded scalefactors for the granule/channel
 };
 
 /**
