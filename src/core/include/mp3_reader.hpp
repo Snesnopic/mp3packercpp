@@ -2,8 +2,9 @@
 #define MP3PACKERCPP_MP3_READER_HPP
 
 #include "types.hpp"
-#include <vector>
 #include <optional>
+#include <string>
+#include <vector>
 
 namespace mp3packer {
 
