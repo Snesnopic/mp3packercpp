@@ -10,6 +10,7 @@
 #include <fstream>
 #include <stdexcept>
 #include <atomic>
+#include <cstring>
 #include <thread>
 
 namespace mp3packer {
@@ -17,8 +18,8 @@ namespace mp3packer {
 Packer::Packer() = default;
 
 // Takes the original raw side_info bytes and sets only the main_data_begin field.
-static std::vector<uint8_t> patch_mdb(const std::vector<uint8_t>& raw, const MpegVersion version, const uint16_t new_mdb) {
-    std::vector<uint8_t> out = raw;
+static std::vector<uint8_t> patch_mdb(const uint8_t* raw, const size_t size, const MpegVersion version, const uint16_t new_mdb) {
+    std::vector<uint8_t> out(raw, raw + size);
     if (version == MpegVersion::MPEG1) {
         // main_data_begin is 9 bits (bits 0-8 MSB first)
         out[0] = static_cast<uint8_t>((new_mdb >> 1) & 0xFF);
@@ -94,12 +95,12 @@ static uint32_t get_samplerate_index(const MpegVersion v, const uint32_t sr) {
     return 0;
 }
 
-static bool is_xing_frame(const Mp3Frame& frame) {
-    std::vector<uint8_t> full_frame;
-    full_frame.insert(full_frame.end(), frame.side_info_raw.begin(), frame.side_info_raw.end());
-    full_frame.insert(full_frame.end(), frame.main_data_raw.begin(), frame.main_data_raw.end());
-    if (full_frame.size() < 100) return false;
-    const std::string s(full_frame.begin(), full_frame.begin() + std::min(static_cast<size_t>(100), full_frame.size()));
+static bool is_xing_frame(const Mp3Frame& frame, const std::vector<uint8_t>& file) {
+    std::string s;
+    s.append(reinterpret_cast<const char*>(frame.side_info_raw), frame.side_info_size);
+    s.append(reinterpret_cast<const char*>(file.data() + frame.main_data_offset), frame.main_data_avail);
+    if (s.size() < 100) return false;
+    s.resize(100);
     return (s.find("Xing") != std::string::npos || s.find("Info") != std::string::npos);
 }
 
@@ -151,7 +152,7 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
 
     std::vector<Mp3Frame> all_frames;
     while (auto opt_frame = reader.read_next_frame()) {
-        all_frames.push_back(*opt_frame);
+        all_frames.push_back(std::move(*opt_frame)); // a copy here duplicated every frame's payload
     }
 
     if (all_frames.empty()) {
@@ -160,7 +161,8 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
 
     bool has_xing = false;
     // removed unused xing_frame here
-    if (is_xing_frame(all_frames[0])) {
+    const std::vector<uint8_t>& file = reader.data();
+    if (is_xing_frame(all_frames[0], file)) {
         has_xing = true;
         // do not erase it! we must keep it to preserve the lame tag!
         // all_frames.erase(all_frames.begin());
@@ -171,27 +173,42 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
     DEBUG_LOG("Optimizing " << N << " audio frames...");
 
     std::vector<std::vector<uint8_t>> optimized_main_data(N);
-    std::vector<SideInfo> optimized_side_info(N);
+    // The new side info goes into the frame itself. A worker owns its frame, and a
+    // frame it gives up on keeps what it arrived with, which is what the verbatim
+    // path reads — so a parallel array of side info was a copy of something each
+    // frame already had, 200 bytes of it per frame.
     // plain uint8_t, not vector<bool>: worker threads write distinct indices concurrently,
     // and vector<bool>'s packed-bit storage would make that a genuine data race (RMW on a
     // shared word) even though each thread only touches its own logical element.
     std::vector<uint8_t> frame_was_optimized(N, 0);
     
     std::vector<uint8_t> global_res;
+    size_t total_main = 0;
+    for (const auto& frame : all_frames) total_main += frame.main_data_size;
+    global_res.reserve(total_main);
     std::vector<size_t> frame_main_starts(N);
     for (size_t i = 0; i < N; ++i) {
         frame_main_starts[i] = global_res.size();
-        global_res.insert(global_res.end(), all_frames[i].main_data_raw.begin(), all_frames[i].main_data_raw.end());
+        // One copy, out of the file and into the reservoir view. A payload the file
+        // does not hold in full is zero-filled to its declared length.
+        const auto& fr = all_frames[i];
+        global_res.insert(global_res.end(), file.data() + fr.main_data_offset,
+                          file.data() + fr.main_data_offset + fr.main_data_avail);
+        global_res.resize(frame_main_starts[i] + fr.main_data_size, 0x00);
     }
 
     std::atomic<size_t> current_frame{0};
     unsigned int active_threads = num_threads > 0 ? num_threads : std::max(1u, std::thread::hardware_concurrency());
 
     auto worker = [&]() {
+        // One pair of spectra per worker, reused for every granule: the coder fills
+        // them and zeroes only the tail it did not write.
+        Spectrum coeffs{}, vcoeffs{};
         while (true) {
             size_t i = current_frame.fetch_add(1);
             if (i >= N) break;
 
+            auto& frame = all_frames[i];
             if (has_xing && i == 0) {
                 // output frames are always written without CRC, so "Xing"/"Info" must be at
                 // output mdr[0..3].
@@ -200,17 +217,19 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
                 //   CRC file:    "Xi"/"In" is in si[-2:], "ng"/"fo" at mdr[0].
                 //                Prepend si[-2:] and copy standard Xing content (through LAME
                 //                extension if present), trimming trailing zeros to save space.
-                const auto& mdr = all_frames[i].main_data_raw;
+                const uint8_t* mdr = file.data() + all_frames[i].main_data_offset;
+                const size_t mdr_size = all_frames[i].main_data_avail;
                 if (!all_frames[i].header.has_crc) {
-                    optimized_main_data[i].assign(mdr.begin(), mdr.end());
+                    optimized_main_data[i].assign(mdr, mdr + mdr_size);
                 } else {
                     // CRC: recover "Xi"/"In" from the last 2 bytes of the original side_info
-                    const auto& sir = all_frames[i].side_info_raw;
-                    uint8_t b0 = (sir.size() >= 2) ? sir[sir.size() - 2] : 0x58;
-                    uint8_t b1 = (sir.size() >= 1) ? sir[sir.size() - 1] : 0x69;
+                    const uint8_t* sir = all_frames[i].side_info_raw;
+                    const size_t sir_size = all_frames[i].side_info_size;
+                    uint8_t b0 = (sir_size >= 2) ? sir[sir_size - 2] : 0x58;
+                    uint8_t b1 = (sir_size >= 1) ? sir[sir_size - 1] : 0x69;
                     // mdr[0..1]="ng"/"fo", content (flags, counts...) at mdr[2..]
                     size_t keep = 2;
-                    if (mdr.size() >= 6) {
+                    if (mdr_size >= 6) {
                         uint32_t fl = (static_cast<uint32_t>(mdr[2]) << 24) |
                                       (static_cast<uint32_t>(mdr[3]) << 16) |
                                       (static_cast<uint32_t>(mdr[4]) << 8) |
@@ -220,22 +239,18 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
                         if (fl & 2) keep += 4;   // byte count
                         if (fl & 4) keep += 100; // TOC
                         if (fl & 8) keep += 4;   // quality
-                        if (mdr.size() >= keep + 4 &&
+                        if (mdr_size >= keep + 4 &&
                             mdr[keep] == 'L' && mdr[keep+1] == 'A' &&
                             mdr[keep+2] == 'M' && mdr[keep+3] == 'E')
                             keep += 36; // LAME extension tag
                     }
-                    keep = std::min(keep, mdr.size());
+                    keep = std::min(keep, mdr_size);
                     optimized_main_data[i] = {b0, b1};
-                    optimized_main_data[i].insert(optimized_main_data[i].end(),
-                                                  mdr.begin(), mdr.begin() + static_cast<ptrdiff_t>(keep));
+                    optimized_main_data[i].insert(optimized_main_data[i].end(), mdr, mdr + keep);
                 }
-                SideInfo clean_si{};
-                optimized_side_info[i] = clean_si;
+                frame.side_info = SideInfo{};
                 continue;
             }
-        auto& frame = all_frames[i];
-
         int n_ch = (frame.header.channel_mode == ChannelMode::Mono) ? 1 : 2;
         int n_gr = (frame.header.version == MpegVersion::MPEG1) ? 2 : 1;
 
@@ -270,35 +285,58 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
                         slen2 = slen2_tab[g.scalefac_compress];
                     }
                     
-                    std::vector<int> scfs;
+                    // Scalefactors are re-emitted exactly as they arrived, so only
+                    // their total length matters. Copying the bits is what Go's
+                    // reference implementation does; reading each field into a
+                    // vector and writing it back cost an allocation per granule and
+                    // some seventy calls through the bit machinery.
+                    size_t sf_bits = 0;
                     if (g.window_switching_flag && g.block_type == 2) {
-                        if (g.mixed_block_flag) {
-                            // 8 long-window sfb (0-7) at slen1
-                            for (int k = 0; k < 8; ++k) scfs.push_back(data_reader.read_bits(slen1));
-                            // short sfb 3-5: 3 bands × 3 windows at slen1
-                            for (int k = 0; k < 9; ++k) scfs.push_back(data_reader.read_bits(slen1));
-                            // short sfb 6-11: 6 bands × 3 windows at slen2
-                            for (int k = 0; k < 18; ++k) scfs.push_back(data_reader.read_bits(slen2));
-                        } else {
-                            for (int k = 0; k < 18; ++k) scfs.push_back(data_reader.read_bits(slen1));
-                            for (int k = 18; k < 36; ++k) scfs.push_back(data_reader.read_bits(slen2));
-                        }
+                        sf_bits = g.mixed_block_flag
+                                  ? static_cast<size_t>(17 * slen1 + 18 * slen2)
+                                  : static_cast<size_t>(18 * slen1 + 18 * slen2);
                     } else {
-                        for (int k = 0; k < 6; ++k) {
-                            if (gr == 0 || !frame.side_info.scfsi[ch][0]) scfs.push_back(data_reader.read_bits(slen1));
-                            else scfs.push_back(0);
-                        }
-                        for (int k = 6; k < 11; ++k) {
-                            if (gr == 0 || !frame.side_info.scfsi[ch][1]) scfs.push_back(data_reader.read_bits(slen1));
-                            else scfs.push_back(0);
-                        }
-                        for (int k = 11; k < 16; ++k) {
-                            if (gr == 0 || !frame.side_info.scfsi[ch][2]) scfs.push_back(data_reader.read_bits(slen2));
-                            else scfs.push_back(0);
-                        }
-                        for (int k = 16; k < 21; ++k) {
-                            if (gr == 0 || !frame.side_info.scfsi[ch][3]) scfs.push_back(data_reader.read_bits(slen2));
-                            else scfs.push_back(0);
+                        // A band group whose scfsi bit is set in granule 1 reuses
+                        // granule 0's values and occupies no bits at all.
+                        if (gr == 0 || !frame.side_info.scfsi[ch][0]) sf_bits += static_cast<size_t>(6 * slen1);
+                        if (gr == 0 || !frame.side_info.scfsi[ch][1]) sf_bits += static_cast<size_t>(5 * slen1);
+                        if (gr == 0 || !frame.side_info.scfsi[ch][2]) sf_bits += static_cast<size_t>(5 * slen2);
+                        if (gr == 0 || !frame.side_info.scfsi[ch][3]) sf_bits += static_cast<size_t>(5 * slen2);
+                    }
+
+                    size_t out_start = writer.tell_bit();
+                    if (data_reader.tell_bit() + sf_bits <= data_reader.size_bits()) {
+                        writer.copy_from(data_reader, sf_bits);
+                    } else {
+                        // The span reaches past the end of the reservoir data, where
+                        // what a read returns depends on the width it was made at, so
+                        // the fields are read and written one at a time as before.
+                        int scfs[36] = {};
+                        if (g.window_switching_flag && g.block_type == 2) {
+                            if (g.mixed_block_flag) {
+                                for (int k = 0; k < 17; ++k) scfs[k] = static_cast<int>(data_reader.read_bits(slen1));
+                                for (int k = 17; k < 35; ++k) scfs[k] = static_cast<int>(data_reader.read_bits(slen2));
+                                for (int k = 0; k < 17; ++k) writer.write_bits(static_cast<uint32_t>(scfs[k]), slen1);
+                                for (int k = 17; k < 35; ++k) writer.write_bits(static_cast<uint32_t>(scfs[k]), slen2);
+                            } else {
+                                for (int k = 0; k < 18; ++k) scfs[k] = static_cast<int>(data_reader.read_bits(slen1));
+                                for (int k = 18; k < 36; ++k) scfs[k] = static_cast<int>(data_reader.read_bits(slen2));
+                                for (int k = 0; k < 18; ++k) writer.write_bits(static_cast<uint32_t>(scfs[k]), slen1);
+                                for (int k = 18; k < 36; ++k) writer.write_bits(static_cast<uint32_t>(scfs[k]), slen2);
+                            }
+                        } else {
+                            static constexpr int group_first[4] = {0, 6, 11, 16};
+                            static constexpr int group_last[4] = {6, 11, 16, 21};
+                            for (int grp = 0; grp < 4; ++grp) {
+                                const int slen = grp < 2 ? slen1 : slen2;
+                                if (gr != 0 && frame.side_info.scfsi[ch][grp]) continue;
+                                for (int k = group_first[grp]; k < group_last[grp]; ++k) {
+                                    scfs[k] = static_cast<int>(data_reader.read_bits(slen));
+                                }
+                                for (int k = group_first[grp]; k < group_last[grp]; ++k) {
+                                    writer.write_bits(static_cast<uint32_t>(scfs[k]), slen);
+                                }
+                            }
                         }
                     }
 
@@ -317,34 +355,8 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
                     };
                     int scalefac_bits = static_cast<int>(data_reader.tell_bit() - gc_orig_start);
                     int max_huff_bits = side_copy.gr[gr][ch].part2_3_length - scalefac_bits;
-                    auto coeffs = HuffmanOptimizer::decode_quantized_coefficients(orig_cfg, data_reader, frame.header.samplerate, max_huff_bits);
+                    HuffmanOptimizer::decode_quantized_coefficients(coeffs, orig_cfg, data_reader, frame.header.samplerate, max_huff_bits);
                     auto best_cfg = HuffmanOptimizer::find_best_config(coeffs, orig_cfg, frame.header.samplerate);
-                    
-                    // re-encode
-                    size_t out_start = writer.tell_bit();
-                    if (g.window_switching_flag && g.block_type == 2) {
-                        if (g.mixed_block_flag) {
-                            for (int k = 0; k < 8; ++k) writer.write_bits(scfs[k], slen1);
-                            for (int k = 8; k < 17; ++k) writer.write_bits(scfs[k], slen1);
-                            for (int k = 17; k < 35; ++k) writer.write_bits(scfs[k], slen2);
-                        } else {
-                            for (int k = 0; k < 18; ++k) writer.write_bits(scfs[k], slen1);
-                            for (int k = 18; k < 36; ++k) writer.write_bits(scfs[k], slen2);
-                        }
-                    } else {
-                        for (int k = 0; k < 6; ++k) {
-                            if (gr == 0 || !frame.side_info.scfsi[ch][0]) writer.write_bits(scfs[k], slen1);
-                        }
-                        for (int k = 6; k < 11; ++k) {
-                            if (gr == 0 || !frame.side_info.scfsi[ch][1]) writer.write_bits(scfs[k], slen1);
-                        }
-                        for (int k = 11; k < 16; ++k) {
-                            if (gr == 0 || !frame.side_info.scfsi[ch][2]) writer.write_bits(scfs[k], slen2);
-                        }
-                        for (int k = 16; k < 21; ++k) {
-                            if (gr == 0 || !frame.side_info.scfsi[ch][3]) writer.write_bits(scfs[k], slen2);
-                        }
-                    }
                     
                     size_t scalefac_end_bit = writer.tell_bit();
                     HuffmanOptimizer::encode_quantized_coefficients(coeffs, best_cfg, writer, frame.header.samplerate);
@@ -354,7 +366,7 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
                         int huff_bits = static_cast<int>(writer.tell_bit() - scalefac_end_bit);
                         BitstreamReader vrdr(writer.data());
                         vrdr.seek_bit(scalefac_end_bit);
-                        auto vcoeffs = HuffmanOptimizer::decode_quantized_coefficients(best_cfg, vrdr, frame.header.samplerate, huff_bits);
+                        HuffmanOptimizer::decode_quantized_coefficients(vcoeffs, best_cfg, vrdr, frame.header.samplerate, huff_bits);
                         for (int ci = 0; ci < 576; ++ci) {
                             if (vcoeffs[ci] != coeffs[ci]) {
                                 optimization_failed = true;
@@ -401,16 +413,23 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
         }
 
         optimized_main_data[i] = new_main;
-        optimized_side_info[i] = frame.side_info;
         }
     };
 
-    std::vector<std::thread> threads;
-    for (unsigned int t = 0; t < active_threads; ++t) {
-        threads.emplace_back(worker);
-    }
-    for (auto& thread : threads) {
-        thread.join();
+    // Spawning and joining threads costs more than the work when there is no
+    // Huffman search to do: without -z a frame's worth of work is a slice copy, and
+    // sixteen threads were being created to share it.
+    if (active_threads == 1 || !this->recompress_huffman) {
+        worker();
+    } else {
+        std::vector<std::thread> threads;
+        threads.reserve(active_threads);
+        for (unsigned int t = 0; t < active_threads; ++t) {
+            threads.emplace_back(worker);
+        }
+        for (auto& thread : threads) {
+            thread.join();
+        }
     }
     
     DEBUG_LOG("Huffman optimization completed. Running reservoir constraint solver...");
@@ -426,15 +445,25 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
     if (!out) {
         throw std::runtime_error("Could not open output file: " + output_file);
     }
-    
+
+    // The file is assembled in memory and written once at the end. Writing it
+    // frame by frame meant three stream writes per frame, and the Xing patch-up
+    // then had to seek back through them.
+    std::vector<uint8_t> out_bytes;
+    out_bytes.reserve(total_main + N * 40 + reader.get_start_junk().size() + reader.get_end_junk().size());
+    (void)total_main;
+    const auto append = [&out_bytes](const uint8_t* p, const size_t n) {
+        out_bytes.insert(out_bytes.end(), p, p + n);
+    };
+
     // write start junk (id3v2)
     const auto& start_junk = reader.get_start_junk();
     if (!start_junk.empty()) {
-        out.write(reinterpret_cast<const char*>(start_junk.data()), static_cast<std::streamsize>(start_junk.size()));
+        append(start_junk.data(), start_junk.size());
     }
     
     // track where the xing frame starts in the file
-    const size_t xing_header_file_pos = has_xing ? static_cast<size_t>(out.tellp()) : SIZE_MAX;
+    const size_t xing_header_file_pos = has_xing ? out_bytes.size() : SIZE_MAX;
     
     // backward pass constraint solver
     std::vector<int> required_carryover(N, 0);
@@ -449,14 +478,20 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
         current_req = std::max(0, space_needed - max_data_per_frame);
         required_carryover[i] = current_req;
     }
-    std::vector<uint8_t> global_main_data;
+    // The reservoir is described rather than built. Deciding a frame's size and its
+    // reservoir offset takes lengths only, so the first pass records the pieces —
+    // each frame's data, and the run of zeros left at the end where the reservoir
+    // cannot be read back — and the second pass reads them straight out of the
+    // frames' own buffers. Concatenating them first was a second copy of the whole
+    // audio and an allocation to hold it.
+    size_t reservoir_bytes = 0;
     int current_reservoir = 0; // free space in past payloads
     
     std::vector<ChosenBitrate> chosen_bitrates(N);
     
     // pass 1: build global_main_data and calculate main_data_begin
     for (size_t i = 0; i < N; ++i) {
-        auto& side = optimized_side_info[i];
+        auto& side = all_frames[i].side_info;
 
         int max_reservoir = (version == MpegVersion::MPEG1) ? 511 : 255;
 
@@ -488,7 +523,7 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
             optimized_main_data[0].resize(static_cast<size_t>(data_size), 0x00);
 
         side.main_data_begin = static_cast<uint16_t>(current_reservoir);
-        global_main_data.insert(global_main_data.end(), optimized_main_data[i].begin(), optimized_main_data[i].end());
+        reservoir_bytes += optimized_main_data[i].size();
         current_reservoir = projected_reservoir;
         chosen_bitrates[i] = bitrate_use;
 
@@ -496,10 +531,9 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
             current_reservoir = 0;
     }
     
-    if (current_reservoir > 0) {
-        std::vector<uint8_t> end_pad(static_cast<size_t>(current_reservoir), 0x00);
-        global_main_data.insert(global_main_data.end(), end_pad.begin(), end_pad.end());
-    }
+    // Whatever the last frame leaves unread is emitted as zeros.
+    const size_t reservoir_tail_zeros = static_cast<size_t>(std::max(0, current_reservoir));
+    reservoir_bytes += reservoir_tail_zeros;
     
     // pass 2: write physical file
     // find the last frame that actually contains non-zero data
@@ -515,17 +549,43 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
         N_out = static_cast<size_t>(i);
     }
     
-    size_t global_main_data_ptr = 0;
+    // A frame's slot is a window over that sequence and generally spans more than one
+    // piece — that is what a bit reservoir is for — so the read side is a cursor.
+    size_t cursor_frame = 0, cursor_offset = 0, cursor_read = 0;
+    const auto emit_reservoir = [&](size_t want) {
+        while (want > 0 && cursor_read < reservoir_bytes) {
+            if (cursor_frame < N) {
+                const auto& piece = optimized_main_data[cursor_frame];
+                if (cursor_offset >= piece.size()) {
+                    ++cursor_frame;
+                    cursor_offset = 0;
+                    continue;
+                }
+                const size_t take = std::min(want, piece.size() - cursor_offset);
+                append(piece.data() + cursor_offset, take);
+                cursor_offset += take;
+                cursor_read += take;
+                want -= take;
+                continue;
+            }
+            // Past the last frame's data: the tail the reservoir never gives back.
+            const size_t take = std::min(want, reservoir_bytes - cursor_read);
+            out_bytes.resize(out_bytes.size() + take, 0x00);
+            cursor_read += take;
+            want -= take;
+        }
+        return want; // whatever the reservoir could not supply
+    };
 
     // audio frame byte positions in the output file (index 0 = first audio frame, i.e. frame 1 if has_xing)
     std::vector<size_t> audio_frame_file_pos;
 
     for (size_t i = 0; i < N_out; ++i) {
         const auto& frame = all_frames[i];
-        const auto& side = optimized_side_info[i];
+        const auto& side = frame.side_info;
 
         if (has_xing && i > 0)
-            audio_frame_file_pos.push_back(static_cast<size_t>(out.tellp()));
+            audio_frame_file_pos.push_back(out_bytes.size());
 
         ChosenBitrate bitrate_use = chosen_bitrates[i];
 
@@ -551,41 +611,36 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
 
         std::vector<uint8_t> new_side;
         if (has_xing && i == 0) {
-            new_side.assign(frame.side_info_raw.size(), 0);
+            new_side.assign(frame.side_info_size, 0);
         } else if (frame_was_optimized[i]) {
             new_side = serialize_side_info(frame.header, side);
         } else {
-            new_side = patch_mdb(frame.side_info_raw, version, side.main_data_begin);
+            new_side = patch_mdb(frame.side_info_raw, frame.side_info_size, version, side.main_data_begin);
         }
 
-        out.write(reinterpret_cast<const char*>(head), 4);
-        out.write(reinterpret_cast<const char*>(new_side.data()), static_cast<std::streamsize>(new_side.size()));
+        append(head, 4);
+        append(new_side.data(), new_side.size());
 
-        int data_size = bitrate_use.data_size;
-        int avail = static_cast<int>(global_main_data.size() - global_main_data_ptr);
-        int write_len = std::min(data_size, avail);
-
-        if (write_len > 0) {
-            out.write(reinterpret_cast<const char*>(&global_main_data[global_main_data_ptr]), write_len);
-            global_main_data_ptr += static_cast<size_t>(write_len);
-        }
-
-        if (data_size > write_len) {
-            std::vector<uint8_t> pad(static_cast<size_t>(data_size - write_len), 0x00);
-            out.write(reinterpret_cast<const char*>(pad.data()), static_cast<std::streamsize>(pad.size()));
+        const int data_size = bitrate_use.data_size;
+        const size_t short_by = emit_reservoir(static_cast<size_t>(data_size));
+        if (short_by > 0) {
+            out_bytes.resize(out_bytes.size() + short_by, 0x00);
         }
     }
     
     // save position before end_junk to calculate total mp3 stream size
-    size_t mp3_end_pos = static_cast<size_t>(out.tellp());
+    size_t mp3_end_pos = out_bytes.size();
     
     // write end junk (id3v1)
     const auto& end_junk = reader.get_end_junk();
     if (!end_junk.empty()) {
-        out.write(reinterpret_cast<const char*>(end_junk.data()), static_cast<std::streamsize>(end_junk.size()));
+        append(end_junk.data(), end_junk.size());
     }
     
     // patch xing header fields (bytes count + TOC) if present
+    const auto patch = [&out_bytes](const size_t at, const uint8_t* p, const size_t n) {
+        if (at + n <= out_bytes.size()) std::memcpy(out_bytes.data() + at, p, n);
+    };
     if (has_xing) {
         // optimized_main_data[0] always has "Xing"/"Info" at bytes 0-3, flags at 4-7
         // (regardless of whether the source was CRC or no-CRC)
@@ -608,13 +663,12 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
 
             if (flags & 1) field_offset += 4; // frames field: skip it
             if (flags & 2) {
-                out.seekp(static_cast<std::streamoff>(main_data_base + field_offset), std::ios::beg);
                 uint8_t buf[4];
                 buf[0] = (total_mp3_bytes >> 24) & 0xFF;
                 buf[1] = (total_mp3_bytes >> 16) & 0xFF;
                 buf[2] = (total_mp3_bytes >> 8) & 0xFF;
                 buf[3] = (total_mp3_bytes >> 0) & 0xFF;
-                out.write(reinterpret_cast<const char*>(buf), 4);
+                patch(main_data_base + field_offset, buf, 4);
                 field_offset += 4;
             }
 
@@ -630,10 +684,14 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
                     int v = static_cast<int>(256.0 * static_cast<double>(pos) / static_cast<double>(total_mp3_bytes));
                     toc[k] = static_cast<uint8_t>(std::min(v, 255));
                 }
-                out.seekp(static_cast<std::streamoff>(main_data_base + field_offset), std::ios::beg);
-                out.write(reinterpret_cast<const char*>(toc), 100);
+                patch(main_data_base + field_offset, toc, 100);
             }
         }
+    }
+
+    out.write(reinterpret_cast<const char*>(out_bytes.data()), static_cast<std::streamsize>(out_bytes.size()));
+    if (!out) {
+        throw std::runtime_error("Could not write output file: " + output_file);
     }
 }
 

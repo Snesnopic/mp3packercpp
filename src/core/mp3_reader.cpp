@@ -1,33 +1,63 @@
 #include "include/mp3_reader.hpp"
 #include "include/logger.hpp"
 #include "include/bitstream.hpp"
+#include <algorithm>
+#include <cstring>
+#include <fstream>
 #include <iostream>
 
 namespace mp3packer {
 
-Mp3Reader::Mp3Reader(const std::string& filename) : file_(filename, std::ios::binary), file_size_(0), start_junk_(), end_junk_() {
-    if (!file_) {
+Mp3Reader::Mp3Reader(const std::string& filename) : start_junk_(), end_junk_() {
+    std::ifstream file(filename, std::ios::binary);
+    if (!file) {
         throw std::runtime_error("Could not open file: " + filename);
     }
-    file_.seekg(0, std::ios::end);
-    file_size_ = static_cast<size_t>(file_.tellg());
-    file_.seekg(0, std::ios::beg);
+    file.seekg(0, std::ios::end);
+    const auto size = file.tellg();
+    file.seekg(0, std::ios::beg);
+    if (size > 0) {
+        data_.resize(static_cast<size_t>(size));
+        file.read(reinterpret_cast<char*>(data_.data()), size);
+        data_.resize(static_cast<size_t>(file.gcount()));
+    }
     skip_id3v2_tag();
 }
 
-Mp3Reader::~Mp3Reader() {
-    if (file_.is_open()) {
-        file_.close();
+Mp3Reader::~Mp3Reader() = default;
+
+bool Mp3Reader::skip(const size_t n) {
+    if (exhausted_) return false;
+    if (data_.size() - pos_ < n) {
+        pos_ = data_.size();
+        exhausted_ = true;
+        return false;
     }
+    pos_ += n;
+    return true;
+}
+
+bool Mp3Reader::take(uint8_t* dst, const size_t n) {
+    if (exhausted_) {
+        std::memset(dst, 0, n);
+        return false;
+    }
+    const size_t avail = data_.size() - pos_;
+    if (avail < n) {
+        std::memcpy(dst, data_.data() + pos_, avail);
+        std::memset(dst + avail, 0, n - avail);
+        pos_ = data_.size();
+        exhausted_ = true;
+        return false;
+    }
+    std::memcpy(dst, data_.data() + pos_, n);
+    pos_ += n;
+    return true;
 }
 
 void Mp3Reader::skip_id3v2_tag() {
-    uint8_t header[10];
-    if (!file_.read(reinterpret_cast<char*>(header), 10)) {
-        file_.clear();
-        file_.seekg(0, std::ios::beg);
-        return;
-    }
+    if (data_.size() < 10) return;
+    const uint8_t* header = data_.data();
 
     if (header[0] == 'I' && header[1] == 'D' && header[2] == '3') {
         const uint32_t size = (static_cast<uint32_t>(header[6] & 0x7F) << 21) |
@@ -41,11 +71,10 @@ void Mp3Reader::skip_id3v2_tag() {
         }
 
         DEBUG_LOG("Found ID3v2 tag of size " << total_tag_size << " bytes. Storing in start_junk...");
-        file_.seekg(0, std::ios::beg);
         start_junk_.resize(total_tag_size);
-        file_.read(reinterpret_cast<char*>(start_junk_.data()), total_tag_size);
-    } else {
-        file_.seekg(0, std::ios::beg);
+        // A tag claiming more than the file holds leaves the rest zero and the data
+        // exhausted, so no frames are found — as before.
+        take(start_junk_.data(), total_tag_size);
     }
 }
 
@@ -120,7 +149,7 @@ uint16_t Mp3Reader::calculate_frame_size(const Mp3Header& header) {
 
 std::optional<Mp3Frame> Mp3Reader::read_next_frame() {
     uint8_t buf[4];
-    while (file_.read(reinterpret_cast<char*>(buf), 4)) {
+    while (take(buf, 4)) {
         uint32_t header_bits = (static_cast<uint32_t>(buf[0]) << 24) |
                                (static_cast<uint32_t>(buf[1]) << 16) |
                                (static_cast<uint32_t>(buf[2]) << 8)  |
@@ -128,18 +157,17 @@ std::optional<Mp3Frame> Mp3Reader::read_next_frame() {
         auto header = parse_header(header_bits);
         if (!header) {
             // invalid header: assume start of trailing junk (e.g. ID3v1 tag)
-            file_.seekg(-4, std::ios::cur);
-            size_t current_pos = static_cast<size_t>(file_.tellg());
-            if (current_pos < file_size_) {
-                size_t remaining = file_size_ - current_pos;
-                end_junk_.resize(remaining);
-                file_.read(reinterpret_cast<char*>(end_junk_.data()), static_cast<std::streamsize>(remaining));
+            pos_ -= 4;
+            if (pos_ < data_.size()) {
+                const size_t remaining = data_.size() - pos_;
+                end_junk_.assign(data_.begin() + static_cast<ptrdiff_t>(pos_), data_.end());
+                pos_ = data_.size();
                 DEBUG_LOG("Found " << remaining << " bytes of junk at end of stream (e.g. ID3v1). Stored in end_junk.");
             }
             return std::nullopt;
         }
 
-        DEBUG_LOG("Successfully parsed valid MP3 header: " << std::hex << header_bits << std::dec << " at stream pos " << (static_cast<size_t>(file_.tellg()) - 4));
+        DEBUG_LOG("Successfully parsed valid MP3 header: " << std::hex << header_bits << std::dec << " at stream pos " << (pos_ - 4));
         Mp3Frame frame;
         header->bitrate.frame_size = calculate_frame_size(*header);
         frame.header = *header;
@@ -148,15 +176,15 @@ std::optional<Mp3Frame> Mp3Reader::read_next_frame() {
                                    ? (header->channel_mode == ChannelMode::Mono ? 17 : 32)
                                    : (header->channel_mode == ChannelMode::Mono ?  9 : 17);
 
-        uint8_t crc_bytes[2] = {0, 0};
         if (header->has_crc) {
-            file_.read(reinterpret_cast<char*>(crc_bytes), 2);
+            uint8_t crc_bytes[2] = {0, 0};
+            take(crc_bytes, 2);
         }
 
-        frame.side_info_raw.resize(static_cast<size_t>(side_info_size));
-        file_.read(reinterpret_cast<char*>(frame.side_info_raw.data()), side_info_size);
+        frame.side_info_size = static_cast<uint8_t>(side_info_size);
+        take(frame.side_info_raw, static_cast<size_t>(side_info_size));
 
-        BitstreamReader side_reader(frame.side_info_raw);
+        BitstreamReader side_reader(frame.side_info_raw, static_cast<size_t>(side_info_size));
         SideInfo& si = frame.side_info;
         const int num_channels = (header->channel_mode == ChannelMode::Mono) ? 1 : 2;
         const int num_granules = (header->version == MpegVersion::MPEG1) ? 2 : 1;
@@ -227,17 +255,14 @@ std::optional<Mp3Frame> Mp3Reader::read_next_frame() {
         const int crc_size      = header->has_crc ? 2 : 0;
         const int main_data_size = static_cast<int>(header->bitrate.frame_size) - 4 - crc_size - side_info_size;
 
-        frame.main_data_raw.resize(static_cast<size_t>(main_data_size));
-        file_.read(reinterpret_cast<char*>(frame.main_data_raw.data()), main_data_size);
-
-        frame.raw_bytes.reserve(static_cast<size_t>(4 + crc_size + side_info_size + main_data_size));
-        frame.raw_bytes.insert(frame.raw_bytes.end(), buf, buf + 4);
-        if (header->has_crc) {
-            frame.raw_bytes.push_back(crc_bytes[0]);
-            frame.raw_bytes.push_back(crc_bytes[1]);
+        // The payload stays where it is; a short one at the end of a truncated file
+        // is zero-filled by whoever reads it, as a short read used to leave it.
+        frame.main_data_offset = pos_;
+        frame.main_data_size = static_cast<size_t>(main_data_size);
+        frame.main_data_avail = exhausted_ ? 0 : std::min(frame.main_data_size, data_.size() - pos_);
+        if (!skip(frame.main_data_size)) {
+            // ran off the end: later reads fail as before
         }
-        frame.raw_bytes.insert(frame.raw_bytes.end(), frame.side_info_raw.begin(), frame.side_info_raw.end());
-        frame.raw_bytes.insert(frame.raw_bytes.end(), frame.main_data_raw.begin(), frame.main_data_raw.end());
 
         return frame;
     }
