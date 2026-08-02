@@ -4,6 +4,7 @@
 #include "include/mp3_reader.hpp"
 #include "include/huffman.hpp"
 #include "include/bitstream.hpp"
+#include <array>
 #include <iostream>
 #include <algorithm>
 #include <vector>
@@ -14,6 +15,81 @@
 #include <thread>
 
 namespace mp3packer {
+
+// MPEG-2/2.5 LSF scalefactor band group counts, indexed by [block category][slen
+// set][group] (ISO 13818-3 table B.1). Block category is 0 for long blocks, 1 for
+// pure short blocks and 2 for mixed blocks.
+static constexpr int lsf_band_counts[3][6][4] = {
+    {{6, 5, 5, 5}, {6, 5, 7, 3}, {11, 10, 0, 0}, {7, 7, 7, 0}, {6, 6, 6, 3}, {8, 8, 5, 0}},
+    {{9, 9, 9, 9}, {9, 9, 12, 6}, {18, 18, 0, 0}, {12, 12, 12, 0}, {12, 9, 9, 6}, {15, 12, 9, 0}},
+    {{6, 9, 9, 9}, {6, 9, 12, 6}, {15, 18, 0, 0}, {6, 15, 12, 0}, {6, 12, 9, 6}, {6, 15, 9, 0}},
+};
+
+// The LSF scalefac_compress field is a compound index selecting both a group of
+// band counts and the bit length used within each group (ISO 13818-3 2.4.3.2).
+// Each entry packs four 3-bit lengths in bits 0..11 and the band-count set in
+// bits 12..14.
+struct LsfSlenTables {
+    std::array<uint32_t, 512> normal{};
+    std::array<uint32_t, 256> intensity{};
+};
+
+static const LsfSlenTables& lsf_slen_tables() {
+    static const LsfSlenTables tables = [] {
+        LsfSlenTables t;
+        for (int i = 0; i < 5; ++i)
+            for (int j = 0; j < 5; ++j)
+                for (int k = 0; k < 4; ++k)
+                    for (int l = 0; l < 4; ++l)
+                        t.normal[static_cast<size_t>(l + k * 4 + j * 16 + i * 80)] =
+                            static_cast<uint32_t>(i | j << 3 | k << 6 | l << 9);
+        for (int i = 0; i < 5; ++i)
+            for (int j = 0; j < 5; ++j)
+                for (int k = 0; k < 4; ++k)
+                    t.normal[static_cast<size_t>(k + j * 4 + i * 20 + 400)] =
+                        static_cast<uint32_t>(i | j << 3 | k << 6 | 1 << 12);
+        for (int i = 0; i < 5; ++i)
+            for (int j = 0; j < 6; ++j)
+                for (int k = 0; k < 6; ++k)
+                    t.intensity[static_cast<size_t>(k + j * 6 + i * 36)] =
+                        static_cast<uint32_t>(i | j << 3 | k << 6 | 2 << 12);
+        for (int i = 0; i < 4; ++i)
+            for (int j = 0; j < 4; ++j)
+                for (int k = 0; k < 4; ++k)
+                    t.intensity[static_cast<size_t>(k + j * 4 + i * 16 + 180)] =
+                        static_cast<uint32_t>(i | j << 3 | k << 6 | 3 << 12);
+        for (int i = 0; i < 4; ++i)
+            for (int j = 0; j < 3; ++j) {
+                t.intensity[static_cast<size_t>(j + i * 3 + 244)] = static_cast<uint32_t>(i | j << 3 | 4 << 12);
+                t.normal[static_cast<size_t>(j + i * 3 + 500)] = static_cast<uint32_t>(i | j << 3 | 1 << 12 | 5 << 15);
+            }
+        return t;
+    }();
+    return tables;
+}
+
+// part2_length for an LSF granule: how many bits of scalefactors precede the
+// Huffman-coded spectrum. Never decodes the values themselves — like MPEG1 they
+// are copied through bit for bit.
+static size_t lsf_scalefactor_bits(const GrChInfo& g, const bool intensity_stereo_ch1) {
+    const auto& tables = lsf_slen_tables();
+    uint32_t slen = intensity_stereo_ch1
+        ? tables.intensity[static_cast<size_t>(g.scalefac_compress >> 1) & 0xFF]
+        : tables.normal[static_cast<size_t>(g.scalefac_compress) & 0x1FF];
+
+    int category = 0;
+    if (g.window_switching_flag && g.block_type == 2) {
+        category = g.mixed_block_flag ? 2 : 1;
+    }
+    const int* counts = lsf_band_counts[category][(slen >> 12) & 7];
+
+    size_t bits = 0;
+    for (int i = 0; i < 4; ++i) {
+        bits += static_cast<size_t>(counts[i]) * (slen & 7);
+        slen >>= 3;
+    }
+    return bits;
+}
 
 Packer::Packer() = default;
 
@@ -271,11 +347,7 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
         bool optimization_failed = false;
         
         try {
-            if (!this->recompress_huffman || frame.header.version != MpegVersion::MPEG1) {
-                // MPEG2/2.5 LSF scalefactor compression uses a different band-group
-                // layout and slen decomposition (ISO 13818-3 Annex B) than MPEG1's fixed
-                // 6/5/5/5 table with granule-1 scfsi copying; not implemented yet, so
-                // fall back to a verbatim copy rather than risk desyncing the bitstream.
+            if (!this->recompress_huffman) {
                 optimization_failed = true; // fallback to raw copy of original data
             } else {
                 for (int gr = 0; gr < n_gr; ++gr) {
@@ -285,20 +357,25 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
 
                     // read scalefactors
                     int slen1 = 0, slen2 = 0;
-                    if (frame.header.version == MpegVersion::MPEG1) {
+                    const bool is_mpeg1 = frame.header.version == MpegVersion::MPEG1;
+                    if (is_mpeg1) {
                         static constexpr int slen1_tab[] = {0, 0, 0, 0, 3, 1, 1, 1, 2, 2, 2, 3, 3, 3, 4, 4};
                         static constexpr int slen2_tab[] = {0, 1, 2, 3, 0, 1, 2, 3, 1, 2, 3, 1, 2, 3, 2, 3};
                         slen1 = slen1_tab[g.scalefac_compress];
                         slen2 = slen2_tab[g.scalefac_compress];
                     }
-                    
+
                     // Scalefactors are re-emitted exactly as they arrived, so only
                     // their total length matters. Copying the bits is what Go's
                     // reference implementation does; reading each field into a
                     // vector and writing it back cost an allocation per granule and
                     // some seventy calls through the bit machinery.
                     size_t sf_bits = 0;
-                    if (g.window_switching_flag && g.block_type == 2) {
+                    if (!is_mpeg1) {
+                        // LSF (MPEG-2/2.5): different band-group layout and slen
+                        // decomposition (ISO 13818-3 Annex B).
+                        sf_bits = lsf_scalefactor_bits(g, frame.header.is_stereo && ch == 1);
+                    } else if (g.window_switching_flag && g.block_type == 2) {
                         sf_bits = g.mixed_block_flag
                                   ? static_cast<size_t>(17 * slen1 + 18 * slen2)
                                   : static_cast<size_t>(18 * slen1 + 18 * slen2);
@@ -314,6 +391,11 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
                     size_t out_start = writer.tell_bit();
                     if (data_reader.tell_bit() + sf_bits <= data_reader.size_bits()) {
                         writer.copy_from(data_reader, sf_bits);
+                    } else if (!is_mpeg1) {
+                        // Rare edge (reservoir truncated mid-scalefactors); the MPEG1
+                        // field-by-field path below does not apply to LSF's band
+                        // layout, so fall back to a verbatim copy of the frame.
+                        throw std::runtime_error("LSF scalefactor span exceeds reservoir data");
                     } else {
                         // The span reaches past the end of the reservoir data, where
                         // what a read returns depends on the width it was made at, so
