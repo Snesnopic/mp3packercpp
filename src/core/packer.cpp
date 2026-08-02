@@ -536,19 +536,16 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
     reservoir_bytes += reservoir_tail_zeros;
     
     // pass 2: write physical file
-    // find the last frame that actually contains non-zero data
-    size_t N_out = N;
-    for (int i = static_cast<int>(N) - 1; i >= 0; --i) {
-        if (chosen_bitrates[i].index == 14) {
-            break;
-        }
-        if (!optimized_main_data[i].empty()) {
-            break;
-        }
-        if (i == 0) break;
-        N_out = static_cast<size_t>(i);
-    }
-    
+    //
+    // Every entry in all_frames is a frame the source actually declared, each
+    // worth a fixed number of samples; omitting one shortens the decoded audio
+    // by exactly that much regardless of where in the file it falls. A frame
+    // whose own optimized_main_data is empty isn't redundant — genuinely quiet
+    // material can compress a granule down to a reservoir back-reference with
+    // nothing new of its own — so every frame is written, unconditionally.
+    const size_t N_out = N;
+
+
     // A frame's slot is a window over that sequence and generally spans more than one
     // piece — that is what a bit reservoir is for — so the read side is a cursor.
     size_t cursor_frame = 0, cursor_offset = 0, cursor_read = 0;
