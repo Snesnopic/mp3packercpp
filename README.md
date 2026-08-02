@@ -19,6 +19,6 @@ cmake --build . --config Release
 
 ## Original project and pre-built binaries
 
-The original mp3packer was written in OCaml. The source code for the original version can be found [here](https://github.com/Snesnopic/mp3packer/tree/main).
+The original mp3packer was written in OCaml. The source code for the original version can be found [here](https://github.com/Snesnopic/mp3packer/tree/main), with a good effort being made to preserve most versions.
 
-Additionally, an effort to modernize the original OCaml codebase for OCaml 5.3.0 and the Dune build system is available in [this branch](https://github.com/Snesnopic/mp3packer/tree/fix/arm64-porting). Pre-built binaries of the original OCaml version can also be easily downloaded from that repository branch.
+Additionally, an effort to modernize the original OCaml codebase for OCaml 5.3.0 and the Dune build system is available in [this branch](https://github.com/Snesnopic/mp3packer/tree/dune-port). Pre-built binaries of the original OCaml version can also be easily downloaded from that repository branch. There is also a [Golang port](https://github.com/W-Floyd/go-mp3packer).
