@@ -37,7 +37,14 @@ static std::vector<uint8_t> serialize_side_info(const Mp3Header& h, const SideIn
     const int n_gr = (h.version == MpegVersion::MPEG1) ? 2 : 1;
 
     writer.write_bits(si.main_data_begin, h.version == MpegVersion::MPEG1 ? 9 : 8);
-    writer.write_bits(si.private_bits, h.channel_mode == ChannelMode::Mono ? 5 : 3);
+    // private_bits is narrower for LSF, and must mirror Mp3Reader exactly: writing
+    // MPEG1's widths for an MPEG2/2.5 frame overruns the block by 4 bits (mono) or
+    // 1 (stereo), which the trailing byte-align then rounds up into a whole extra
+    // byte — a frame one byte longer than its own header declares.
+    const int private_bit_count = (h.version == MpegVersion::MPEG1)
+                                  ? (h.channel_mode == ChannelMode::Mono ? 5 : 3)
+                                  : (h.channel_mode == ChannelMode::Mono ? 1 : 2);
+    writer.write_bits(si.private_bits, private_bit_count);
     
     if (h.version == MpegVersion::MPEG1) {
         for (int ch = 0; ch < n_ch; ++ch)
