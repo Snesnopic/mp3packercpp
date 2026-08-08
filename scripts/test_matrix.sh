@@ -125,6 +125,45 @@ for signal in sine clicks noise; do
     done
 done
 
+# Second corpus: encoded through ffmpeg's libmp3lame rather than the lame CLI, and
+# without pinning the stereo mode.
+#
+# Everything above passes lame an explicit -m, which fixes one stereo mode for the
+# whole file. Left to itself the encoder decides per frame, so a file can open in
+# plain L/R and switch to joint/MS a frame or two in. That is the only way to get a
+# file whose frames do not all share frame 0's mode — and it is exactly what the
+# packer got wrong (writing frame 0's mode into every output header, leaving mid/side
+# data labelled as L/R: structurally valid, audio destroyed).
+#
+# Whether the encoder switches at all depends on how correlated the channels are, so
+# the content matters as much as the settings: identical channels and noise push it
+# into MS, two unrelated tones keep it in plain stereo.
+echo "== ffmpeg-encoded corpus (per-frame stereo mode decisions) =="
+
+ff_content() { # ff_content NAME SAMPLERATE -> ffmpeg input args
+    local name="$1" sr="$2"
+    case "$name" in
+        # both channels the same: encoder goes to MS, side channel vanishes
+        dup-sine)   echo "-f lavfi -i sine=frequency=440:duration=5:sample_rate=$sr -ac 2" ;;
+        # unrelated tones per channel: encoder tends to stay in plain L/R
+        lr-sines)   echo "-f lavfi -i sine=frequency=440:duration=5:sample_rate=$sr -f lavfi -i sine=frequency=660:duration=5:sample_rate=$sr -filter_complex [0][1]amerge=inputs=2[a] -map [a]" ;;
+        pink-noise) echo "-f lavfi -i anoisesrc=d=5:c=pink:r=$sr:a=0.5:seed=1 -ac 2" ;;
+        mono-noise) echo "-f lavfi -i anoisesrc=d=5:c=white:r=$sr:a=0.5:seed=2 -ac 1" ;;
+    esac
+}
+
+for content in dup-sine lr-sines pink-noise mono-noise; do
+    for samplerate in 48000 44100 22050; do
+        for rate_opt in "-b:a 192k" "-b:a 320k" "-q:a 2"; do
+            mp3="$WORKDIR/ff_${content}_${samplerate}_$(echo "$rate_opt" | tr -d ' :').mp3"
+            # shellcheck disable=SC2046,SC2086
+            ffmpeg -y -v error $(ff_content "$content" "$samplerate") \
+                   -c:a libmp3lame $rate_opt "$mp3" 2>/dev/null || continue
+            check_case "ffmpeg/${content}/${samplerate}Hz/${rate_opt}" "$mp3"
+        done
+    done
+done
+
 echo ""
 echo "== summary: $((TOTAL - FAIL))/$TOTAL passed =="
 if [ "$FAIL" -gt 0 ]; then
