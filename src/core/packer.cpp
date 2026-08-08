@@ -682,9 +682,17 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
         h |= (version_bits << 19);
         h |= (1 << 17) | (1 << 16);
         h |= (static_cast<uint32_t>(bitrate_use.index) << 12) | (get_samplerate_index(version, samplerate) << 10);
-        h |= static_cast<uint32_t>(bitrate_use.padding ? 1 : 0) << 9 | (static_cast<uint32_t>(channel_mode) << 6);
+        // Mode and mode_extension come from this frame, not from frame 0: an encoder
+        // may switch a stereo pair between plain L/R and joint stereo per frame, and
+        // the main_data we are copying through is coded accordingly. Writing frame 0's
+        // mode for the whole file silently mislabels every frame that differs — a
+        // joint/MS frame emitted as plain stereo leaves the decoder with mid/side
+        // values it never un-rotates, which destroys the audio while staying
+        // structurally valid.
+        h |= static_cast<uint32_t>(bitrate_use.padding ? 1 : 0) << 9
+           | (static_cast<uint32_t>(frame.header.channel_mode) << 6);
         uint32_t mode_ext = 0;
-        if (channel_mode == ChannelMode::JointStereo) {
+        if (frame.header.channel_mode == ChannelMode::JointStereo) {
             mode_ext = (frame.header.ms_stereo ? 2 : 0) | (frame.header.is_stereo ? 1 : 0);
         }
         h |= mode_ext << 4;
