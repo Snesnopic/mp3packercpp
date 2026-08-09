@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.15...4.3)
 
-project(mp3packercpp VERSION 1.2.0 LANGUAGES CXX)
+project(mp3packercpp VERSION 1.2.1 LANGUAGES CXX)
 
 if(MSVC)
     # force static msvc runtime linkage (/mt for release, /mtd for debug)
