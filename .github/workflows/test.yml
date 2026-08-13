@@ -24,12 +24,23 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y lame ffmpeg mp3val
 
+    - name: Check ffmpeg has libmp3lame
+      run: |
+        # scripts/test_matrix.sh encodes part of its corpus through ffmpeg's
+        # libmp3lame (the only way to get per-frame stereo mode decisions).
+        # Fail loudly here rather than let those cases go missing.
+        ffmpeg -hide_banner -encoders 2>/dev/null | grep -q libmp3lame
+
     - name: Build mp3packercpp
       run: |
-        mkdir -p build
-        cd build
-        cmake ..
-        cmake --build . -j $(nproc)
+        cmake -B build -DCMAKE_BUILD_TYPE=Release
+        cmake --build build -j $(nproc)
+
+    - name: Unit tests
+      run: ctest --test-dir build --output-on-failure
+
+    - name: Lossless validation matrix
+      run: bash scripts/test_matrix.sh build/bin/mp3packercpp
 
     - name: Generate Test Audio
       run: |

@@ -156,10 +156,19 @@ for content in dup-sine lr-sines pink-noise mono-noise; do
     for samplerate in 48000 44100 22050; do
         for rate_opt in "-b:a 192k" "-b:a 320k" "-q:a 2"; do
             mp3="$WORKDIR/ff_${content}_${samplerate}_$(echo "$rate_opt" | tr -d ' :').mp3"
+            label="ffmpeg/${content}/${samplerate}Hz/${rate_opt}"
+            # A silent skip here would hide this whole corpus — the one that covers
+            # per-frame stereo mode switching — so an encode that fails is reported
+            # as a failure, not passed over. Needs an ffmpeg built with libmp3lame.
             # shellcheck disable=SC2046,SC2086
-            ffmpeg -y -v error $(ff_content "$content" "$samplerate") \
-                   -c:a libmp3lame $rate_opt "$mp3" 2>/dev/null || continue
-            check_case "ffmpeg/${content}/${samplerate}Hz/${rate_opt}" "$mp3"
+            if ! ffmpeg -y -v error $(ff_content "$content" "$samplerate") \
+                        -c:a libmp3lame $rate_opt "$mp3" 2>/dev/null; then
+                TOTAL=$((TOTAL + 1)); FAIL=$((FAIL + 1))
+                FAILURES+=("$label :: ffmpeg/libmp3lame could not encode this case")
+                echo "FAIL  $label  (ffmpeg/libmp3lame encode failed)"
+                continue
+            fi
+            check_case "$label" "$mp3"
         done
     done
 done
