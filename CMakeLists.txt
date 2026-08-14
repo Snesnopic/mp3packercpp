@@ -33,6 +33,19 @@ target_link_libraries(mp3packercpp PRIVATE mp3packercpp_core)
 target_include_directories(mp3packercpp PRIVATE src/cli)
 target_compile_definitions(mp3packercpp PRIVATE MP3PACKERCPP_VERSION="${PROJECT_VERSION}")
 
+# --- Link-time optimization ---
+# Release only, and only where the toolchain actually supports it: this ships static
+# binaries for eleven platforms and a configure-time check is cheaper than finding out
+# from a broken build. Worth about 1.5% on a recompressing run — small, but free.
+include(CheckIPOSupported)
+check_ipo_supported(RESULT MP3PACKERCPP_IPO_SUPPORTED OUTPUT MP3PACKERCPP_IPO_ERROR)
+if(MP3PACKERCPP_IPO_SUPPORTED)
+    set_property(TARGET mp3packercpp_core PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
+    set_property(TARGET mp3packercpp      PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
+else()
+    message(STATUS "LTO not available, building without it: ${MP3PACKERCPP_IPO_ERROR}")
+endif()
+
 # --- Tests ---
 option(MP3PACKERCPP_BUILD_TESTS "Build the test programs" ${PROJECT_IS_TOP_LEVEL})
 if(MP3PACKERCPP_BUILD_TESTS)
