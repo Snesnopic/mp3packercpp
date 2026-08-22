@@ -4,14 +4,21 @@
 #include "../core/include/logger.hpp"
 
 void printUsage() {
-    std::cout << "Usage: mp3packercpp [-z] [-t threads] [-v] <input.mp3> <output.mp3>\n";
+    std::cout << "Usage: mp3packercpp [-z] [-t threads] [--cbr] [-b kbps] [--ib] [-v] <input.mp3> [output.mp3]\n";
     std::cout << "  -z         : Recompress frames to find optimal Huffman settings\n";
     std::cout << "  -t threads : Number of threads to use (default: auto)\n";
+    std::cout << "  --cbr      : Constant-bitrate output at the lowest bitrate that fits\n";
+    std::cout << "  -b kbps    : Floor for the constant bitrate, rounded up to a valid one\n";
+    std::cout << "               (implies --cbr; with --cbr the higher of the two wins)\n";
+    std::cout << "  --ib       : Print the lowest constant bitrate this file fits in, and exit\n";
     std::cout << "  -v         : Verbose output (default: silent on success)\n";
 }
 int main(int argc, const char* argv[]) {
     bool recompress_huffman = false;
     bool verbose = false;
+    bool constant_bitrate = false;
+    bool report_bitrate = false;
+    int min_bitrate = 0;
     int num_threads = 0;
     std::filesystem::path input;
     std::filesystem::path output;
@@ -28,14 +35,26 @@ int main(int argc, const char* argv[]) {
             recompress_huffman = true;
         } else if (arg == "-v") {
             verbose = true;
-        } else if (arg == "-t") {
-            if (i + 1 < argc) {
-                num_threads = std::stoi(argv[++i]);
-            } else {
-                std::cerr << "Missing value for -t\n";
+        } else if (arg == "--cbr") {
+            constant_bitrate = true;
+        } else if (arg == "--ib") {
+            report_bitrate = true;
+            constant_bitrate = true;
+        } else if (arg == "-t" || arg == "-b") {
+            if (i + 1 >= argc) {
+                std::cerr << "Missing value for " << arg << "\n";
                 printUsage();
                 return EXIT_FAILURE;
             }
+            const std::string value = argv[++i];
+            int parsed = 0;
+            try {
+                parsed = std::stoi(value);
+            } catch (const std::exception&) {
+                std::cerr << "Not a number: " << arg << " " << value << "\n";
+                return EXIT_FAILURE;
+            }
+            if (arg == "-t") num_threads = parsed; else min_bitrate = parsed;
         } else if (input.empty()) {
             input = arg;
         } else if (output.empty()) {
@@ -47,7 +66,8 @@ int main(int argc, const char* argv[]) {
         }
     }
 
-    if (input.empty() || output.empty()) {
+    // --ib answers a question about the input, so it takes no output file
+    if (input.empty() || (output.empty() && !report_bitrate)) {
         printUsage();
         return EXIT_FAILURE;
     }
@@ -58,9 +78,19 @@ int main(int argc, const char* argv[]) {
         mp3packer::Packer packer;
         packer.recompress_huffman = recompress_huffman;
         packer.num_threads = num_threads > 0 ? num_threads : 0;
-        packer.process(input.string(), output.string());
-        if (verbose) {
-            std::cout << "Successfully packed " << input.string() << " into " << output.string() << "\n";
+        packer.constant_bitrate = constant_bitrate;
+        packer.min_bitrate_kbps = min_bitrate;
+        packer.report_bitrate_only = report_bitrate;
+
+        int chosen_bitrate = 0;
+        packer.process(input.string(), output.string(), &chosen_bitrate);
+
+        if (report_bitrate) {
+            std::cout << chosen_bitrate << "\n";
+        } else if (verbose) {
+            std::cout << "Successfully packed " << input.string() << " into " << output.string();
+            if (chosen_bitrate > 0) std::cout << " at " << chosen_bitrate << " kbps CBR";
+            std::cout << "\n";
         }
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << "\n";

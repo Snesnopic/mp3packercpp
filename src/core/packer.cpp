@@ -229,7 +229,34 @@ static ChosenBitrate bytes_to_bitrate(const MpegVersion version, const uint32_t 
     return {true, max_frame_size - 4 - side_info_size, 14};
 }
 
-void Packer::process(const std::string& input_file, const std::string& output_file) const {
+// The bitrate table for a version, as indices into the frame header's 4-bit field.
+// Index 0 (free) and 15 (reserved) are not usable.
+static const int* bitrate_table_for(const MpegVersion version) {
+    static const int mpeg1_bitrates[] = {0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320};
+    static const int mpeg2_bitrates[] = {0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160};
+    return (version == MpegVersion::MPEG1) ? mpeg1_bitrates : mpeg2_bitrates;
+}
+
+// One frame's size in a constant-bitrate stream. The exact length is fractional —
+// 144 * 128000 / 44100 is 417.96 — so a running remainder decides which frames
+// carry the extra padding byte, which is the cycle a CBR encoder follows and what
+// makes the stream come out at exactly the bitrate it claims.
+static int cbr_frame_size(const MpegVersion version, const uint32_t samplerate,
+                          const int bitrate_kbps, int& remainder, bool& padded) {
+    const int mult = (version == MpegVersion::MPEG1) ? 144 : 72;
+    const long long numer = static_cast<long long>(mult) * bitrate_kbps * 1000;
+    const int base = static_cast<int>(numer / samplerate);
+    remainder += static_cast<int>(numer % samplerate);
+    padded = false;
+    if (remainder >= static_cast<int>(samplerate)) {
+        remainder -= static_cast<int>(samplerate);
+        padded = true;
+    }
+    return base + (padded ? 1 : 0);
+}
+
+void Packer::process(const std::string& input_file, const std::string& output_file,
+                     int* out_bitrate_kbps) const {
     DEBUG_LOG("Reading input file " << input_file << "...");
     Mp3Reader reader(input_file);
 
@@ -530,9 +557,14 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
     
     DEBUG_LOG("Reservoir carryover calculated. Writing output stream...");
     
-    std::ofstream out(output_file, std::ios::binary);
-    if (!out) {
-        throw std::runtime_error("Could not open output file: " + output_file);
+    // Opened lazily: report_bitrate_only writes nothing, and asking for a bitrate
+    // should not require naming (or creating) an output file.
+    std::ofstream out;
+    if (!this->report_bitrate_only) {
+        out.open(output_file, std::ios::binary);
+        if (!out) {
+            throw std::runtime_error("Could not open output file: " + output_file);
+        }
     }
 
     // The file is assembled in memory and written once at the end. Writing it
@@ -575,17 +607,80 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
     // audio and an allocation to hold it.
     size_t reservoir_bytes = 0;
     int current_reservoir = 0; // free space in past payloads
-    
+
+    const int max_reservoir_bytes = (version == MpegVersion::MPEG1) ? 511 : 255;
+    const int frame_side_info_size = (version == MpegVersion::MPEG1)
+                                     ? (channel_mode == ChannelMode::Mono ? 17 : 32)
+                                     : (channel_mode == ChannelMode::Mono ?  9 : 17);
+
+    // --- constant bitrate ---------------------------------------------------
+    //
+    // Walking the layout with every frame pinned to one bitrate answers whether
+    // that bitrate is usable: a frame's payload has to come out of its own slot
+    // plus whatever earlier frames banked, and the back-reference only reaches
+    // 511 bytes (255 for LSF). Nothing here re-runs the search — it reads the
+    // sizes the repack already produced — so the whole scan costs one pass per
+    // candidate bitrate.
+    const int* bitrates = bitrate_table_for(version);
+    const auto cbr_fits = [&](const int bitrate_kbps) {
+        int remainder = 0, reservoir = 0;
+        for (size_t i = 0; i < N; ++i) {
+            bool padded = false;
+            const int data_size = cbr_frame_size(version, samplerate, bitrate_kbps, remainder, padded)
+                                  - 4 - frame_side_info_size;
+            if (data_size < 0) return false;
+            const int needed = static_cast<int>(optimized_main_data[i].size());
+            if (has_xing && i == 0) {
+                // The Xing frame is preserved rather than rebuilt, so it has to fit
+                // as it stands; if it arrived larger than the audio needs, it is what
+                // raises the floor rather than being left as one odd frame.
+                if (needed > data_size) return false;
+                reservoir = 0;
+                continue;
+            }
+            const int projected = reservoir + data_size - needed;
+            if (projected < 0) return false;
+            reservoir = std::min(projected, max_reservoir_bytes);
+        }
+        return true;
+    };
+
+    int cbr_bitrate = 0;          // 0 means variable bitrate
+    int cbr_index = 0;
+    const bool want_cbr = this->constant_bitrate || this->min_bitrate_kbps > 0;
+    if (want_cbr) {
+        for (int index = 1; index <= 14; ++index) {
+            // The floor only raises the starting point; a bitrate the frames do not
+            // fit in is never usable, so feasibility is checked either way. Forcing
+            // an under-sized bitrate would produce a structurally broken file.
+            if (bitrates[index] < this->min_bitrate_kbps) continue;   // floor, rounded up
+            if (!cbr_fits(bitrates[index])) continue;
+            cbr_bitrate = bitrates[index];
+            cbr_index = index;
+            break;
+        }
+        if (cbr_bitrate == 0) {
+            throw std::runtime_error("no constant bitrate can hold this file");
+        }
+    }
+    if (out_bitrate_kbps) *out_bitrate_kbps = cbr_bitrate;
+    if (this->report_bitrate_only) return;
+
     std::vector<ChosenBitrate> chosen_bitrates(N);
-    
+    int cbr_remainder = 0;
+
     // pass 1: build global_main_data and calculate main_data_begin
     for (size_t i = 0; i < N; ++i) {
         auto& side = all_frames[i].side_info;
 
-        int max_reservoir = (version == MpegVersion::MPEG1) ? 511 : 255;
+        int max_reservoir = max_reservoir_bytes;
 
         ChosenBitrate bitrate_use{};
-        if (has_xing && i == 0) {
+        if (cbr_bitrate != 0) {
+            bool padded = false;
+            const int frame_size = cbr_frame_size(version, samplerate, cbr_bitrate, cbr_remainder, padded);
+            bitrate_use = {padded, frame_size - 4 - frame_side_info_size, cbr_index};
+        } else if (has_xing && i == 0) {
             // use minimum bitrate that fits the trimmed Xing tag content
             int needed = static_cast<int>(optimized_main_data[0].size());
             bitrate_use = bytes_to_bitrate(version, samplerate, channel_mode, needed);

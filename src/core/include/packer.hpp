@@ -22,13 +22,42 @@ public:
     
     /** @brief Number of threads to use. If 0, uses auto-detection. */
     unsigned int num_threads = 0;
-    
+
+    /**
+     * @brief Emit a constant-bitrate stream instead of letting each frame shrink.
+     *
+     * The bitrate is the lowest one every frame still fits in *after* the repack,
+     * worked out from that same repack rather than a separate pass. Frames only
+     * grow, and only into padding: the audio is untouched.
+     */
+    bool constant_bitrate = false;
+
+    /**
+     * @brief Floor for the constant bitrate, in kbps; rounded up to a valid one.
+     *
+     * Setting this implies constant-bitrate output. Combined with
+     * @ref constant_bitrate the higher of the two wins.
+     */
+    int min_bitrate_kbps = 0;
+
+    /**
+     * @brief Work out the constant bitrate but write nothing.
+     *
+     * @ref process still parses and repacks — the answer comes out of that same
+     * work — but stops before writing the output file.
+     */
+    bool report_bitrate_only = false;
+
     /**
      * @brief Processes an input MP3 file and writes the optimized result to an output file.
      * @param input_file Path to the source MP3 file.
-     * @param output_file Path where the optimized MP3 file should be saved.
+     * @param output_file Path where the optimized MP3 file should be saved. Ignored
+     *        when @ref report_bitrate_only is set.
+     * @param out_bitrate_kbps If non-null, receives the constant bitrate chosen, or 0
+     *        when the output is variable-bitrate.
      */
-    void process(const std::string& input_file, const std::string& output_file) const;
+    void process(const std::string& input_file, const std::string& output_file,
+                 int* out_bitrate_kbps = nullptr) const;
 };
 
 } // namespace mp3packer
