@@ -99,6 +99,19 @@ public:
 
 };
 
+/// Which cost-kernel form is running: "neon", "avx2", "sse4.1" or "portable".
+/// Decided once from the processor's own capabilities; MP3PACKER_SIMD in the
+/// environment can narrow it, which is how the forms are compared against each
+/// other on one machine.
+const char* active_simd_kernel();
+
+/// Runs every cost-kernel form this processor can execute against the portable
+/// ones over pseudo-random inputs, and returns the name of the first form that
+/// disagreed — or nullptr when they all match. The kernels are the one place
+/// where the same answer is computed four different ways, so they are also the
+/// one place where a machine can check itself.
+const char* verify_simd_kernels();
+
 } // namespace mp3packer
 
 #endif // MP3PACKERCPP_HUFFMAN_HPP

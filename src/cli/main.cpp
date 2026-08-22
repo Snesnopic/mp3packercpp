@@ -2,6 +2,7 @@
 #include <iostream>
 #include "../core/include/packer.hpp"
 #include "../core/include/logger.hpp"
+#include "../core/include/huffman.hpp"
 
 void printUsage() {
     std::cout << "Usage: mp3packercpp [-z] [-t threads] [--cbr] [-b kbps] [--ib] [-v] <input.mp3> [output.mp3]\n";
@@ -108,6 +109,9 @@ int main(int argc, const char* argv[]) {
             std::cout << "Successfully packed " << input.string() << " into " << output.string();
             if (chosen_bitrate > 0) std::cout << " at " << chosen_bitrate << " kbps CBR";
             std::cout << "\n";
+            if (recompress_huffman) {
+                std::cout << "Cost kernels: " << mp3packer::active_simd_kernel() << "\n";
+            }
         }
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << "\n";

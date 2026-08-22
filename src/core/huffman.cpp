@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <iostream>
 #include <array>
+#include <cstring>
+#include <cstdlib>
 
 // The cost machinery keeps all 32 code tables side by side, so its two kernels are
 // pure 32-lane vector work: eight vectors cover a whole row, and the only scalar
@@ -15,11 +17,28 @@
 //
 // AArch64 with a GNU-style compiler only: the horizontal minimum the span kernel
 // ends in has no 32-bit NEON encoding, so __ARM_NEON alone is not enough of a
-// test, and MSVC spells its NEON header differently. Everything else builds the
-// portable form, which measured about 9% behind on a recompressing run.
+// test, and MSVC spells its NEON header differently.
 #if !defined(MP3PACKER_NO_SIMD) && defined(__aarch64__) && (defined(__ARM_NEON) || defined(__ARM_NEON__))
 #define MP3PACKER_NEON 1
 #include <arm_neon.h>
+#endif
+
+// x86-64 gets the same two kernels, chosen at run time rather than at compile
+// time: the binaries this project ships are built for baseline x86-64, so a
+// compile-time test would settle on SSE2 and the wider forms would never run on
+// the machines that have them. The span kernel needs an unsigned 32-bit minimum,
+// which arrives with SSE4.1 — SSE2 has it for bytes and signed shorts only — so
+// SSE4.1 is the floor worth having, with AVX2 doing the same work half as many
+// times.
+#if !defined(MP3PACKER_NO_SIMD) && !defined(MP3PACKER_NEON) && (defined(__x86_64__) || defined(_M_X64))
+#define MP3PACKER_X86 1
+#include <immintrin.h>
+#if defined(_MSC_VER)
+#include <intrin.h>
+#define MP3PACKER_TARGET(feature)
+#else
+#define MP3PACKER_TARGET(feature) __attribute__((target(feature)))
+#endif
 #endif
 
 
@@ -580,7 +599,8 @@ static inline uint32_t pair_key(const int x, const int y) {
 /// cost<<kCostShift|table values yields both the cheapest cost and which table
 /// achieved it, breaking ties towards the lower index.
 /// Aligned so the span kernel's loads of it are: leaving it to chance cost 10%.
-alignas(16) static constexpr uint32_t lane_index[kNumTables] = {
+/// 32 rather than 16 so an AVX2 vector of it is aligned too.
+alignas(32) static constexpr uint32_t lane_index[kNumTables] = {
     0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
     16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
 };
@@ -591,8 +611,39 @@ alignas(16) static constexpr uint32_t lane_index[kNumTables] = {
 /// is 32 lanes of load-add with no gathers — the shape that lets the compiler hold
 /// it in eight vectors. The escape row is all zeros unless the pair's magnitude
 /// escapes to linbits, which is uncommon, so it is skipped rather than added.
-static void accumulate_costs(int32_t* acc, const uint32_t* keys, const int n, const PairCosts& ct) {
+static void accumulate_costs_portable(int32_t* acc, const uint32_t* keys, const int n, const PairCosts& ct) {
+    for (int i = 0; i < n; ++i) {
+        const uint32_t key = keys[i];
+        const int32_t* base = ct.pair[key & 0xFF];
+        if (key & 0xF00) {
+            const int32_t* esc = ct.escape[key >> 8 & 0xF];
+            for (int t = 0; t < kNumTables; ++t) acc[t] += base[t] + esc[t];
+        } else {
+            for (int t = 0; t < kNumTables; ++t) acc[t] += base[t];
+        }
+    }
+}
+
+/// Cheapest table for the span between two prefix rows, packed as
+/// cost<<kCostShift|table so that the lowest table index wins a tie — the order
+/// the original's ascending scan with a strict comparison settled on.
+///
+/// Both rows arrive pre-scaled, so their difference already has room for the lane
+/// label, and the minimum is taken over unsigned values: costs are non-negative,
+/// so the order is the same, and a signed shift that might overflow is enough to
+/// stop a vectoriser cold.
+static uint32_t best_span_portable(const int32_t* from, const int32_t* to) {
+    uint32_t best = UINT32_MAX;
+    for (int t = 0; t < kNumTables; ++t) {
+        const uint32_t k = static_cast<uint32_t>(to[t] - from[t]) | lane_index[t];
+        best = std::min(best, k);
+    }
+    return best;
+}
+
 #if defined(MP3PACKER_NEON)
+
+static void accumulate_costs(int32_t* acc, const uint32_t* keys, const int n, const PairCosts& ct) {
     // Eight vectors cover all 32 lanes and stay live for the whole loop.
     int32x4_t a0 = vld1q_s32(acc + 0),  a1 = vld1q_s32(acc + 4);
     int32x4_t a2 = vld1q_s32(acc + 8),  a3 = vld1q_s32(acc + 12);
@@ -625,30 +676,11 @@ static void accumulate_costs(int32_t* acc, const uint32_t* keys, const int n, co
     vst1q_s32(acc + 8, a2);  vst1q_s32(acc + 12, a3);
     vst1q_s32(acc + 16, a4); vst1q_s32(acc + 20, a5);
     vst1q_s32(acc + 24, a6); vst1q_s32(acc + 28, a7);
-#else
-    for (int i = 0; i < n; ++i) {
-        const uint32_t key = keys[i];
-        const int32_t* base = ct.pair[key & 0xFF];
-        if (key & 0xF00) {
-            const int32_t* esc = ct.escape[key >> 8 & 0xF];
-            for (int t = 0; t < kNumTables; ++t) acc[t] += base[t] + esc[t];
-        } else {
-            for (int t = 0; t < kNumTables; ++t) acc[t] += base[t];
-        }
-    }
-#endif
 }
 
-/// Cheapest table for the span between two prefix rows, packed as
-/// cost<<kCostShift|table so that the lowest table index wins a tie — the order
-/// the original's ascending scan with a strict comparison settled on.
-///
-/// Both rows arrive pre-scaled, so their difference already has room for the lane
-/// label, and the minimum is taken over unsigned values: costs are non-negative,
-/// so the order is the same, and a signed shift that might overflow is enough to
-/// stop a vectoriser cold.
+const char* kernel_name() { return "neon"; }
+
 static inline uint32_t best_span(const int32_t* from, const int32_t* to) {
-#if defined(MP3PACKER_NEON)
     const uint32_t* f = reinterpret_cast<const uint32_t*>(from);
     const uint32_t* t = reinterpret_cast<const uint32_t*>(to);
     uint32x4_t d0 = vorrq_u32(vsubq_u32(vld1q_u32(t + 0),  vld1q_u32(f + 0)),  vld1q_u32(lane_index + 0));
@@ -663,15 +695,225 @@ static inline uint32_t best_span(const int32_t* from, const int32_t* to) {
     d4 = vminq_u32(d4, d5); d6 = vminq_u32(d6, d7);
     d0 = vminq_u32(d0, d2); d4 = vminq_u32(d4, d6);
     return vminvq_u32(vminq_u32(d0, d4));
-#else
-    uint32_t best = UINT32_MAX;
-    for (int t = 0; t < kNumTables; ++t) {
-        const uint32_t k = static_cast<uint32_t>(to[t] - from[t]) | lane_index[t];
-        best = std::min(best, k);
+}
+
+#elif defined(MP3PACKER_X86)
+
+// Note both kernels below spell out their loads and their final reduction rather
+// than sharing a helper or a lambda. A lambda's operator() does not inherit the
+// enclosing function's target attribute, so clang compiles its body for the
+// baseline and rejects the wider intrinsics outright; a separate helper compiles,
+// but cannot be inlined across the boundary.
+
+MP3PACKER_TARGET("sse4.1")
+static void accumulate_costs_sse41(int32_t* acc, const uint32_t* keys, const int n, const PairCosts& ct) {
+    __m128i a0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(acc + 0));
+    __m128i a1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(acc + 4));
+    __m128i a2 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(acc + 8));
+    __m128i a3 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(acc + 12));
+    __m128i a4 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(acc + 16));
+    __m128i a5 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(acc + 20));
+    __m128i a6 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(acc + 24));
+    __m128i a7 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(acc + 28));
+    for (int i = 0; i < n; ++i) {
+        const uint32_t key = keys[i];
+        const int32_t* base = ct.pair[key & 0xFF];
+        __m128i b0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(base + 0));
+        __m128i b1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(base + 4));
+        __m128i b2 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(base + 8));
+        __m128i b3 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(base + 12));
+        __m128i b4 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(base + 16));
+        __m128i b5 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(base + 20));
+        __m128i b6 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(base + 24));
+        __m128i b7 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(base + 28));
+        if (key & 0xF00) {
+            const int32_t* esc = ct.escape[key >> 8 & 0xF];
+            b0 = _mm_add_epi32(b0, _mm_loadu_si128(reinterpret_cast<const __m128i*>(esc + 0)));
+            b1 = _mm_add_epi32(b1, _mm_loadu_si128(reinterpret_cast<const __m128i*>(esc + 4)));
+            b2 = _mm_add_epi32(b2, _mm_loadu_si128(reinterpret_cast<const __m128i*>(esc + 8)));
+            b3 = _mm_add_epi32(b3, _mm_loadu_si128(reinterpret_cast<const __m128i*>(esc + 12)));
+            b4 = _mm_add_epi32(b4, _mm_loadu_si128(reinterpret_cast<const __m128i*>(esc + 16)));
+            b5 = _mm_add_epi32(b5, _mm_loadu_si128(reinterpret_cast<const __m128i*>(esc + 20)));
+            b6 = _mm_add_epi32(b6, _mm_loadu_si128(reinterpret_cast<const __m128i*>(esc + 24)));
+            b7 = _mm_add_epi32(b7, _mm_loadu_si128(reinterpret_cast<const __m128i*>(esc + 28)));
+        }
+        a0 = _mm_add_epi32(a0, b0); a1 = _mm_add_epi32(a1, b1);
+        a2 = _mm_add_epi32(a2, b2); a3 = _mm_add_epi32(a3, b3);
+        a4 = _mm_add_epi32(a4, b4); a5 = _mm_add_epi32(a5, b5);
+        a6 = _mm_add_epi32(a6, b6); a7 = _mm_add_epi32(a7, b7);
     }
-    return best;
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(acc + 0), a0);
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(acc + 4), a1);
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(acc + 8), a2);
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(acc + 12), a3);
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(acc + 16), a4);
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(acc + 20), a5);
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(acc + 24), a6);
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(acc + 28), a7);
+}
+
+MP3PACKER_TARGET("sse4.1")
+static uint32_t best_span_sse41(const int32_t* from, const int32_t* to) {
+    const __m128i* f = reinterpret_cast<const __m128i*>(from);
+    const __m128i* t = reinterpret_cast<const __m128i*>(to);
+    const __m128i* l = reinterpret_cast<const __m128i*>(lane_index);
+    __m128i d0 = _mm_or_si128(_mm_sub_epi32(_mm_loadu_si128(t + 0), _mm_loadu_si128(f + 0)), _mm_loadu_si128(l + 0));
+    __m128i d1 = _mm_or_si128(_mm_sub_epi32(_mm_loadu_si128(t + 1), _mm_loadu_si128(f + 1)), _mm_loadu_si128(l + 1));
+    __m128i d2 = _mm_or_si128(_mm_sub_epi32(_mm_loadu_si128(t + 2), _mm_loadu_si128(f + 2)), _mm_loadu_si128(l + 2));
+    __m128i d3 = _mm_or_si128(_mm_sub_epi32(_mm_loadu_si128(t + 3), _mm_loadu_si128(f + 3)), _mm_loadu_si128(l + 3));
+    __m128i d4 = _mm_or_si128(_mm_sub_epi32(_mm_loadu_si128(t + 4), _mm_loadu_si128(f + 4)), _mm_loadu_si128(l + 4));
+    __m128i d5 = _mm_or_si128(_mm_sub_epi32(_mm_loadu_si128(t + 5), _mm_loadu_si128(f + 5)), _mm_loadu_si128(l + 5));
+    __m128i d6 = _mm_or_si128(_mm_sub_epi32(_mm_loadu_si128(t + 6), _mm_loadu_si128(f + 6)), _mm_loadu_si128(l + 6));
+    __m128i d7 = _mm_or_si128(_mm_sub_epi32(_mm_loadu_si128(t + 7), _mm_loadu_si128(f + 7)), _mm_loadu_si128(l + 7));
+    d0 = _mm_min_epu32(d0, d1); d2 = _mm_min_epu32(d2, d3);
+    d4 = _mm_min_epu32(d4, d5); d6 = _mm_min_epu32(d6, d7);
+    d0 = _mm_min_epu32(d0, d2); d4 = _mm_min_epu32(d4, d6);
+    __m128i v = _mm_min_epu32(d0, d4);
+    v = _mm_min_epu32(v, _mm_shuffle_epi32(v, _MM_SHUFFLE(1, 0, 3, 2)));
+    v = _mm_min_epu32(v, _mm_shuffle_epi32(v, _MM_SHUFFLE(2, 3, 0, 1)));
+    return static_cast<uint32_t>(_mm_cvtsi128_si32(v));
+}
+
+MP3PACKER_TARGET("avx2")
+static void accumulate_costs_avx2(int32_t* acc, const uint32_t* keys, const int n, const PairCosts& ct) {
+    __m256i a0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(acc + 0));
+    __m256i a1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(acc + 8));
+    __m256i a2 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(acc + 16));
+    __m256i a3 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(acc + 24));
+    for (int i = 0; i < n; ++i) {
+        const uint32_t key = keys[i];
+        const int32_t* base = ct.pair[key & 0xFF];
+        __m256i b0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(base + 0));
+        __m256i b1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(base + 8));
+        __m256i b2 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(base + 16));
+        __m256i b3 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(base + 24));
+        if (key & 0xF00) {
+            const int32_t* esc = ct.escape[key >> 8 & 0xF];
+            b0 = _mm256_add_epi32(b0, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(esc + 0)));
+            b1 = _mm256_add_epi32(b1, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(esc + 8)));
+            b2 = _mm256_add_epi32(b2, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(esc + 16)));
+            b3 = _mm256_add_epi32(b3, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(esc + 24)));
+        }
+        a0 = _mm256_add_epi32(a0, b0); a1 = _mm256_add_epi32(a1, b1);
+        a2 = _mm256_add_epi32(a2, b2); a3 = _mm256_add_epi32(a3, b3);
+    }
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(acc + 0), a0);
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(acc + 8), a1);
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(acc + 16), a2);
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(acc + 24), a3);
+}
+
+MP3PACKER_TARGET("avx2")
+static uint32_t best_span_avx2(const int32_t* from, const int32_t* to) {
+    const __m256i* f = reinterpret_cast<const __m256i*>(from);
+    const __m256i* t = reinterpret_cast<const __m256i*>(to);
+    const __m256i* l = reinterpret_cast<const __m256i*>(lane_index);
+    const __m256i d0 = _mm256_or_si256(_mm256_sub_epi32(_mm256_loadu_si256(t + 0), _mm256_loadu_si256(f + 0)), _mm256_loadu_si256(l + 0));
+    const __m256i d1 = _mm256_or_si256(_mm256_sub_epi32(_mm256_loadu_si256(t + 1), _mm256_loadu_si256(f + 1)), _mm256_loadu_si256(l + 1));
+    const __m256i d2 = _mm256_or_si256(_mm256_sub_epi32(_mm256_loadu_si256(t + 2), _mm256_loadu_si256(f + 2)), _mm256_loadu_si256(l + 2));
+    const __m256i d3 = _mm256_or_si256(_mm256_sub_epi32(_mm256_loadu_si256(t + 3), _mm256_loadu_si256(f + 3)), _mm256_loadu_si256(l + 3));
+    const __m256i d = _mm256_min_epu32(_mm256_min_epu32(d0, d1), _mm256_min_epu32(d2, d3));
+    __m128i v = _mm_min_epu32(_mm256_castsi256_si128(d), _mm256_extracti128_si256(d, 1));
+    v = _mm_min_epu32(v, _mm_shuffle_epi32(v, _MM_SHUFFLE(1, 0, 3, 2)));
+    v = _mm_min_epu32(v, _mm_shuffle_epi32(v, _MM_SHUFFLE(2, 3, 0, 1)));
+    return static_cast<uint32_t>(_mm_cvtsi128_si32(v));
+}
+
+/// Which of the three forms this processor can run. Decided once; the answer is
+/// a property of the machine, not of the file being packed.
+static bool cpu_has(const char* feature) {
+#if defined(_MSC_VER)
+    int regs[4] = {0, 0, 0, 0};
+    __cpuid(regs, 1);
+    if (std::strcmp(feature, "sse4.1") == 0) return (regs[2] & (1 << 19)) != 0;
+    // AVX2 also needs the OS to be saving the upper halves of the vector
+    // registers, which is what the OSXSAVE bit and XGETBV together attest; a
+    // CPUID bit alone would fault on a kernel that does not.
+    const bool osxsave = (regs[2] & (1 << 27)) != 0;
+    const bool avx = (regs[2] & (1 << 28)) != 0;
+    if (!osxsave || !avx || (_xgetbv(0) & 0x6) != 0x6) return false;
+    int ext[4] = {0, 0, 0, 0};
+    __cpuidex(ext, 7, 0);
+    return (ext[1] & (1 << 5)) != 0;
+#else
+    // __builtin_cpu_supports does the XGETBV check itself.
+    if (std::strcmp(feature, "sse4.1") == 0) return __builtin_cpu_supports("sse4.1");
+    return __builtin_cpu_supports("avx2");
 #endif
 }
+
+/// Whether a form may be run at all. Normally that is what the processor
+/// advertises; MP3PACKER_SIMD_UNCHECKED drops the gate for emulators that execute
+/// an instruction set they decline to advertise — Rosetta runs AVX2 while
+/// reporting avx2=0 through CPUID — and has no business in a shipped binary.
+static bool cpu_can(const char* feature) {
+#if defined(MP3PACKER_SIMD_UNCHECKED)
+    (void)feature;
+    return true;
+#else
+    return cpu_has(feature);
+#endif
+}
+
+using AccumulateFn = void (*)(int32_t*, const uint32_t*, int, const PairCosts&);
+using BestSpanFn = uint32_t (*)(const int32_t*, const int32_t*);
+
+struct SimdKernels {
+    AccumulateFn accumulate;
+    BestSpanFn span;
+    const char* name;
+};
+
+static const SimdKernels& simd_kernels() {
+    static const SimdKernels chosen = [] {
+#if !defined(_MSC_VER)
+        __builtin_cpu_init();
+#endif
+        const SimdKernels avx2{accumulate_costs_avx2, best_span_avx2, "avx2"};
+        const SimdKernels sse41{accumulate_costs_sse41, best_span_sse41, "sse4.1"};
+        const SimdKernels portable{accumulate_costs_portable, best_span_portable, "portable"};
+        // MP3PACKER_SIMD forces one form, so a single machine can be made to run
+        // all three and their outputs compared. It only ever narrows what the
+        // processor already advertises: asking for a form it cannot run would
+        // fault. Building with MP3PACKER_SIMD_UNCHECKED drops that gate, which is
+        // for emulators that execute an instruction set they decline to advertise
+        // — Rosetta runs AVX2 while reporting avx2=0 through CPUID — and has no
+        // business in a shipped binary.
+        if (const char* forced = std::getenv("MP3PACKER_SIMD")) {
+            if (std::strcmp(forced, "portable") == 0) return portable;
+            if (std::strcmp(forced, "sse4.1") == 0 && cpu_can("sse4.1")) return sse41;
+            if (std::strcmp(forced, "avx2") == 0 && cpu_can("avx2")) return avx2;
+        }
+        if (cpu_has("avx2")) return avx2;
+        if (cpu_has("sse4.1")) return sse41;
+        return portable;
+    }();
+    return chosen;
+}
+
+static void accumulate_costs(int32_t* acc, const uint32_t* keys, const int n, const PairCosts& ct) {
+    simd_kernels().accumulate(acc, keys, n, ct);
+}
+
+const char* kernel_name() { return simd_kernels().name; }
+
+static inline uint32_t best_span(const int32_t* from, const int32_t* to) {
+    return simd_kernels().span(from, to);
+}
+
+#else
+
+static inline void accumulate_costs(int32_t* acc, const uint32_t* keys, const int n, const PairCosts& ct) {
+    accumulate_costs_portable(acc, keys, n, ct);
+}
+
+const char* kernel_name() { return "portable"; }
+
+static inline uint32_t best_span(const int32_t* from, const int32_t* to) {
+    return best_span_portable(from, to);
+}
+
+#endif
 
 /// The cheapest two-region cover of every pair below a boundary: what it costs,
 /// where region0 ends and the tables both regions use. None of it moves with
@@ -708,7 +950,72 @@ struct SearchScratch {
     bool c1_ok[kNumCoefficients + 8];
 };
 
+
+/// Drives whichever forms this build has against the portable ones. The inputs
+/// are pseudo-random but fixed, so a disagreement reproduces; the accumulator is
+/// walked in the same shape the search walks it, since a kernel that is only ever
+/// handed one length would not exercise its loop.
+const char* compare_kernels_against_portable() {
+    const PairCosts& ct = pair_cost_tables();
+    uint32_t state = 0x12345678u;
+    const auto next = [&state] {
+        state ^= state << 13; state ^= state >> 17; state ^= state << 5;
+        return state;
+    };
+
+    std::vector<uint32_t> keys(4096);
+    for (auto& k : keys) {
+        // a key is a clamped symbol plus, occasionally, an escape width
+        k = (next() & 0xFF) | ((next() % 8 == 0) ? ((next() % 15 + 1) << 8) : 0u);
+    }
+
+    // Spelled out rather than reusing the dispatch aliases: those exist only in
+    // the x86 build, and this check runs in the NEON one too.
+    struct Form {
+        void (*accumulate)(int32_t*, const uint32_t*, int, const PairCosts&);
+        uint32_t (*span)(const int32_t*, const int32_t*);
+        const char* name;
+    };
+    std::vector<Form> forms;
+#if defined(MP3PACKER_X86)
+    if (cpu_can("sse4.1")) forms.push_back({accumulate_costs_sse41, best_span_sse41, "sse4.1"});
+    if (cpu_can("avx2")) forms.push_back({accumulate_costs_avx2, best_span_avx2, "avx2"});
+#elif defined(MP3PACKER_NEON)
+    forms.push_back({[](int32_t* a, const uint32_t* k, int n, const PairCosts& c) { accumulate_costs(a, k, n, c); },
+                     [](const int32_t* f, const int32_t* t) { return best_span(f, t); }, "neon"});
+#endif
+    if (forms.empty()) return nullptr;   // nothing but the portable form to run
+
+    for (const Form& form : forms) {
+        int32_t ref[kNumTables] = {0};
+        int32_t got[kNumTables] = {0};
+        int32_t prev_ref[kNumTables] = {0};
+        int32_t prev_got[kNumTables] = {0};
+        size_t pos = 0;
+        while (pos < keys.size()) {
+            const int n = static_cast<int>(1 + next() % 37);
+            const int take = static_cast<int>(std::min(static_cast<size_t>(n), keys.size() - pos));
+            std::copy(std::begin(ref), std::end(ref), std::begin(prev_ref));
+            std::copy(std::begin(got), std::end(got), std::begin(prev_got));
+            accumulate_costs_portable(ref, keys.data() + pos, take, ct);
+            form.accumulate(got, keys.data() + pos, take, ct);
+            for (int t = 0; t < kNumTables; ++t) {
+                if (ref[t] != got[t]) return form.name;
+            }
+            if (best_span_portable(prev_ref, ref) != form.span(prev_got, got)) return form.name;
+            pos += static_cast<size_t>(take);
+        }
+    }
+    return nullptr;
+}
+
 } // namespace
+
+// The kernels live in an anonymous namespace, so the name has to be handed out
+// from a function with external linkage.
+const char* active_simd_kernel() { return kernel_name(); }
+
+const char* verify_simd_kernels() { return compare_kernels_against_portable(); }
 
 HuffmanConfig HuffmanOptimizer::find_best_config(
         const Spectrum& coeffs,
