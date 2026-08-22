@@ -103,6 +103,36 @@ check_case() {
         fi
     fi
 
+    # CRC preservation: --keep-crc must stay lossless, must actually carry CRCs
+    # when the source had them, and every CRC it writes must be right. The default
+    # is checked too, since dropping the CRC is what every release so far did.
+    local crc_status="ok" crc_out="$WORKDIR/out_crc.mp3" pcm_crc="$WORKDIR/pcm_crc.f32"
+    local src_prot; src_prot="$(crc_report "$src" | cut -d' ' -f2)"
+    if [ "$(echo "$d_noz $d_t1" | tr -d ' 0')" = "" ]; then
+        local def_rep; def_rep="$(crc_report "$out_t1")"
+        if [ "$(echo "$def_rep" | cut -d' ' -f2)" != "0" ]; then
+            crc_status="default output kept a CRC ($def_rep)"
+        elif ! "$BIN" -z --keep-crc "$src" "$crc_out" >/dev/null 2>&1; then
+            crc_status="--keep-crc pack failed"
+        elif ! ffmpeg -y -v error -i "$crc_out" -f f32le "$pcm_crc" 2>/dev/null; then
+            crc_status="--keep-crc output failed to decode"
+        else
+            local d_crc; d_crc="$(pcm_diff "$orig_pcm" "$pcm_crc")"
+            local rep; rep="$(crc_report "$crc_out")"
+            local out_prot; out_prot="$(echo "$rep" | cut -d' ' -f2)"
+            local out_bad; out_bad="$(echo "$rep" | cut -d' ' -f3)"
+            if [ "$d_crc" != "0" ]; then
+                crc_status="--keep-crc $d_crc PCM diffs"
+            elif [ "$out_bad" != "0" ]; then
+                crc_status="$out_bad frames with a wrong CRC"
+            elif [ "$src_prot" != "0" ] && [ "$out_prot" = "0" ]; then
+                crc_status="source had $src_prot CRC frames, output has none"
+            elif [ "$src_prot" = "0" ] && [ "$out_prot" != "0" ]; then
+                crc_status="source had no CRC, output invented $out_prot"
+            fi
+        fi
+    fi
+
     if [ "$d_noz" != "0" ] || [ "$d_t1" != "0" ] || [ "$d_tn" != "0" ] || [ "$det_ok" != "yes" ]; then
         FAIL=$((FAIL + 1))
         FAILURES+=("$label :: no-z diffs=$d_noz  t1 diffs=$d_t1  tN diffs=$d_tn  t1==tN:$det_ok")
@@ -111,9 +141,62 @@ check_case() {
         FAIL=$((FAIL + 1))
         FAILURES+=("$label :: cbr $cbr_status")
         echo "FAIL  $label  (cbr: $cbr_status)"
+    elif [ "$crc_status" != "ok" ]; then
+        FAIL=$((FAIL + 1))
+        FAILURES+=("$label :: crc $crc_status")
+        echo "FAIL  $label  (crc: $crc_status)"
     else
         echo "ok    $label"
     fi
+}
+
+# "<frames> <protected> <bad>" for a file: how many frames carry a CRC, and how
+# many of those disagree with a CRC recomputed here. The recomputation is
+# deliberately independent of the packer's own, so a shared misunderstanding of
+# the polynomial or the covered bytes cannot pass unnoticed.
+crc_report() {
+    python3 -c "
+import sys
+d=open(sys.argv[1],'rb').read()
+i=0
+if d[:3]==b'ID3':
+    i=10+(((d[6]&0x7F)<<21)|((d[7]&0x7F)<<14)|((d[8]&0x7F)<<7)|(d[9]&0x7F))
+v1=[0,32,40,48,56,64,80,96,112,128,160,192,224,256,320,0]
+v2=[0,8,16,24,32,40,48,56,64,80,96,112,128,144,160,0]
+rates=[44100,48000,32000]
+
+def crc16(payload):
+    crc=0xFFFF
+    for byte in payload:
+        value=byte<<8
+        for _ in range(8):
+            value=(value<<1)&0x1FFFF
+            crc=(crc<<1)&0x1FFFF
+            if (value^crc)&0x10000: crc^=0x8005
+    return crc&0xFFFF
+
+frames=protected=bad=0
+while i < len(d)-4:
+    if d[i]==0xFF and (d[i+1]&0xE0)==0xE0:
+        ver=(d[i+1]>>3)&3
+        if ver==1: i+=1; continue
+        tbl = v1 if ver==3 else v2
+        mult = 144 if ver==3 else 72
+        sr = rates[(d[i+2]>>2)&3] // (1 if ver==3 else (2 if ver==2 else 4))
+        br = tbl[(d[i+2]>>4)&0xF]; pad=(d[i+2]>>1)&1
+        if br==0 or sr==0: i+=1; continue
+        frames+=1
+        mono = ((d[i+3]>>6)&3)==3
+        si = (17 if mono else 32) if ver==3 else (9 if mono else 17)
+        if not (d[i+1]&1):
+            protected+=1
+            stored=(d[i+4]<<8)|d[i+5]
+            if crc16(bytes([d[i+2],d[i+3]])+d[i+6:i+6+si])!=stored: bad+=1
+        i += mult*br*1000//sr + pad
+    else:
+        i += 1
+print(frames, protected, bad)
+" "$1"
 }
 
 # The distinct bitrates the frames of a file carry, as a space-separated list.

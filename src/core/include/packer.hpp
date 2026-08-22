@@ -41,6 +41,15 @@ public:
     int min_bitrate_kbps = 0;
 
     /**
+     * @brief Keep the frame CRC on frames that arrived with one, recomputing it.
+     *
+     * Off by default: dropping it frees two bytes of payload per frame, which is
+     * what every release so far has done. Turning it on is more faithful to the
+     * input at that cost. Frames that had no CRC never gain one.
+     */
+    bool keep_crc = false;
+
+    /**
      * @brief Work out the constant bitrate but write nothing.
      *
      * @ref process still parses and repacks — the answer comes out of that same

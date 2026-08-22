@@ -12,6 +12,7 @@ void printUsage() {
     std::cout << "  -b kbps    : Floor for the constant bitrate, rounded up to a valid one\n";
     std::cout << "               (implies --cbr; with --cbr the higher of the two wins)\n";
     std::cout << "  --ib       : Print the lowest constant bitrate this file fits in, and exit\n";
+    std::cout << "  --keep-crc : Keep (and recompute) the frame CRC where the input had one\n";
     std::cout << "  -v         : Verbose output (default: silent on success)\n";
 }
 int main(int argc, const char* argv[]) {
@@ -19,6 +20,7 @@ int main(int argc, const char* argv[]) {
     bool verbose = false;
     bool constant_bitrate = false;
     bool report_bitrate = false;
+    bool keep_crc = false;
     int min_bitrate = 0;
     int num_threads = 0;
     std::filesystem::path input;
@@ -36,6 +38,9 @@ int main(int argc, const char* argv[]) {
             recompress_huffman = true;
         } else if (arg == "-v") {
             verbose = true;
+        } else if (arg == "--keep-crc") {
+            keep_crc = true;
+
         } else if (arg == "--cbr") {
             constant_bitrate = true;
         } else if (arg == "--ib") {
@@ -88,6 +93,7 @@ int main(int argc, const char* argv[]) {
         packer.constant_bitrate = constant_bitrate;
         packer.min_bitrate_kbps = min_bitrate;
         packer.report_bitrate_only = report_bitrate;
+        packer.keep_crc = keep_crc;
 
         int chosen_bitrate = 0;
         packer.process(input.string(), output.string(), &chosen_bitrate);
