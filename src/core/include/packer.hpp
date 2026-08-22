@@ -50,6 +50,17 @@ public:
     bool keep_crc = false;
 
     /**
+     * @brief Keep the Xing/Info frame as it arrived, patching only its numeric fields.
+     *
+     * By default the frame is rebuilt around the fields we understand and shrunk to
+     * the smallest bitrate that holds them, which drops any trailing extension we do
+     * not recognise. With this set it keeps its original length and its full
+     * contents; only the byte count and the seek table, which the repack genuinely
+     * changes, are written over.
+     */
+    bool preserve_xing = false;
+
+    /**
      * @brief Work out the constant bitrate but write nothing.
      *
      * @ref process still parses and repacks — the answer comes out of that same

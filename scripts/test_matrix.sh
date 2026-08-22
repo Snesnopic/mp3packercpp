@@ -133,6 +133,32 @@ check_case() {
         fi
     fi
 
+    # Xing fidelity: --preserve-xing must keep the frame and its tag the length they
+    # arrived at, where the default is free to shrink them around the fields it knows.
+    # Either way the LAME checksums must describe what was actually written.
+    local xing_status="ok" xing_out="$WORKDIR/out_xing.mp3" pcm_xing="$WORKDIR/pcm_xing.f32"
+    local src_x; src_x="$(xing_report "$src")"
+    if [ "$(echo "$d_noz $d_t1" | tr -d ' 0')" = "" ] && [ "$(echo "$src_x" | cut -d' ' -f1)" != "0" ]; then
+        local def_x; def_x="$(xing_report "$out_t1")"
+        if [ "$(echo "$def_x" | cut -d' ' -f3)" = "bad" ]; then
+            xing_status="default output has stale LAME checksums"
+        elif ! "$BIN" -z --preserve-xing "$src" "$xing_out" >/dev/null 2>&1; then
+            xing_status="--preserve-xing pack failed"
+        elif ! ffmpeg -y -v error -i "$xing_out" -f f32le "$pcm_xing" 2>/dev/null; then
+            xing_status="--preserve-xing output failed to decode"
+        else
+            local d_x; d_x="$(pcm_diff "$orig_pcm" "$pcm_xing")"
+            local out_x; out_x="$(xing_report "$xing_out")"
+            if [ "$d_x" != "0" ]; then
+                xing_status="--preserve-xing $d_x PCM diffs"
+            elif [ "$(echo "$out_x" | cut -d' ' -f3)" = "bad" ]; then
+                xing_status="stale LAME checksums under --preserve-xing"
+            elif [ "$(echo "$out_x" | cut -d' ' -f1,2)" != "$(echo "$src_x" | cut -d' ' -f1,2)" ]; then
+                xing_status="frame/tag was [$src_x], output is [$out_x]"
+            fi
+        fi
+    fi
+
     if [ "$d_noz" != "0" ] || [ "$d_t1" != "0" ] || [ "$d_tn" != "0" ] || [ "$det_ok" != "yes" ]; then
         FAIL=$((FAIL + 1))
         FAILURES+=("$label :: no-z diffs=$d_noz  t1 diffs=$d_t1  tN diffs=$d_tn  t1==tN:$det_ok")
@@ -145,9 +171,59 @@ check_case() {
         FAIL=$((FAIL + 1))
         FAILURES+=("$label :: crc $crc_status")
         echo "FAIL  $label  (crc: $crc_status)"
+    elif [ "$xing_status" != "ok" ]; then
+        FAIL=$((FAIL + 1))
+        FAILURES+=("$label :: xing $xing_status")
+        echo "FAIL  $label  (xing: $xing_status)"
     else
         echo "ok    $label"
     fi
+}
+
+# "<frame0_bytes> <tag_bytes> <lame_crc>" for a file: how long the xing frame and
+# its tag are, and whether the two checksums the LAME extension carries agree with
+# a recomputation ("ok", "bad", or "none" when there is no extension). Those
+# checksums cover the audio and the tag itself, both of which a repack rewrites.
+xing_report() {
+    python3 -c "
+import sys
+d=open(sys.argv[1],'rb').read()
+i=0
+if d[:3]==b'ID3':
+    i=10+(((d[6]&0x7F)<<21)|((d[7]&0x7F)<<14)|((d[8]&0x7F)<<7)|(d[9]&0x7F))
+while i<len(d)-4 and not (d[i]==0xFF and (d[i+1]&0xE0)==0xE0): i+=1
+v1=[0,32,40,48,56,64,80,96,112,128,160,192,224,256,320,0]
+v2=[0,8,16,24,32,40,48,56,64,80,96,112,128,144,160,0]
+ver=(d[i+1]>>3)&3
+tbl=v1 if ver==3 else v2
+mult=144 if ver==3 else 72
+sr=[44100,48000,32000][(d[i+2]>>2)&3]//(1 if ver==3 else (2 if ver==2 else 4))
+size=mult*tbl[(d[i+2]>>4)&0xF]*1000//sr+((d[i+2]>>1)&1)
+fr=d[i:i+size]
+t=max(fr.find(b'Xing'), fr.find(b'Info'))
+if t<0:
+    print(0, 0, 'none'); raise SystemExit
+end=len(d)
+if d[end-128:end-125]==b'TAG': end-=128
+
+def crc(buf):
+    c=0
+    for b in buf:
+        c^=b
+        for _ in range(8): c=(c>>1)^(0xA001 if c&1 else 0)
+    return c
+
+fl=int.from_bytes(fr[t+4:t+8],'big')
+off=t+8
+for m,n in ((1,4),(2,4),(4,100),(8,4)):
+    if fl&m: off+=n
+state='none'
+if off+36<=size and 0x20<=fr[off]<=0x7E:
+    sm=(fr[off+32]<<8)|fr[off+33]
+    st=(fr[off+34]<<8)|fr[off+35]
+    state='ok' if (sm==crc(d[i+size:end]) and st==crc(fr[:off+34])) else 'bad'
+print(size, size-t, state)
+" "$1"
 }
 
 # "<frames> <protected> <bad>" for a file: how many frames carry a CRC, and how

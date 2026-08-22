@@ -195,6 +195,38 @@ struct ChosenBitrate {
     int index;
 };
 
+// The LAME extension carries its own two checksums, and they use a different
+// CRC-16 from the frame one: reflected polynomial, seed 0, stored big-endian.
+// Verified against files written by lame and by ffmpeg's libmp3lame.
+static uint16_t crc16_lame(const uint8_t* data, const size_t size) {
+    uint16_t crc = 0;
+    for (size_t i = 0; i < size; ++i) {
+        crc ^= data[i];
+        for (int bit = 0; bit < 8; ++bit) {
+            crc = (crc & 1) ? static_cast<uint16_t>((crc >> 1) ^ 0xA001) : static_cast<uint16_t>(crc >> 1);
+        }
+    }
+    return crc;
+}
+
+// The payload a frame holds at a bitrate index it already carries, rather than at
+// the smallest index that would fit. Used to keep the xing frame the size it
+// arrived at instead of shrinking it around its tag.
+static ChosenBitrate bitrate_at_index(const MpegVersion version, const uint32_t samplerate,
+                                      const ChannelMode channel_mode, const int index,
+                                      const bool padding, const int crc_size) {
+    static const int mpeg1_bitrates[] = {0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320};
+    static const int mpeg2_bitrates[] = {0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160};
+    const int* bitrates = (version == MpegVersion::MPEG1) ? mpeg1_bitrates : mpeg2_bitrates;
+    const int side_info_size = (version == MpegVersion::MPEG1) ?
+                               (channel_mode == ChannelMode::Mono ? 17 : 32) :
+                               (channel_mode == ChannelMode::Mono ? 9 : 17);
+    const int mult = (version == MpegVersion::MPEG1) ? 144 : 72;
+    const int frame_size = mult * bitrates[index] * 1000 / static_cast<int>(samplerate)
+                           + (padding ? 1 : 0);
+    return {padding, frame_size - 4 - crc_size - side_info_size, index};
+}
+
 static ChosenBitrate bytes_to_bitrate(const MpegVersion version, const uint32_t samplerate,
                                       const ChannelMode channel_mode, const int bytes, const int crc_size) {
     static const int mpeg1_bitrates[] = {0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320};
@@ -415,7 +447,10 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
                             mdr[keep+2] == 'M' && mdr[keep+3] == 'E')
                             keep += 36; // LAME extension tag
                     }
-                    keep = std::min(keep, mdr_size);
+                    // Preserving means copying the tag whole: the fields we know how
+                    // to size are not necessarily all of it, and an extension we do
+                    // not recognise is exactly what trimming would silently drop.
+                    keep = this->preserve_xing ? mdr_size : std::min(keep, mdr_size);
                     optimized_main_data[i] = {b0, b1};
                     optimized_main_data[i].insert(optimized_main_data[i].end(), mdr, mdr + keep);
                 }
@@ -748,6 +783,13 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
             bool padded = false;
             const int frame_size = cbr_frame_size(version, samplerate, cbr_bitrate, cbr_remainder, padded);
             bitrate_use = {padded, frame_size - 4 - crc_size_of(i) - frame_side_info_size, cbr_index};
+        } else if (has_xing && i == 0 && this->preserve_xing) {
+            // Keep the frame the length the encoder gave it. Dropping the crc frees
+            // exactly the two bytes the recovered "Xi"/"In" takes back, so the tag
+            // lands in the same payload it came out of, byte for byte.
+            bitrate_use = bitrate_at_index(version, samplerate, channel_mode,
+                                           all_frames[0].header.bitrate.index,
+                                           all_frames[0].header.bitrate.padding, crc_size_of(i));
         } else if (has_xing && i == 0) {
             // use minimum bitrate that fits the trimmed Xing tag content
             int needed = static_cast<int>(optimized_main_data[0].size());
@@ -957,6 +999,42 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
                 patch(main_data_base + field_offset, toc, 100);
             }
 
+            // The LAME extension ends with a checksum of the audio and a checksum of
+            // the tag itself. Both describe what we have just rewritten — the audio
+            // bytes are new, and the tag checksum covers the header, the side info
+            // and the byte count and seek table patched above — so copying them
+            // through would leave the frame asserting two things that are no longer
+            // true. Order matters: the tag checksum covers the audio one.
+            size_t lame_off = 8;
+            if (flags & 1) lame_off += 4;
+            if (flags & 2) lame_off += 4;
+            if (flags & 4) lame_off += 100;
+            if (flags & 8) lame_off += 4;
+            const size_t lame_pos = main_data_base + lame_off;
+            // The extension opens with a vendor string, and the vendor is not always
+            // lame: ffmpeg writes "Lavc"/"Lavf" into the same 36-byte block. Matching
+            // on "LAME" would have skipped every file ffmpeg encoded, so presence is
+            // judged on the block being there and starting with printable text —
+            // a frame with no extension has zero padding at that offset instead.
+            const auto printable = [&](const size_t at) {
+                return out_bytes[at] >= 0x20 && out_bytes[at] <= 0x7E;
+            };
+            if (lame_pos + 36 <= out_bytes.size() && lame_pos + 36 <= mp3_end_pos &&
+                printable(lame_pos) && printable(lame_pos + 1) &&
+                printable(lame_pos + 2) && printable(lame_pos + 3)) {
+                if (!audio_frame_file_pos.empty() && audio_frame_file_pos[0] < mp3_end_pos) {
+                    const size_t audio_start = audio_frame_file_pos[0];
+                    const uint16_t music = crc16_lame(out_bytes.data() + audio_start,
+                                                      mp3_end_pos - audio_start);
+                    const uint8_t mb[2] = {static_cast<uint8_t>(music >> 8), static_cast<uint8_t>(music & 0xFF)};
+                    patch(lame_pos + 32, mb, 2);
+                }
+                const size_t tag_crc_pos = lame_pos + 34;
+                const uint16_t tag = crc16_lame(out_bytes.data() + xing_header_file_pos,
+                                                tag_crc_pos - xing_header_file_pos);
+                const uint8_t tb[2] = {static_cast<uint8_t>(tag >> 8), static_cast<uint8_t>(tag & 0xFF)};
+                patch(tag_crc_pos, tb, 2);
+            }
         }
     }
 
