@@ -12,6 +12,8 @@
 #include <stdexcept>
 #include <atomic>
 #include <cstring>
+#include <filesystem>
+#include <random>
 #include <thread>
 
 namespace mp3packer {
@@ -227,6 +229,43 @@ static ChosenBitrate bytes_to_bitrate(const MpegVersion version, const uint32_t 
                          (144 * max_br * 1000 / static_cast<int>(samplerate)) + 1 :
                          (72 * max_br * 1000 / static_cast<int>(samplerate)) + 1;
     return {true, max_frame_size - 4 - side_info_size, 14};
+}
+
+// Writes the finished file through a temporary in the same directory and renames it
+// into place. The rename is the only step that touches the destination, so an
+// interrupted or failed run cannot leave a half-written file behind — and repacking
+// a file onto itself is safe, since the input was read into memory long before.
+static void write_file_atomically(const std::string& path, const std::vector<uint8_t>& bytes) {
+    namespace fs = std::filesystem;
+    const fs::path target(path);
+
+    // Same directory keeps the rename on one filesystem, which is what makes it
+    // atomic; a temp in /tmp could land on another and degrade to a copy.
+    std::random_device entropy;
+    fs::path temp = target;
+    temp += ".mp3packer-" + std::to_string(entropy()) + ".tmp";
+
+    {
+        std::ofstream out(temp, std::ios::binary);
+        if (!out) {
+            throw std::runtime_error("Could not open output file: " + path);
+        }
+        out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+        out.close();
+        if (!out) {
+            std::error_code ignored;
+            fs::remove(temp, ignored);
+            throw std::runtime_error("Could not write output file: " + path);
+        }
+    }
+
+    std::error_code ec;
+    fs::rename(temp, target, ec);
+    if (ec) {
+        std::error_code ignored;
+        fs::remove(temp, ignored);
+        throw std::runtime_error("Could not replace output file: " + path + ": " + ec.message());
+    }
 }
 
 // The bitrate table for a version, as indices into the frame header's 4-bit field.
@@ -557,15 +596,9 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
     
     DEBUG_LOG("Reservoir carryover calculated. Writing output stream...");
     
-    // Opened lazily: report_bitrate_only writes nothing, and asking for a bitrate
-    // should not require naming (or creating) an output file.
-    std::ofstream out;
-    if (!this->report_bitrate_only) {
-        out.open(output_file, std::ios::binary);
-        if (!out) {
-            throw std::runtime_error("Could not open output file: " + output_file);
-        }
-    }
+    // Nothing is opened here: the output is assembled in memory and written at the
+    // end through a temporary file, so an interrupted run leaves the destination
+    // exactly as it was.
 
     // The file is assembled in memory and written once at the end. Writing it
     // frame by frame meant three stream writes per frame, and the Xing patch-up
@@ -878,10 +911,7 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
         }
     }
 
-    out.write(reinterpret_cast<const char*>(out_bytes.data()), static_cast<std::streamsize>(out_bytes.size()));
-    if (!out) {
-        throw std::runtime_error("Could not write output file: " + output_file);
-    }
+    write_file_atomically(output_file, out_bytes);
 }
 
 } // namespace mp3packer

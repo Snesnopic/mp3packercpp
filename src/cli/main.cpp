@@ -5,6 +5,7 @@
 
 void printUsage() {
     std::cout << "Usage: mp3packercpp [-z] [-t threads] [--cbr] [-b kbps] [--ib] [-v] <input.mp3> [output.mp3]\n";
+    std::cout << "  Without output.mp3 the input is repacked in place.\n";
     std::cout << "  -z         : Recompress frames to find optimal Huffman settings\n";
     std::cout << "  -t threads : Number of threads to use (default: auto)\n";
     std::cout << "  --cbr      : Constant-bitrate output at the lowest bitrate that fits\n";
@@ -66,10 +67,16 @@ int main(int argc, const char* argv[]) {
         }
     }
 
-    // --ib answers a question about the input, so it takes no output file
-    if (input.empty() || (output.empty() && !report_bitrate)) {
+    if (input.empty()) {
         printUsage();
         return EXIT_FAILURE;
+    }
+    // --ib answers a question about the input and writes nothing; otherwise a
+    // missing output means repacking in place, which is safe because the output
+    // is written through a temporary and renamed over the input only once it is
+    // complete.
+    if (output.empty() && !report_bitrate) {
+        output = input;
     }
 
     mp3packer::Logger::verbose = verbose;
