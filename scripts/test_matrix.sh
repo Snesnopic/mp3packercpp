@@ -80,13 +80,69 @@ check_case() {
     local det_ok="yes"
     cmp -s "$out_t1" "$out_tn" || det_ok="no"
 
+    # Constant-bitrate output: lossless like the rest, and actually constant —
+    # every frame carrying the same bitrate index, which is the whole point of
+    # the mode and the thing a caller would notice if the search picked a
+    # bitrate some frame does not fit in.
+    local cbr_status="ok" cbr_out="$WORKDIR/out_cbr.mp3" pcm_cbr="$WORKDIR/pcm_cbr.f32"
+    local reported=""
+    if ! reported="$("$BIN" --ib -z "$src" 2>/dev/null)"; then
+        cbr_status="--ib failed"
+    elif ! "$BIN" --cbr -z "$src" "$cbr_out" >/dev/null 2>&1; then
+        cbr_status="pack failed"
+    elif ! ffmpeg -y -v error -i "$cbr_out" -f f32le "$pcm_cbr" 2>/dev/null; then
+        cbr_status="output failed to decode"
+    else
+        local d_cbr; d_cbr="$(pcm_diff "$orig_pcm" "$pcm_cbr")"
+        [ "$d_cbr" = "0" ] || cbr_status="$d_cbr PCM diffs"
+        local seen; seen="$(frame_bitrates "$cbr_out")"
+        if [ "$(echo "$seen" | wc -w | tr -d ' ')" != "1" ]; then
+            cbr_status="bitrate not constant: $seen"
+        elif [ -n "$reported" ] && [ "$seen" != "$reported" ]; then
+            cbr_status="--ib said $reported but output is $seen"
+        fi
+    fi
+
     if [ "$d_noz" != "0" ] || [ "$d_t1" != "0" ] || [ "$d_tn" != "0" ] || [ "$det_ok" != "yes" ]; then
         FAIL=$((FAIL + 1))
         FAILURES+=("$label :: no-z diffs=$d_noz  t1 diffs=$d_t1  tN diffs=$d_tn  t1==tN:$det_ok")
         echo "FAIL  $label  (no-z=$d_noz t1=$d_t1 tN=$d_tn t1==tN:$det_ok)"
+    elif [ "$cbr_status" != "ok" ]; then
+        FAIL=$((FAIL + 1))
+        FAILURES+=("$label :: cbr $cbr_status")
+        echo "FAIL  $label  (cbr: $cbr_status)"
     else
         echo "ok    $label"
     fi
+}
+
+# The distinct bitrates the frames of a file carry, as a space-separated list.
+frame_bitrates() {
+    python3 -c "
+import sys
+d=open(sys.argv[1],'rb').read()
+i=0
+if d[:3]==b'ID3':
+    i=10+(((d[6]&0x7F)<<21)|((d[7]&0x7F)<<14)|((d[8]&0x7F)<<7)|(d[9]&0x7F))
+v1=[0,32,40,48,56,64,80,96,112,128,160,192,224,256,320,0]
+v2=[0,8,16,24,32,40,48,56,64,80,96,112,128,144,160,0]
+rates=[44100,48000,32000]
+seen=[]
+while i < len(d)-4:
+    if d[i]==0xFF and (d[i+1]&0xE0)==0xE0:
+        ver=(d[i+1]>>3)&3
+        if ver==1: i+=1; continue
+        tbl = v1 if ver==3 else v2
+        mult = 144 if ver==3 else 72
+        sr = rates[(d[i+2]>>2)&3] // (1 if ver==3 else (2 if ver==2 else 4))
+        br = tbl[(d[i+2]>>4)&0xF]; pad=(d[i+2]>>1)&1
+        if br==0 or sr==0: i+=1; continue
+        if br not in seen: seen.append(br)
+        i += mult*br*1000//sr + pad
+    else:
+        i += 1
+print(' '.join(str(b) for b in sorted(seen)))
+" "$1"
 }
 
 echo "== generating corpus in $WORKDIR =="
