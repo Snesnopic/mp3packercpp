@@ -94,3 +94,45 @@ jobs:
         else
           echo "SUCCESS: MP3 structure and CRCs are valid."
         fi
+
+  # The deeper suites, in their own job so they run alongside the matrix rather
+  # than after it: between them they take longer than everything else here.
+  #
+  # Both were written before there was any CI to run them in, and every bug in
+  # this project's history was found by one of these scripts being run by hand —
+  # #10 by the randomised corpus, and #12 shipped in a release precisely because
+  # nothing automated ran them.
+  deep_validation:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v7
+
+    - name: Set up CMake
+      uses: jwlawson/actions-setup-cmake@v1.13
+      with:
+        cmake-version: '3.21.x'
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        # mpg123 on top of the usual three: test_regression.sh checks losslessness
+        # through three independent decoders, because one decoder proves less than
+        # it looks — a wrong Xing tag changes ffmpeg's gapless trimming and leaves
+        # mpg123 unmoved.
+        sudo apt-get install -y lame ffmpeg mp3val mpg123
+
+    - name: Build mp3packercpp
+      run: |
+        cmake -B build -DCMAKE_BUILD_TYPE=Release
+        cmake --build build -j $(nproc)
+
+    - name: Cross-decoder regression suite
+      run: bash scripts/test_regression.sh build/bin/mp3packercpp
+
+    # The seed rotates with the run number, so successive pushes explore different
+    # corners instead of re-testing one fixed corpus forever. The script prints the
+    # seed it used, and passing that seed back reproduces the exact corpus locally.
+    - name: Randomised corpus
+      run: bash scripts/test_random.sh build/bin/mp3packercpp 60 ${{ github.run_number }}
