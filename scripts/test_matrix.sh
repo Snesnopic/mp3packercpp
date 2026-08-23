@@ -275,6 +275,32 @@ print(frames, protected, bad)
 " "$1"
 }
 
+# How many frames the file is, if every frame's declared length lands exactly on
+# the next one's sync word from the first to the end; 0 if the chain breaks.
+chain_length() {
+    python3 -c "
+import sys
+d=open(sys.argv[1],'rb').read()
+i=0
+if d[:3]==b'ID3':
+    i=10+(((d[6]&0x7F)<<21)|((d[7]&0x7F)<<14)|((d[8]&0x7F)<<7)|(d[9]&0x7F))
+end=len(d)
+if end>=128 and d[end-128:end-125]==b'TAG': end-=128
+v1=[0,32,40,48,56,64,80,96,112,128,160,192,224,256,320,0]
+v2=[0,8,16,24,32,40,48,56,64,80,96,112,128,144,160,0]
+n=0
+while i+4<=end:
+    if d[i]!=0xFF or (d[i+1]&0xE0)!=0xE0: print(0); raise SystemExit
+    ver=(d[i+1]>>3)&3; lay=(d[i+1]>>1)&3; bi=(d[i+2]>>4)&0xF; ri=(d[i+2]>>2)&3
+    if ver==1 or lay!=1 or bi in (0,15) or ri==3: print(0); raise SystemExit
+    br=(v1 if ver==3 else v2)[bi]
+    rate=[44100,48000,32000][ri]//(1 if ver==3 else (2 if ver==2 else 4))
+    i+=(144 if ver==3 else 72)*br*1000//rate+((d[i+2]>>1)&1)
+    n+=1
+print(n if i==end else 0)
+" "$1"
+}
+
 # The distinct bitrates the frames of a file carry, as a space-separated list.
 frame_bitrates() {
     python3 -c "
@@ -385,6 +411,55 @@ for content in dup-sine lr-sines pink-noise mono-noise; do
             fi
             check_case "$label" "$mp3"
         done
+    done
+done
+
+# Streams that change channel count partway through. No encoder emits one, but
+# concatenating two files does, and the packer used to size every frame's side
+# info from frame 0's channel mode — so a stereo frame in a mono stream came out
+# eight bytes shorter than its own header declared and every frame after it lost
+# sync. Same shape as the per-frame stereo mode bug (#12), one field over; found
+# by the fuzzer. The check is structural: frames in must equal frames out, with
+# each frame's declared length landing exactly on the next one's sync word.
+echo ""
+echo "== concatenated streams (channel count changes mid-file) =="
+for rate in 44100 22050 11025; do
+    for order in "mono stereo" "stereo mono" "mono stereo mono"; do
+        parts=""
+        idx=0
+        for mode in $order; do
+            src="$WORKDIR/cat_${rate}_${idx}.mp3"
+            ch=$([ "$mode" = "mono" ] && echo 1 || echo 2)
+            # No tags and no Xing frame on the parts: ffmpeg writes an ID3v2 header
+            # at the start of each, and one landing in the middle of the joined file
+            # would break the chain before the packer ever saw it — the test would
+            # then be failing on its own fixture.
+            ffmpeg -y -v error -f lavfi -i "sine=frequency=$((300 + idx * 220)):duration=1:sample_rate=$rate" \
+                   -ac "$ch" -c:a libmp3lame -b:a 96k -write_xing 0 -id3v2_version 0 \
+                   -map_metadata -1 "$src" 2>/dev/null || continue
+            parts="$parts $src"
+            idx=$((idx + 1))
+        done
+        joined="$WORKDIR/joined_${rate}_$(echo "$order" | tr ' ' '-').mp3"
+        cat $parts > "$joined" 2>/dev/null || continue
+        TOTAL=$((TOTAL + 1))
+        label="concat/${rate}Hz/$(echo "$order" | tr ' ' '+')"
+        before="$(chain_length "$joined")"
+        ok=yes
+        if [ "$before" = "0" ]; then ok="the joined fixture is not an unbroken chain"; fi
+        [ "$ok" = "yes" ] || { FAIL=$((FAIL + 1)); FAILURES+=("$label :: $ok"); echo "FAIL  $label  ($ok)"; continue; }
+        for flags in "" "-z"; do
+            out="$WORKDIR/joined_out.mp3"
+            if ! $BIN $flags "$joined" "$out" >/dev/null 2>&1; then ok="pack failed$flags"; break; fi
+            after="$(chain_length "$out")"
+            if [ "$after" = "0" ]; then ok="output is not an unbroken chain ($flags)"; break; fi
+            if [ "$after" != "$before" ]; then ok="$before frames in, $after out ($flags)"; break; fi
+        done
+        if [ "$ok" = "yes" ]; then
+            echo "ok    $label  ($before frames, chain intact)"
+        else
+            FAIL=$((FAIL + 1)); FAILURES+=("$label :: $ok"); echo "FAIL  $label  ($ok)"
+        fi
     done
 done
 
