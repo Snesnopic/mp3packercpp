@@ -446,8 +446,16 @@ void HuffmanOptimizer::decode_quantized_coefficients(
         r1_pairs = std::max(0, static_cast<int>(config.big_values) - region0);
         r2_pairs = 0;
     } else {
-        r0_pairs = std::min(static_cast<int>(config.big_values), sf_bands[config.region0_count + 1] / 2);
-        r1_pairs = std::min(static_cast<int>(config.big_values), sf_bands[config.region0_count + config.region1_count + 2] / 2) - r0_pairs;
+        // region0_count is 4 bits and region1_count 3, so their sum plus two reaches
+        // 24 while the table holds 23 boundaries. A real decoder never indexes a
+        // boundary table at all — minimp3 walks the bands counting region_count of
+        // them and stops when big_values runs out — so a count past the last band
+        // simply means "the rest". Clamping to the last boundary (576, i.e. 288
+        // pairs, at least big_values) reproduces exactly that.
+        const int r0_edge = std::min(config.region0_count + 1, kNumBands - 1);
+        const int r1_edge = std::min(config.region0_count + config.region1_count + 2, kNumBands - 1);
+        r0_pairs = std::min(static_cast<int>(config.big_values), sf_bands[r0_edge] / 2);
+        r1_pairs = std::min(static_cast<int>(config.big_values), sf_bands[r1_edge] / 2) - r0_pairs;
         r2_pairs = static_cast<int>(config.big_values) - r0_pairs - r1_pairs;
     }
 
@@ -1386,8 +1394,16 @@ void HuffmanOptimizer::encode_quantized_coefficients(
         r1_pairs = std::max(0, static_cast<int>(config.big_values) - region0);
         r2_pairs = 0;
     } else {
-        r0_pairs = std::min(static_cast<int>(config.big_values), sf_bands[config.region0_count + 1] / 2);
-        r1_pairs = std::min(static_cast<int>(config.big_values), sf_bands[config.region0_count + config.region1_count + 2] / 2) - r0_pairs;
+        // region0_count is 4 bits and region1_count 3, so their sum plus two reaches
+        // 24 while the table holds 23 boundaries. A real decoder never indexes a
+        // boundary table at all — minimp3 walks the bands counting region_count of
+        // them and stops when big_values runs out — so a count past the last band
+        // simply means "the rest". Clamping to the last boundary (576, i.e. 288
+        // pairs, at least big_values) reproduces exactly that.
+        const int r0_edge = std::min(config.region0_count + 1, kNumBands - 1);
+        const int r1_edge = std::min(config.region0_count + config.region1_count + 2, kNumBands - 1);
+        r0_pairs = std::min(static_cast<int>(config.big_values), sf_bands[r0_edge] / 2);
+        r1_pairs = std::min(static_cast<int>(config.big_values), sf_bands[r1_edge] / 2) - r0_pairs;
         r2_pairs = static_cast<int>(config.big_values) - r0_pairs - r1_pairs;
     }
 

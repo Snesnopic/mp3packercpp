@@ -213,29 +213,28 @@ static uint16_t crc16_lame(const uint8_t* data, const size_t size) {
 // the smallest index that would fit. Used to keep the xing frame the size it
 // arrived at instead of shrinking it around its tag.
 static ChosenBitrate bitrate_at_index(const MpegVersion version, const uint32_t samplerate,
-                                      const ChannelMode channel_mode, const int index,
+                                      const int side_info_size, const int index,
                                       const bool padding, const int crc_size) {
     static const int mpeg1_bitrates[] = {0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320};
     static const int mpeg2_bitrates[] = {0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160};
     const int* bitrates = (version == MpegVersion::MPEG1) ? mpeg1_bitrates : mpeg2_bitrates;
-    const int side_info_size = (version == MpegVersion::MPEG1) ?
-                               (channel_mode == ChannelMode::Mono ? 17 : 32) :
-                               (channel_mode == ChannelMode::Mono ? 9 : 17);
     const int mult = (version == MpegVersion::MPEG1) ? 144 : 72;
     const int frame_size = mult * bitrates[index] * 1000 / static_cast<int>(samplerate)
                            + (padding ? 1 : 0);
     return {padding, frame_size - 4 - crc_size - side_info_size, index};
 }
 
+// The side info size is passed in rather than derived from a file-level channel
+// mode: mono and stereo frames can sit in the same stream — concatenating two
+// files is enough — and sizing a stereo frame's payload as if its side info were
+// a mono one emits a frame whose length disagrees with its own header, which
+// desynchronises everything after it. Same lesson as bug #12, one field over.
 static ChosenBitrate bytes_to_bitrate(const MpegVersion version, const uint32_t samplerate,
-                                      const ChannelMode channel_mode, const int bytes, const int crc_size) {
+                                      const int side_info_size, const int bytes, const int crc_size) {
     static const int mpeg1_bitrates[] = {0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320};
     static const int mpeg2_bitrates[] = {0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160};
     
     const int* bitrates = (version == MpegVersion::MPEG1) ? mpeg1_bitrates : mpeg2_bitrates;
-    const int side_info_size = (version == MpegVersion::MPEG1) ?
-                         (channel_mode == ChannelMode::Mono ? 17 : 32) :
-                         (channel_mode == ChannelMode::Mono ? 9 : 17);
     // A kept CRC costs two bytes of every frame's payload.
     const int overhead = 4 + crc_size + side_info_size;
 
@@ -616,8 +615,16 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
 
         std::vector<uint8_t> new_main = writer.data();
         if (optimization_failed || new_main.size() >= static_cast<size_t>(total_orig_bytes)) {
-            // fallback: no improvement or failure — preserve original side_info bits via patch_mdb
-            new_main.assign(global_res.begin() + start_byte, global_res.begin() + start_byte + total_orig_bytes);
+            // fallback: no improvement or failure — preserve original side_info bits via patch_mdb.
+            // The length comes from the side info's part2_3 fields, which on a
+            // malformed file can claim more than the stream actually holds; what is
+            // missing is zero-filled, the same answer the reservoir already gives a
+            // frame whose payload the file truncates.
+            const size_t want = static_cast<size_t>(total_orig_bytes);
+            const size_t have = std::min(want, global_res.size() - start_byte);
+            new_main.assign(global_res.begin() + static_cast<ptrdiff_t>(start_byte),
+                            global_res.begin() + static_cast<ptrdiff_t>(start_byte + have));
+            new_main.resize(want, 0x00);
             frame.side_info = side_copy;
         } else {
             // strictly smaller: use compressed data and re-serialize updated side_info
@@ -684,6 +691,10 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
     // the side info on a protected frame. The payload we rebuild normalises that to
     // start at main_data[0], which only lands where readers look if no crc follows
     // the header. It carries no audio, so it simply never gets one.
+    const auto side_info_of = [&](const size_t index) {
+        return static_cast<int>(all_frames[index].side_info_size);
+    };
+
     const auto crc_size_of = [&](const size_t index) {
         if (has_xing && index == 0) return 0;
         return (this->keep_crc && all_frames[index].header.has_crc) ? 2 : 0;
@@ -696,7 +707,7 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
         int space_needed = static_cast<int>(optimized_main_data[i].size()) + current_req;
         
         // we allow the forward pass to use up to 320 kbps if needed, so the backward pass should assume max capacity.
-        ChosenBitrate max_br = bytes_to_bitrate(version, samplerate, channel_mode, 9999, crc_size_of(static_cast<size_t>(i)));
+        ChosenBitrate max_br = bytes_to_bitrate(version, samplerate, side_info_of(static_cast<size_t>(i)), 9999, crc_size_of(static_cast<size_t>(i)));
         int max_data_per_frame = max_br.data_size;
         
         current_req = std::max(0, space_needed - max_data_per_frame);
@@ -712,9 +723,6 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
     int current_reservoir = 0; // free space in past payloads
 
     const int max_reservoir_bytes = (version == MpegVersion::MPEG1) ? 511 : 255;
-    const int frame_side_info_size = (version == MpegVersion::MPEG1)
-                                     ? (channel_mode == ChannelMode::Mono ? 17 : 32)
-                                     : (channel_mode == ChannelMode::Mono ?  9 : 17);
 
     // --- constant bitrate ---------------------------------------------------
     //
@@ -730,7 +738,7 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
         for (size_t i = 0; i < N; ++i) {
             bool padded = false;
             const int data_size = cbr_frame_size(version, samplerate, bitrate_kbps, remainder, padded)
-                                  - 4 - crc_size_of(i) - frame_side_info_size;
+                                  - 4 - crc_size_of(i) - side_info_of(i);
             if (data_size < 0) return false;
             const int needed = static_cast<int>(optimized_main_data[i].size());
             if (has_xing && i == 0) {
@@ -782,22 +790,22 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
         if (cbr_bitrate != 0) {
             bool padded = false;
             const int frame_size = cbr_frame_size(version, samplerate, cbr_bitrate, cbr_remainder, padded);
-            bitrate_use = {padded, frame_size - 4 - crc_size_of(i) - frame_side_info_size, cbr_index};
+            bitrate_use = {padded, frame_size - 4 - crc_size_of(i) - side_info_of(i), cbr_index};
         } else if (has_xing && i == 0 && this->preserve_xing) {
             // Keep the frame the length the encoder gave it. Dropping the crc frees
             // exactly the two bytes the recovered "Xi"/"In" takes back, so the tag
             // lands in the same payload it came out of, byte for byte.
-            bitrate_use = bitrate_at_index(version, samplerate, channel_mode,
+            bitrate_use = bitrate_at_index(version, samplerate, side_info_of(0),
                                            all_frames[0].header.bitrate.index,
                                            all_frames[0].header.bitrate.padding, crc_size_of(i));
         } else if (has_xing && i == 0) {
             // use minimum bitrate that fits the trimmed Xing tag content
             int needed = static_cast<int>(optimized_main_data[0].size());
-            bitrate_use = bytes_to_bitrate(version, samplerate, channel_mode, needed, crc_size_of(i));
+            bitrate_use = bytes_to_bitrate(version, samplerate, side_info_of(i), needed, crc_size_of(i));
         } else {
             int req_for_next = (i + 1 < N) ? required_carryover[i + 1] : 0;
             int bytes_needed = std::max(0, static_cast<int>(optimized_main_data[i].size()) + req_for_next - current_reservoir);
-            bitrate_use = bytes_to_bitrate(version, samplerate, channel_mode, bytes_needed, crc_size_of(i));
+            bitrate_use = bytes_to_bitrate(version, samplerate, side_info_of(i), bytes_needed, crc_size_of(i));
         }
 
         int data_size = bitrate_use.data_size;

@@ -211,7 +211,12 @@ std::optional<Mp3Frame> Mp3Reader::read_next_frame() {
             for (int ch = 0; ch < num_channels; ++ch) {
                 auto& gi = si.gr[gr][ch];
                 gi.part2_3_length    = static_cast<uint16_t>(side_reader.read_bits(12));
-                gi.big_values        = static_cast<uint16_t>(side_reader.read_bits(9));
+                // The field is nine bits wide but only 288 pairs fit in a granule's
+                // 576 coefficients, and nothing in the bitstream prevents a larger
+                // value being written. Real decoders clamp it — minimp3 does so
+                // explicitly — and so must we: the coder walks the coefficient array
+                // by pair count, and an unclamped 511 would walk off the end of it.
+                gi.big_values        = std::min<uint16_t>(static_cast<uint16_t>(side_reader.read_bits(9)), 288);
                 gi.global_gain       = static_cast<uint8_t>(side_reader.read_bits(8));
                 gi.scalefac_compress = static_cast<uint16_t>(
                     side_reader.read_bits((header->version == MpegVersion::MPEG1) ? 4 : 9));
