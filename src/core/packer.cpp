@@ -409,6 +409,20 @@ static int cbr_frame_size(const MpegVersion version, const uint32_t samplerate,
     return base + (padded ? 1 : 0);
 }
 
+// The length of the Layer III frame whose header starts at p, with the version and
+// sample-rate fields it carries, or a zero length if p does not start one.
+struct RawHeader { size_t size; int version; int rate; };
+static RawHeader raw_header(const uint8_t* p, const size_t avail) {
+    if (avail < 4 || p[0] != 0xFF || (p[1] & 0xE0) != 0xE0) return {0, 0, 0};
+    const int version = (p[1] >> 3) & 3, layer = (p[1] >> 1) & 3;
+    const int bitrate = (p[2] >> 4) & 0xF, rate = (p[2] >> 2) & 3;
+    if (version == 1 || layer != 1 || bitrate == 0 || bitrate == 15 || rate == 3) return {0, 0, 0};
+    static const int rates[3] = {44100, 48000, 32000};
+    const int* table = bitrate_table_for(version == 3 ? MpegVersion::MPEG1 : MpegVersion::MPEG2);
+    const int hz = rates[rate] / (version == 3 ? 1 : (version == 2 ? 2 : 4));
+    return {static_cast<size_t>((version == 3 ? 144 : 72) * table[bitrate] * 1000 / hz + ((p[2] >> 1) & 1)), version, rate};
+}
+
 void Packer::process(const std::string& input_file, const std::string& output_file,
                      int* out_bitrate_kbps) const {
     DEBUG_LOG("Reading input file " << input_file << "...");
@@ -439,6 +453,37 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
     const bool has_vbri = !has_xing && is_vbri_frame(all_frames[0], file);
     const bool has_tag_frame = has_xing || has_vbri;
 
+    // The reader stops at the first thing that is not a frame and passes the rest
+    // through untouched. When that is a trailing tag, nothing depends on it. When
+    // audio resumes after it — a damaged frame, a second file's tag in a
+    // concatenation — the first frame there reaches back main_data_begin bytes into
+    // the reservoir it inherits, and the repack had rewritten that reservoir: those
+    // frames decoded differently afterwards, thousands of samples' worth. Three
+    // frames in a row count as audio, so a sync-like pair inside a trailing tag's
+    // picture is not mistaken for any.
+    std::vector<size_t> tail_frames;          // offsets into the end junk
+    size_t tail_reach = 0;
+    {
+        const auto& junk = reader.get_end_junk();
+        const uint8_t* f0 = file.data() + frame_start_of(all_frames[0]);
+        const RawHeader stream = raw_header(f0, 4);
+        for (size_t at = 0; at + 4 <= junk.size() && tail_frames.empty(); ++at) {
+            if (junk[at] != 0xFF) continue;
+            std::vector<size_t> run;
+            for (size_t w = at;;) {
+                const RawHeader h = raw_header(junk.data() + w, junk.size() - w);
+                if (!h.size || h.version != stream.version || h.rate != stream.rate || w + h.size > junk.size()) break;
+                run.push_back(w);
+                w += h.size;
+            }
+            if (run.size() < 3) continue;
+            tail_frames = run;
+            const size_t side = at + 4 + ((junk[at + 1] & 1) ? 0 : 2);
+            tail_reach = stream.version == 3 ? static_cast<size_t>(junk[side] << 1 | junk[side + 1] >> 7)
+                                              : static_cast<size_t>(junk[side]);
+        }
+    }
+    
     size_t N = all_frames.size();
     DEBUG_LOG("Optimizing " << N << " audio frames...");
 
@@ -789,10 +834,73 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
         return (this->keep_crc && all_frames[index].header.has_crc) ? 2 : 0;
     };
 
+    // When the frames after a break reach back into the reservoir, what they find
+    // has to be what they found before, for every decoder — and decoders differ in
+    // what they keep across a break, how long the kept region may be, and how they
+    // conceal a reach it cannot satisfy. The only arrangement that is the same for
+    // all of them is the same bytes: so the last stretch before the break is copied
+    // as it arrived, frames and all, from a frame F onwards. F's own back-reference
+    // (K bytes) is the one seam, and it is met by closing the repacked part with
+    // those K original bytes as ancillary data. F is chosen near the break with the
+    // seam workable: the repacked part's unconsumed bytes, which is what a decoder
+    // carries into F, must stay within the 511 every decoder keeps whole. Failing
+    // every candidate, F is the first audio frame and the head is not repacked.
+    size_t n_lay = N;          // frames laid out afresh; [n_lay, N) go through as they arrived
+    size_t glue = 0;           // original bytes closing the repacked part, for F to reach back into
+    const int reservoir_cap = (version == MpegVersion::MPEG1) ? 511 : 255;
+    const auto unconsumed_after = [&](const size_t end, const size_t extra) {
+        std::vector<int> req(end + 1, 0);
+        for (size_t k = end; k-- > 0;) {
+            const int need = static_cast<int>(optimized_main_data[k].size() + (k + 1 == end ? extra : 0)) + req[k + 1];
+            req[k] = std::max(0, need - bytes_to_bitrate(version, samplerate, side_info_of(k), 9999, crc_size_of(k)).data_size);
+        }
+        int r = 0, mdb_last = 0, excess_last = 0;
+        for (size_t k = 0; k < end; ++k) {
+            const int n = static_cast<int>(optimized_main_data[k].size() + (k + 1 == end ? extra : 0));
+            if (has_vbri && k == 0) continue;
+            int d;
+            if (has_xing && k == 0) {
+                d = this->preserve_xing
+                    ? bitrate_at_index(version, samplerate, side_info_of(0), all_frames[0].header.bitrate.index,
+                                       all_frames[0].header.bitrate.padding, crc_size_of(0)).data_size
+                    : bytes_to_bitrate(version, samplerate, side_info_of(0), n, crc_size_of(0)).data_size;
+            } else {
+                d = bytes_to_bitrate(version, samplerate, side_info_of(k), std::max(0, n + req[k + 1] - r), crc_size_of(k)).data_size;
+            }
+            if (k + 1 == end) mdb_last = r;
+            int projected = r + d - n;
+            if (projected > reservoir_cap) {
+                if (k + 1 == end) excess_last = projected - reservoir_cap;
+                projected = reservoir_cap;
+            }
+            r = (has_xing && k == 0) ? 0 : projected;
+        }
+        const int moved = end >= 2 ? std::min(r, mdb_last) : 0;
+        return excess_last + r - moved + static_cast<int>(extra);
+    };
+    if (tail_reach > 0) {
+        const size_t first_audio = has_tag_frame ? 1 : 0;
+        n_lay = first_audio;
+        // a constant bitrate cannot be held across frames copied at their own sizes
+        if (!(this->constant_bitrate || this->min_bitrate_kbps > 0)) {
+            for (size_t f = N - 1; f > first_audio && f + 64 >= N; --f) {
+                const size_t k = all_frames[f].side_info.main_data_begin;   // still the input's
+                if (k > frame_main_starts[f] || static_cast<int>(k) > reservoir_cap) continue;
+                if (unconsumed_after(f, k) <= reservoir_cap) { n_lay = f; glue = k; break; }
+            }
+        }
+        if (glue > 0) {
+            auto& last = optimized_main_data[n_lay - 1];
+            last.insert(last.end(), global_res.begin() + static_cast<ptrdiff_t>(frame_main_starts[n_lay] - glue),
+                        global_res.begin() + static_cast<ptrdiff_t>(frame_main_starts[n_lay]));
+        }
+        for (size_t k = n_lay; k < N; ++k) optimized_main_data[k].clear();
+    }
+
     // backward pass constraint solver
     std::vector<int> required_carryover(N, 0);
     int current_req = 0;
-    for (int i = static_cast<int>(N) - 1; i >= 0; --i) {
+    for (int i = static_cast<int>(n_lay) - 1; i >= 0; --i) {
         int space_needed = static_cast<int>(optimized_main_data[i].size()) + current_req;
         
         // we allow the forward pass to use up to 320 kbps if needed, so the backward pass should assume max capacity.
@@ -824,7 +932,7 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
     const int* bitrates = bitrate_table_for(version);
     const auto cbr_fits = [&](const int bitrate_kbps) {
         int remainder = 0, reservoir = 0;
-        for (size_t i = 0; i < N; ++i) {
+        for (size_t i = 0; i < n_lay; ++i) {
             if (has_vbri && i == 0) continue;   // copied whole at its own size
             bool padded = false;
             const int data_size = cbr_frame_size(version, samplerate, bitrate_kbps, remainder, padded)
@@ -871,7 +979,7 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
     int cbr_remainder = 0;
 
     // pass 1: build global_main_data and calculate main_data_begin
-    for (size_t i = 0; i < N; ++i) {
+    for (size_t i = 0; i < n_lay; ++i) {
         auto& side = all_frames[i].side_info;
 
         int max_reservoir = max_reservoir_bytes;
@@ -898,7 +1006,7 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
             int needed = static_cast<int>(optimized_main_data[0].size());
             bitrate_use = bytes_to_bitrate(version, samplerate, side_info_of(i), needed, crc_size_of(i));
         } else {
-            int req_for_next = (i + 1 < N) ? required_carryover[i + 1] : 0;
+            int req_for_next = (i + 1 < n_lay) ? required_carryover[i + 1] : 0;
             int bytes_needed = std::max(0, static_cast<int>(optimized_main_data[i].size()) + req_for_next - current_reservoir);
             bitrate_use = bytes_to_bitrate(version, samplerate, side_info_of(i), bytes_needed, crc_size_of(i));
         }
@@ -910,7 +1018,9 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
         int projected_reservoir = current_reservoir + data_size - static_cast<int>(optimized_main_data[i].size());
         if (projected_reservoir > max_reservoir) {
             int excess = projected_reservoir - max_reservoir;
-            optimized_main_data[i].resize(optimized_main_data[i].size() + excess, 0x00);
+            auto& piece = optimized_main_data[i];
+            const size_t keep_last = (i + 1 == n_lay) ? glue : 0;
+            piece.insert(piece.end() - static_cast<ptrdiff_t>(keep_last), static_cast<size_t>(excess), uint8_t{0});
             projected_reservoir = max_reservoir;
         }
 
@@ -928,6 +1038,24 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
             current_reservoir = 0;
     }
     
+    if (glue > 0 && current_reservoir > 0) {
+        // Slack after the seam would lengthen what F inherits. As much of it as the
+        // last repacked frame's back-reference can absorb goes in front of that
+        // frame's data instead — its data starts later and its main_data_begin
+        // shrinks by as much — and the rest stays ahead of the seam bytes, which the
+        // choice of F has already shown to fit.
+        const size_t slack = static_cast<size_t>(current_reservoir);
+        const size_t last = n_lay - 1;
+        auto& last_side = all_frames[last].side_info;
+        const size_t moved = last >= 1 ? std::min<size_t>(slack, last_side.main_data_begin) : 0;
+        if (moved > 0) optimized_main_data[last - 1].insert(optimized_main_data[last - 1].end(), moved, uint8_t{0});
+        last_side.main_data_begin = static_cast<uint16_t>(last_side.main_data_begin - moved);
+        auto& piece = optimized_main_data[last];
+        piece.insert(piece.end() - static_cast<ptrdiff_t>(glue), slack - moved, uint8_t{0});
+        reservoir_bytes += slack;
+        current_reservoir = 0;
+    }
+
     // Whatever the last frame leaves unread is emitted as zeros.
     const size_t reservoir_tail_zeros = static_cast<size_t>(std::max(0, current_reservoir));
     reservoir_bytes += reservoir_tail_zeros;
@@ -982,7 +1110,7 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
         if (has_tag_frame && i > 0)
             audio_frame_file_pos.push_back(out_bytes.size());
 
-        if (has_vbri && i == 0) {
+        if ((has_vbri && i == 0) || i >= n_lay) {
             chosen_bitrates[i] = {frame.header.padding, 0, frame.header.bitrate.index};
             const size_t start = frame_start_of(frame);
             const size_t size = frame.header.bitrate.frame_size;
@@ -1061,6 +1189,35 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
         append(end_junk.data(), end_junk.size());
     }
 
+    // Audio after a break may or may not be what the tag describes. A damaged file
+    // was one encode, and its tag counts every frame; a concatenation's first tag
+    // counts only its own file, and ffmpeg checks the byte count against the file
+    // to decide whether to trust the tag at all, so extending it changes how long
+    // the result plays. The tag says which: its frame count, or failing that its
+    // byte count, is held against the head alone and against head and tail.
+    size_t stream_end = mp3_end_pos;
+    if (has_xing && !tail_frames.empty() && optimized_main_data[0].size() >= 16) {
+        const uint8_t* tag = optimized_main_data[0].data();
+        const uint32_t flags = read_be(tag + 4, 4);
+        const size_t tail_end = tail_frames.back() + raw_header(end_junk.data() + tail_frames.back(),
+                                                                end_junk.size() - tail_frames.back()).size;
+        const auto closer_to_whole = [](const size_t said, const size_t head, const size_t whole) {
+            const auto gap = [said](const size_t v) { return said > v ? said - v : v - said; };
+            return gap(whole) < gap(head);
+        };
+        bool whole = false;
+        if (flags & 1) {
+            whole = closer_to_whole(read_be(tag + 8, 4), N - 1, N - 1 + tail_frames.size());
+        } else if (flags & 2) {
+            const size_t head_in = file.size() - end_junk.size() - frame_start_of(all_frames[0]);
+            whole = closer_to_whole(read_be(tag + 8, 4), head_in, head_in + tail_end);
+        }
+        if (whole) {
+            for (const size_t at : tail_frames) audio_frame_file_pos.push_back(mp3_end_pos + at);
+            stream_end = mp3_end_pos + tail_end;
+        }
+    }
+    
     // patch xing header fields (bytes count + TOC) if present
     const auto patch = [&out_bytes](const size_t at, const uint8_t* p, const size_t n) {
         if (at + n <= out_bytes.size()) std::memcpy(out_bytes.data() + at, p, n);
@@ -1100,7 +1257,7 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
             // in output: 'Xing'(4) + flags(4) = offset 8
             size_t field_offset = 8;
 
-            size_t total_mp3_bytes = mp3_end_pos - xing_header_file_pos;
+            size_t total_mp3_bytes = stream_end - xing_header_file_pos;
 
             if (flags & 1) field_offset += 4; // frames field: skip it
             if (flags & 2) {
@@ -1142,10 +1299,10 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
             const size_t lame_pos = main_data_base + lame_off;
             if (lame_pos < mp3_end_pos &&
                 lame_extension_at(out_bytes.data() + lame_pos, mp3_end_pos - lame_pos)) {
-                if (!audio_frame_file_pos.empty() && audio_frame_file_pos[0] < mp3_end_pos) {
+                if (!audio_frame_file_pos.empty() && audio_frame_file_pos[0] < stream_end) {
                     const size_t audio_start = audio_frame_file_pos[0];
                     const uint16_t music = crc16_lame(out_bytes.data() + audio_start,
-                                                      mp3_end_pos - audio_start);
+                                                      stream_end - audio_start);
                     const uint8_t mb[2] = {static_cast<uint8_t>(music >> 8), static_cast<uint8_t>(music & 0xFF)};
                     patch(lame_pos + 32, mb, 2);
                 }

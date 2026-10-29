@@ -705,6 +705,103 @@ for case in overrun:44100 mixed:44100 mixed:22050 mixed:11025 mixed:8000; do
     else FAIL=$((FAIL + 1)); FAILURES+=("$label :: $status"); echo "FAIL  $label  ($status)"; fi
 done
 
+# Stream structure: what sits around the frames rather than inside them. Each of
+# these used to cost either the whole file or its audio after some point:
+#   lead-*  — junk before the first frame that is not one well-formed ID3v2 tag
+#             (the file was refused outright); lead-falsesync opens with four bytes
+#             that parse as a header, which is why a frame needs a second behind it
+#   insert  — three stray bytes between two intact frames, and lost — one frame's
+#             header destroyed: the reader stops there and copies the rest through,
+#             and the first frames after the break reach back into a reservoir the
+#             repack had rewritten (thousands of samples changed)
+#   concat  — a second file, ID3v2 and Info frame included, appended to the first:
+#             its tag must keep describing the first file alone, or ffmpeg plays it
+#             for a different length
+#   vbri    — a Fraunhofer VBRI frame, which was decoded as audio after its tag was
+#             dropped (one frame of silence added); its seek table is rebuilt only
+#             under a reading that reproduces the input's, so the fixture builds one
+structure_fixture() { # structure_fixture KIND BASE OUT [SECOND]
+    python3 -c "
+import sys
+kind, base, out = sys.argv[1], sys.argv[2], sys.argv[3]
+d=open(base,'rb').read()
+v1=[0,32,40,48,56,64,80,96,112,128,160,192,224,256,320,0]
+def fsize(b,i): return 144*v1[(b[i+2]>>4)&0xF]*1000//44100+((b[i+2]>>1)&1)
+def frame_at(n):
+    i=0
+    for _ in range(n): i+=fsize(d,i)
+    return i
+def id3(body, pad=0):
+    size=len(body)+10+pad
+    hdr=b'ID3\x03\x00\x00'+bytes([(size>>21)&0x7F,(size>>14)&0x7F,(size>>7)&0x7F,size&0x7F])
+    return hdr+b'TIT2'+(len(body)+1).to_bytes(4,'big')+b'\x00\x00\x00'+body+b'\x00'*pad
+if kind=='lead-zeros': o=b'\x00'*64+d
+elif kind=='lead-twoid3': o=id3(b'one',20)+id3(b'two')+d
+elif kind=='lead-overpad': o=id3(b'tag')+b'\x00'*300+d
+elif kind=='lead-falsesync': o=b'\xff\xfb\x12'+b'junk'*25+d
+elif kind=='insert': i=frame_at(120); o=d[:i]+b'\x00\x13\x37'+d[i:]
+elif kind=='lost': i=frame_at(120); o=d[:i]+b'\x00'+d[i+1:]
+elif kind=='concat': o=d+open(sys.argv[4],'rb').read()
+elif kind=='vbri':
+    sizes=[];i=0
+    while i+4<=len(d) and d[i]==0xFF: sizes.append(fsize(d,i)); i+=sizes[-1]
+    f=bytearray(417); f[0:4]=bytes([0xFF,0xFB,0x90,d[3]])
+    fpe=10; n=(len(sizes)+fpe-1)//fpe
+    toc=b''.join(sum(sizes[e*fpe:(e+1)*fpe]).to_bytes(2,'big') for e in range(n))
+    body=b'VBRI'+(1).to_bytes(2,'big')+(1105).to_bytes(2,'big')+(75).to_bytes(2,'big')+(417+len(d)).to_bytes(4,'big') \
+         +(len(sizes)+1).to_bytes(4,'big')+n.to_bytes(2,'big')+(1).to_bytes(2,'big')+(2).to_bytes(2,'big')+fpe.to_bytes(2,'big')+toc
+    f[36:36+len(body)]=body; o=bytes(f)+d
+open(out,'wb').write(o)
+" "$@"
+}
+# For vbri: the tag still there, its byte count equal to the stream, its table
+# matching the frames written. Prints "ok" or what is wrong.
+vbri_check() {
+    python3 -c "
+import sys
+b=open(sys.argv[1],'rb').read()
+v1=[0,32,40,48,56,64,80,96,112,128,160,192,224,256,320,0]
+def fsize(i): return 144*v1[(b[i+2]>>4)&0xF]*1000//44100+((b[i+2]>>1)&1)
+be=lambda o,n: int.from_bytes(b[o:o+n],'big')
+if b[36:40]!=b'VBRI': print('tag gone'); raise SystemExit
+sizes=[];i=0
+while i+4<=len(b) and b[i]==0xFF: sizes.append(fsize(i)); i+=sizes[-1]
+n=be(54,2); fpe=be(60,2)
+if be(46,4)!=len(b): print('byte count', be(46,4), 'for', len(b)); raise SystemExit
+if [be(62+2*e,2) for e in range(n)]!=[sum(sizes[1+e*fpe:1+(e+1)*fpe]) for e in range(n)]: print('seek table stale'); raise SystemExit
+print('ok')
+" "$1"
+}
+echo ""
+echo "== stream structure (leading junk, breaks, concatenation, vbri) =="
+ffmpeg -y -v error -f lavfi -i "anoisesrc=duration=8:color=pink:sample_rate=44100:seed=5" \
+       -f lavfi -i "sine=frequency=440:duration=8:sample_rate=44100" \
+       -filter_complex "[0][1]amerge=inputs=2" "$WORKDIR/st.wav" 2>/dev/null
+lame --quiet -V2 "$WORKDIR/st.wav" "$WORKDIR/st_base.mp3"
+lame --quiet -V2 -t "$WORKDIR/st.wav" "$WORKDIR/st_notag.mp3"
+ffmpeg -y -v error -f lavfi -i "sine=frequency=500:duration=4:sample_rate=44100" -ac 2 -c:a libmp3lame -q:a 2 "$WORKDIR/st_second.mp3"
+for kind in lead-zeros lead-twoid3 lead-overpad lead-falsesync insert lost concat vbri; do
+    base="$WORKDIR/st_base.mp3"; [ "$kind" = "vbri" ] && base="$WORKDIR/st_notag.mp3"
+    in="$WORKDIR/st_$kind.mp3"
+    structure_fixture "$kind" "$base" "$in" "$WORKDIR/st_second.mp3"
+    ffmpeg -y -v error -i "$in" -f s16le "$WORKDIR/st_a.s16" 2>/dev/null
+    for flags in "" "-z"; do
+        TOTAL=$((TOTAL + 1))
+        label="structure/$kind/${flags:-no-z}"
+        out="$WORKDIR/st_out.mp3"; status=ok
+        if ! $BIN $flags "$in" "$out" >/dev/null 2>&1; then status="pack failed"
+        else
+            ffmpeg -y -v error -i "$out" -f s16le "$WORKDIR/st_b.s16" 2>/dev/null
+            cmp -s "$WORKDIR/st_a.s16" "$WORKDIR/st_b.s16" || status="PCM differs"
+            if [ "$status" = "ok" ] && [ "$kind" = "vbri" ]; then
+                v="$(vbri_check "$out")"; [ "$v" = "ok" ] || status="vbri: $v"
+            fi
+        fi
+        if [ "$status" = "ok" ]; then echo "ok    $label"
+        else FAIL=$((FAIL + 1)); FAILURES+=("$label :: $status"); echo "FAIL  $label  ($status)"; fi
+    done
+done
+
 echo ""
 echo "== summary: $((TOTAL - FAIL))/$TOTAL passed =="
 if [ "$FAIL" -gt 0 ]; then
