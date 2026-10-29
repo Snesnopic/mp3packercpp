@@ -100,7 +100,15 @@ check_case() {
             cbr_status="bitrate not constant: $seen"
         elif [ -n "$reported" ] && [ "$seen" != "$reported" ]; then
             cbr_status="--ib said $reported but output is $seen"
+        elif [ "$(xing_magic "$cbr_out")" = "Xing" ]; then
+            cbr_status="constant-bitrate output still tagged Xing"
         fi
+    fi
+    # And the reverse: a repack that leaves the frames at varying bitrates must not
+    # keep an "Info" tag, which tells players the stream is constant-bitrate.
+    if [ "$cbr_status" = "ok" ] && [ "$(frame_bitrates "$out_t1" | wc -w | tr -d ' ')" -gt 1 ] \
+       && [ "$(xing_magic "$out_t1")" = "Info" ]; then
+        cbr_status="variable-bitrate output still tagged Info"
     fi
 
     # CRC preservation: --keep-crc must stay lossless, must actually carry CRCs
@@ -178,6 +186,19 @@ check_case() {
     else
         echo "ok    $label"
     fi
+}
+
+# The xing frame's magic: "Xing", "Info", or "none".
+xing_magic() {
+    python3 -c "
+import sys
+d=open(sys.argv[1],'rb').read()
+i=0
+if d[:3]==b'ID3':
+    i=10+(((d[6]&0x7F)<<21)|((d[7]&0x7F)<<14)|((d[8]&0x7F)<<7)|(d[9]&0x7F))
+w=d[i:i+64]
+print('Xing' if b'Xing' in w else 'Info' if b'Info' in w else 'none')
+" "$1"
 }
 
 # "<frame0_bytes> <tag_bytes> <lame_crc>" for a file: how long the xing frame and

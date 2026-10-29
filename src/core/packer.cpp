@@ -1027,6 +1027,21 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
             size_t main_data_base = xing_header_file_pos + 4
                                     + static_cast<size_t>(crc_size_of(0))
                                     + static_cast<size_t>(side_info_size);
+            // "Info" tells a player the stream is constant-bitrate and "Xing" that it
+            // is not, and some take it at its word for duration and seeking. The
+            // repack decides that afresh — a CBR input comes out variable unless
+            // --cbr, a VBR one comes out constant with it — so the magic follows
+            // the frames actually written, not the ones that arrived.
+            bool constant = true;
+            for (size_t i = 2; i < N; ++i) {
+                if (chosen_bitrates[i].index != chosen_bitrates[1].index) { constant = false; break; }
+            }
+            if (main_data_base + 4 <= out_bytes.size() &&
+                (std::memcmp(out_bytes.data() + main_data_base, "Xing", 4) == 0 ||
+                 std::memcmp(out_bytes.data() + main_data_base, "Info", 4) == 0)) {
+                patch(main_data_base, reinterpret_cast<const uint8_t*>(constant ? "Info" : "Xing"), 4);
+            }
+
             // in output: 'Xing'(4) + flags(4) = offset 8
             size_t field_offset = 8;
 
