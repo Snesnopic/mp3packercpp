@@ -208,13 +208,26 @@ struct ChosenBitrate {
 // The LAME extension carries its own two checksums, and they use a different
 // CRC-16 from the frame one: reflected polynomial, seed 0, stored big-endian.
 // Verified against files written by lame and by ffmpeg's libmp3lame.
+//
+// The music checksum covers every audio byte in the file, so this runs over
+// megabytes on the serial path. A byte at a time through a table rather than a
+// bit at a time: on a 180 s file that was 18 ms of a 25 ms run without -z, and a
+// quarter of an all-core -z run.
 static uint16_t crc16_lame(const uint8_t* data, const size_t size) {
+    static const std::array<uint16_t, 256> table = [] {
+        std::array<uint16_t, 256> t{};
+        for (size_t i = 0; i < 256; ++i) {
+            auto crc = static_cast<uint16_t>(i);
+            for (int bit = 0; bit < 8; ++bit) {
+                crc = (crc & 1) ? static_cast<uint16_t>((crc >> 1) ^ 0xA001) : static_cast<uint16_t>(crc >> 1);
+            }
+            t[i] = crc;
+        }
+        return t;
+    }();
     uint16_t crc = 0;
     for (size_t i = 0; i < size; ++i) {
-        crc ^= data[i];
-        for (int bit = 0; bit < 8; ++bit) {
-            crc = (crc & 1) ? static_cast<uint16_t>((crc >> 1) ^ 0xA001) : static_cast<uint16_t>(crc >> 1);
-        }
+        crc = static_cast<uint16_t>((crc >> 8) ^ table[(crc ^ data[i]) & 0xFF]);
     }
     return crc;
 }
@@ -393,7 +406,6 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
         // all_frames.erase(all_frames.begin());
         DEBUG_LOG("Detected XING header frame at beginning. Preserving it.");
     }
-    
     size_t N = all_frames.size();
     DEBUG_LOG("Optimizing " << N << " audio frames...");
 
@@ -691,7 +703,7 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
     }
     
     DEBUG_LOG("Huffman optimization completed. Running reservoir constraint solver...");
-    
+
     // backward pass (constraint solver for carry-over reservoir)
     MpegVersion version = all_frames[0].header.version;
     uint32_t samplerate = all_frames[0].header.samplerate;
@@ -993,7 +1005,7 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
     if (!end_junk.empty()) {
         append(end_junk.data(), end_junk.size());
     }
-    
+
     // patch xing header fields (bytes count + TOC) if present
     const auto patch = [&out_bytes](const size_t at, const uint8_t* p, const size_t n) {
         if (at + n <= out_bytes.size()) std::memcpy(out_bytes.data() + at, p, n);
