@@ -463,6 +463,50 @@ for rate in 44100 22050 11025; do
     done
 done
 
+# A protected xing frame whose LAME extension carries a vendor other than "LAME".
+# The default path trims a CRC input's tag after the fields it knows how to size,
+# and it used to recognise the extension by the literal "LAME" magic — so a "Lavc"
+# or "Lavf" block was cut off, taking the encoder delay and padding with it, and
+# decoders stopped trimming them (1296-2016 extra samples). ffmpeg reads gapless
+# from all three vendors, which is what makes this observable. No encoder in our
+# corpus writes both a CRC and a non-lame vendor, so the fixture patches one in.
+echo ""
+echo "== xing extension with a non-lame vendor (crc input, trimmed tag) =="
+for vendor in Lavc Lavf; do
+    src="$WORKDIR/vendor_src.mp3"
+    patched="$WORKDIR/vendor_${vendor}.mp3"
+    ffmpeg -y -v error -f lavfi -i "anoisesrc=duration=3:color=pink:sample_rate=44100" -ac 2 "$WORKDIR/vendor.wav" 2>/dev/null
+    lame --quiet -V2 -p "$WORKDIR/vendor.wav" "$src"
+    python3 -c "
+import sys
+d=bytearray(open(sys.argv[1],'rb').read())
+i=max(d.find(b'Xing',0,64), d.find(b'Info',0,64))
+fl=int.from_bytes(d[i+4:i+8],'big'); off=i+8
+for m,n in ((1,4),(2,4),(4,100),(8,4)):
+    if fl&m: off+=n
+d[off:off+4]=sys.argv[3].encode()
+open(sys.argv[2],'wb').write(bytes(d))
+" "$src" "$patched" "$vendor"
+    want="$(ffmpeg -v error -i "$patched" -f s16le - 2>/dev/null | wc -c | tr -d ' ')"
+    for flags in "" "-z"; do
+        TOTAL=$((TOTAL + 1))
+        label="vendor/$vendor/${flags:-no-z}"
+        out="$WORKDIR/vendor_out.mp3"
+        status=ok
+        if ! $BIN $flags "$patched" "$out" >/dev/null 2>&1; then
+            status="pack failed"
+        else
+            got="$(ffmpeg -v error -i "$out" -f s16le - 2>/dev/null | wc -c | tr -d ' ')"
+            ext="$(xing_report "$out" | cut -d' ' -f3)"
+            if [ "$ext" != "ok" ]; then status="extension $ext after repack"
+            elif [ "$got" != "$want" ]; then status="decoded $got bytes, source $want"
+            fi
+        fi
+        if [ "$status" = "ok" ]; then echo "ok    $label"
+        else FAIL=$((FAIL + 1)); FAILURES+=("$label :: $status"); echo "FAIL  $label  ($status)"; fi
+    done
+done
+
 echo ""
 echo "== summary: $((TOTAL - FAIL))/$TOTAL passed =="
 if [ "$FAIL" -gt 0 ]; then

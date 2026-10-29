@@ -209,6 +209,19 @@ static uint16_t crc16_lame(const uint8_t* data, const size_t size) {
     return crc;
 }
 
+// Whether a 36-byte LAME extension starts at p. It opens with a vendor string, and
+// the vendor is not always lame: ffmpeg writes "Lavc"/"Lavf" into the same block, so
+// matching on "LAME" misses every file ffmpeg encoded. Presence is judged on the
+// block being there and starting with printable text — a tag with no extension has
+// zero padding at that offset instead.
+static bool lame_extension_at(const uint8_t* p, const size_t available) {
+    if (available < 36) return false;
+    for (int k = 0; k < 4; ++k) {
+        if (p[k] < 0x20 || p[k] > 0x7E) return false;
+    }
+    return true;
+}
+
 // The payload a frame holds at a bitrate index it already carries, rather than at
 // the smallest index that would fit. Used to keep the xing frame the size it
 // arrived at instead of shrinking it around its tag.
@@ -441,10 +454,8 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
                         if (fl & 2) keep += 4;   // byte count
                         if (fl & 4) keep += 100; // TOC
                         if (fl & 8) keep += 4;   // quality
-                        if (mdr_size >= keep + 4 &&
-                            mdr[keep] == 'L' && mdr[keep+1] == 'A' &&
-                            mdr[keep+2] == 'M' && mdr[keep+3] == 'E')
-                            keep += 36; // LAME extension tag
+                        if (keep <= mdr_size && lame_extension_at(mdr + keep, mdr_size - keep))
+                            keep += 36;
                     }
                     // Preserving means copying the tag whole: the fields we know how
                     // to size are not necessarily all of it, and an extension we do
@@ -1019,17 +1030,8 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
             if (flags & 4) lame_off += 100;
             if (flags & 8) lame_off += 4;
             const size_t lame_pos = main_data_base + lame_off;
-            // The extension opens with a vendor string, and the vendor is not always
-            // lame: ffmpeg writes "Lavc"/"Lavf" into the same 36-byte block. Matching
-            // on "LAME" would have skipped every file ffmpeg encoded, so presence is
-            // judged on the block being there and starting with printable text —
-            // a frame with no extension has zero padding at that offset instead.
-            const auto printable = [&](const size_t at) {
-                return out_bytes[at] >= 0x20 && out_bytes[at] <= 0x7E;
-            };
-            if (lame_pos + 36 <= out_bytes.size() && lame_pos + 36 <= mp3_end_pos &&
-                printable(lame_pos) && printable(lame_pos + 1) &&
-                printable(lame_pos + 2) && printable(lame_pos + 3)) {
+            if (lame_pos < mp3_end_pos &&
+                lame_extension_at(out_bytes.data() + lame_pos, mp3_end_pos - lame_pos)) {
                 if (!audio_frame_file_pos.empty() && audio_frame_file_pos[0] < mp3_end_pos) {
                     const size_t audio_start = audio_frame_file_pos[0];
                     const uint16_t music = crc16_lame(out_bytes.data() + audio_start,
