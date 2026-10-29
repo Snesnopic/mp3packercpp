@@ -501,6 +501,16 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
                     // read scalefactors
                     int slen1 = 0, slen2 = 0;
                     const bool is_mpeg1 = frame.header.version == MpegVersion::MPEG1;
+
+                    // Where decoders disagree about what a granule holds, the only
+                    // repack that is lossless for every one of them is the original
+                    // bits. An LSF mixed block is such a case: ffmpeg and the ISO
+                    // reference put region0's end 36 coefficients in, minimp3 48, so
+                    // whichever boundary we decoded with, re-encoding fixes the
+                    // tables to it and changes what the other decoders hear.
+                    if (!is_mpeg1 && g.window_switching_flag && g.block_type == 2 && g.mixed_block_flag) {
+                        throw std::runtime_error("lsf mixed block: decoders disagree on region0");
+                    }
                     if (is_mpeg1) {
                         static constexpr int slen1_tab[] = {0, 0, 0, 0, 3, 1, 1, 1, 2, 2, 2, 3, 3, 3, 4, 4};
                         static constexpr int slen2_tab[] = {0, 1, 2, 3, 0, 1, 2, 3, 1, 2, 3, 1, 2, 3, 2, 3};
@@ -588,6 +598,14 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
                     int scalefac_bits = static_cast<int>(data_reader.tell_bit() - gc_orig_start);
                     int max_huff_bits = side_copy.gr[gr][ch].part2_3_length - scalefac_bits;
                     HuffmanOptimizer::decode_quantized_coefficients(coeffs, orig_cfg, data_reader, frame.header.samplerate, max_huff_bits);
+                    // The other such case: a last count1 quad that runs past
+                    // part2_3_length. We read it whole, as the original mp3packer did;
+                    // ffmpeg and the ISO reference drop it; minimp3 keeps it only if
+                    // just its sign bits overran. Re-encoding would write it inside
+                    // the limit, and every decoder would then play it.
+                    if (data_reader.tell_bit() > gc_orig_start + side_copy.gr[gr][ch].part2_3_length) {
+                        throw std::runtime_error("granule overruns part2_3_length");
+                    }
                     auto best_cfg = HuffmanOptimizer::find_best_config(coeffs, orig_cfg, frame.header.samplerate);
                     
                     size_t scalefac_end_bit = writer.tell_bit();
