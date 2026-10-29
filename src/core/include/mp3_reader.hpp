@@ -92,6 +92,17 @@ private:
      * @brief Identifies and skips over an ID3v2 tag if present at the current position.
      */
     void skip_id3v2_tag();
+
+    /**
+     * @brief Moves anything before the first frame into the start junk.
+     *
+     * A second ID3v2 tag, zero padding a tagger wrote past its tag's declared size,
+     * a RIFF wrapper: none of it is a frame header, and without this the first four
+     * bytes failing to parse ended the stream before it began. A position counts as
+     * the first frame only if a second, consistent header follows it at the frame's
+     * own length, so a stray sync inside the junk is not taken for one.
+     */
+    void skip_leading_junk();
 };
 
 } // namespace mp3packer

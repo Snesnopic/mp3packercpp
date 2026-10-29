@@ -22,6 +22,7 @@ Mp3Reader::Mp3Reader(const std::string& filename) : start_junk_(), end_junk_() {
         data_.resize(static_cast<size_t>(file.gcount()));
     }
     skip_id3v2_tag();
+    skip_leading_junk();
 }
 
 Mp3Reader::~Mp3Reader() = default;
@@ -75,6 +76,35 @@ void Mp3Reader::skip_id3v2_tag() {
         // A tag claiming more than the file holds leaves the rest zero and the data
         // exhausted, so no frames are found — as before.
         take(start_junk_.data(), total_tag_size);
+    }
+}
+
+void Mp3Reader::skip_leading_junk() {
+    const auto header_at = [this](const size_t at) -> std::optional<Mp3Header> {
+        if (at + 4 > data_.size()) return std::nullopt;
+        return parse_header(static_cast<uint32_t>(data_[at]) << 24 | static_cast<uint32_t>(data_[at + 1]) << 16 |
+                            static_cast<uint32_t>(data_[at + 2]) << 8 | static_cast<uint32_t>(data_[at + 3]));
+    };
+    // A frame is believed only with a consistent header right after it, or with
+    // nothing after it but the end of the data or a trailing tag: a valid-looking
+    // header on its own is four bytes any junk can contain.
+    const auto synced = [&](const size_t at) {
+        const auto first = header_at(at);
+        if (!first) return false;
+        const size_t next = at + calculate_frame_size(*first);
+        if (next + 4 > data_.size()) return true;
+        if (std::memcmp(data_.data() + next, "TAG", 3) == 0) return true;
+        const auto second = header_at(next);
+        return second && second->version == first->version && second->samplerate == first->samplerate;
+    };
+    if (exhausted_ || synced(pos_)) return;
+    for (size_t at = pos_ + 1; at + 4 <= data_.size(); ++at) {
+        if (data_[at] != 0xFF || !synced(at)) continue;
+        DEBUG_LOG("Skipped " << (at - pos_) << " bytes before the first frame. Stored in start_junk.");
+        start_junk_.insert(start_junk_.end(), data_.begin() + static_cast<ptrdiff_t>(pos_),
+                           data_.begin() + static_cast<ptrdiff_t>(at));
+        pos_ = at;
+        return;
     }
 }
 
