@@ -36,6 +36,15 @@ struct LsfSlenTables {
     std::array<uint32_t, 256> intensity{};
 };
 
+// The six ranges map one to one onto the six rows of lsf_band_counts, in order:
+// normal 0..399, 400..499, 500..511 (the last is how LSF signals preflag), then
+// intensity 0..179, 180..243, 244..255. They used to be numbered 0, 1, 1, 2, 3, 4,
+// so everything from 500 on took the row before its own: -z sized those
+// scalefactors wrongly, decoded the spectrum from the wrong bit and re-encoded the
+// garbage, and the granule round trip — self-consistent — let it through. LAME never
+// emits preflag or intensity stereo in LSF, which is why no corpus caught it, and
+// go-mp3packer carries the same table. Rows checked against ISO 13818-3 and
+// minimp3's partition walk.
 static const LsfSlenTables& lsf_slen_tables() {
     static const LsfSlenTables tables = [] {
         LsfSlenTables t;
@@ -50,21 +59,22 @@ static const LsfSlenTables& lsf_slen_tables() {
                 for (int k = 0; k < 4; ++k)
                     t.normal[static_cast<size_t>(k + j * 4 + i * 20 + 400)] =
                         static_cast<uint32_t>(i | j << 3 | k << 6 | 1 << 12);
+        for (int i = 0; i < 4; ++i)
+            for (int j = 0; j < 3; ++j)
+                t.normal[static_cast<size_t>(j + i * 3 + 500)] = static_cast<uint32_t>(i | j << 3 | 2 << 12);
         for (int i = 0; i < 5; ++i)
             for (int j = 0; j < 6; ++j)
                 for (int k = 0; k < 6; ++k)
                     t.intensity[static_cast<size_t>(k + j * 6 + i * 36)] =
-                        static_cast<uint32_t>(i | j << 3 | k << 6 | 2 << 12);
+                        static_cast<uint32_t>(i | j << 3 | k << 6 | 3 << 12);
         for (int i = 0; i < 4; ++i)
             for (int j = 0; j < 4; ++j)
                 for (int k = 0; k < 4; ++k)
                     t.intensity[static_cast<size_t>(k + j * 4 + i * 16 + 180)] =
-                        static_cast<uint32_t>(i | j << 3 | k << 6 | 3 << 12);
+                        static_cast<uint32_t>(i | j << 3 | k << 6 | 4 << 12);
         for (int i = 0; i < 4; ++i)
-            for (int j = 0; j < 3; ++j) {
-                t.intensity[static_cast<size_t>(j + i * 3 + 244)] = static_cast<uint32_t>(i | j << 3 | 4 << 12);
-                t.normal[static_cast<size_t>(j + i * 3 + 500)] = static_cast<uint32_t>(i | j << 3 | 1 << 12 | 5 << 15);
-            }
+            for (int j = 0; j < 3; ++j)
+                t.intensity[static_cast<size_t>(j + i * 3 + 244)] = static_cast<uint32_t>(i | j << 3 | 5 << 12);
         return t;
     }();
     return tables;

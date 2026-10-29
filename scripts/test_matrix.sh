@@ -507,6 +507,85 @@ open(sys.argv[2],'wb').write(bytes(d))
     done
 done
 
+# MPEG2/2.5 sizes scalefactors through a compound scalefac_compress that selects
+# one of six band partitions. Two of the ranges never come out of LAME — preflag
+# (500..511) and the intensity-stereo forms of the right channel — and the packer
+# used to take the partition one row too early for both, so -z decoded the
+# spectrum from the wrong bit and re-encoded the garbage. The fixture rewrites a
+# LAME file into those forms without touching a bit of main data: it picks
+# granules whose current scalefactors occupy exactly as many bits as some value in
+# the target range declares under the right partition, and not under the wrong one.
+lsf_fixture() { # lsf_fixture MODE IN OUT -> prints how many granules were rewritten
+    python3 -c "
+import sys
+def gb(b,p,n):
+    v=0
+    for k in range(n): v=v<<1|((b[(p+k)>>3]>>(7-((p+k)&7)))&1)
+    return v
+def sb(b,p,n,x):
+    for k in range(n):
+        bit=(x>>(n-1-k))&1; i=(p+k)>>3; sh=7-((p+k)&7); b[i]=(b[i]&~(1<<sh)&0xFF)|(bit<<sh)
+rows={0:(6,5,5,5),1:(6,5,7,3),2:(11,10,0,0),3:(7,7,7,0),4:(6,6,6,3),5:(8,8,5,0)}
+def normal(s):
+    if s<400: return ((s>>4)//5,(s>>4)%5,(s%16)>>2,s%4),0
+    if s<500: return (((s-400)>>2)//5,((s-400)>>2)%5,(s-400)%4,0),1
+    return ((s-500)//3,(s-500)%3,0,0),2
+def intensity(s):
+    if s<180: return (s//36,(s%36)//6,s%6,0),3
+    if s<244: return (((s-180)%64)>>4,((s-180)%16)>>2,(s-180)%4,0),4
+    return ((s-244)//3,(s-244)%3,0,0),5
+def bits(sl,row): return sum(a*b for a,b in zip(sl,rows[row]))
+mode=sys.argv[1]
+v2=[0,8,16,24,32,40,48,56,64,80,96,112,128,144,160]
+d=bytearray(open(sys.argv[2],'rb').read()); i=0; n=0
+while i+4<=len(d) and d[i]==0xFF:
+    ver=(d[i+1]>>3)&3; sr=[44100,48000,32000][(d[i+2]>>2)&3]//(2 if ver==2 else 4)
+    sz=72*v2[(d[i+2]>>4)&0xF]*1000//sr+((d[i+2]>>1)&1)
+    m=(d[i+3]>>6)&3; mono=m==3; isst=m==1 and (d[i+3]>>4)&1
+    base=(i+4+(0 if d[i+1]&1 else 2))*8+8+(1 if mono else 2)
+    for ch in range(1 if mono else 2):
+        p=base+63*ch; sfc=gb(d,p+29,9)
+        if gb(d,p+38,1) or sfc>=400 or (isst and ch==1): continue
+        have=bits(*normal(sfc))
+        if mode=='preflag':
+            for t in range(500,512):
+                sl,row=normal(t)
+                if bits(sl,row)==have and bits(sl,row-1)!=have: sb(d,p+29,9,t); n+=1; break
+        elif ch==1 and m==1 and (d[i+1]&1):
+            for t in range(256):
+                sl,row=intensity(t)
+                if bits(sl,row)==have and bits(sl,row-1)!=have: sb(d,p+29,9,t<<1); d[i+3]|=0x10; n+=1; break
+    i+=sz
+open(sys.argv[3],'wb').write(bytes(d)); print(n)
+" "$1" "$2" "$3"
+}
+echo ""
+echo "== lsf scalefactor partitions lame never uses (preflag, intensity stereo) =="
+for rate in 22050 16000 11025 8000; do
+    src="$WORKDIR/lsfp_src.mp3"
+    ffmpeg -y -v error -f lavfi -i "anoisesrc=duration=4:color=pink:sample_rate=$rate:seed=42" \
+           -f lavfi -i "sine=frequency=330:duration=4:sample_rate=$rate" \
+           -filter_complex "[0][1]amerge=inputs=2" "$WORKDIR/lsfp.wav" 2>/dev/null
+    lame --quiet -V4 "$WORKDIR/lsfp.wav" "$src"
+    for mode in preflag intensity; do
+        TOTAL=$((TOTAL + 1))
+        label="lsf-$mode/${rate}Hz"
+        patched="$WORKDIR/lsfp_$mode.mp3"; out="$WORKDIR/lsfp_out.mp3"
+        rewritten="$(lsf_fixture "$mode" "$src" "$patched")"
+        status=ok
+        if [ "${rewritten:-0}" = "0" ]; then status="fixture rewrote no granules"
+        elif ! $BIN -z "$patched" "$out" >/dev/null 2>&1; then status="pack failed"
+        else
+            ffmpeg -y -v error -i "$patched" -f f32le "$WORKDIR/lsfp_a.f32" 2>/dev/null
+            ffmpeg -y -v error -i "$out" -f f32le "$WORKDIR/lsfp_b.f32" 2>/dev/null
+            d="$(pcm_diff "$WORKDIR/lsfp_a.f32" "$WORKDIR/lsfp_b.f32")"
+            [ "$d" = "0" ] || status="$d PCM diffs over $rewritten rewritten granules"
+        fi
+        if [ "$status" = "ok" ]; then echo "ok    $label  ($rewritten granules)"
+        else FAIL=$((FAIL + 1)); FAILURES+=("$label :: $status"); echo "FAIL  $label  ($status)"; fi
+    done
+done
+
 echo ""
 echo "== summary: $((TOTAL - FAIL))/$TOTAL passed =="
 if [ "$FAIL" -gt 0 ]; then
