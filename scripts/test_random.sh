@@ -42,7 +42,7 @@ import struct, sys
 a = open(sys.argv[1], 'rb').read()
 b = open(sys.argv[2], 'rb').read()
 n = min(len(a), len(b)) // 4
-diffs = sum(1 for i in range(n) if abs(struct.unpack_from('f', a, i*4)[0] - struct.unpack_from('f', b, i*4)[0]) > 0.0001)
+diffs = sum(1 for i in range(n) if a[4*i:4*i+4] != b[4*i:4*i+4])  # exact: a lossless repack decodes bit for bit
 print(diffs)
 " "$1" "$2"
 }

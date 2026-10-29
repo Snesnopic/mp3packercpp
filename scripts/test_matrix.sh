@@ -36,7 +36,7 @@ import struct, sys
 a = open(sys.argv[1], 'rb').read()
 b = open(sys.argv[2], 'rb').read()
 n = min(len(a), len(b)) // 4
-diffs = sum(1 for i in range(n) if abs(struct.unpack_from('f', a, i*4)[0] - struct.unpack_from('f', b, i*4)[0]) > 0.0001)
+diffs = sum(1 for i in range(n) if a[4*i:4*i+4] != b[4*i:4*i+4])  # exact: a lossless repack decodes bit for bit
 print(diffs)
 " "$1" "$2"
 }
@@ -584,6 +584,104 @@ for rate in 22050 16000 11025 8000; do
         if [ "$status" = "ok" ]; then echo "ok    $label  ($rewritten granules)"
         else FAIL=$((FAIL + 1)); FAILURES+=("$label :: $status"); echo "FAIL  $label  ($status)"; fi
     done
+done
+
+# Granules decoders read differently. Where they disagree on what a granule holds,
+# the only repack lossless for all of them is the original bits, so the packer
+# leaves those frames verbatim; before it did, -z re-encoded them and every decoder
+# but one heard a different spectrum. Two shapes, neither of which LAME produces,
+# so the fixtures make them without moving a bit of main data:
+#   overrun — the last granule of every tenth frame declares one bit fewer than it
+#             holds, so its last count1 quad runs past part2_3_length (we used to
+#             keep it; ffmpeg drops it)
+#   mixed   — a short-block granule whose first scalefactor group is zero-width
+#             occupies the same bits as a mixed block, so its flag can be set; in
+#             LSF ffmpeg puts region0's end at 36 coefficients, minimp3 at 48.
+#             MPEG1 mixed blocks have no such disagreement and are repacked, so
+#             they check the mixed-block path itself, which no other case reaches.
+granule_fixture() { # granule_fixture MODE IN OUT -> prints how many granules were rewritten
+    python3 -c "
+import sys
+def gb(b,p,n):
+    v=0
+    for k in range(n): v=v<<1|((b[(p+k)>>3]>>(7-((p+k)&7)))&1)
+    return v
+def sb(b,p,n,x):
+    for k in range(n):
+        bit=(x>>(n-1-k))&1; i=(p+k)>>3; sh=7-((p+k)&7); b[i]=(b[i]&~(1<<sh)&0xFF)|(bit<<sh)
+v1=[0,32,40,48,56,64,80,96,112,128,160,192,224,256,320]
+v2=[0,8,16,24,32,40,48,56,64,80,96,112,128,144,160]
+mode=sys.argv[1]
+d=bytearray(open(sys.argv[2],'rb').read()); i=0; f=0; n=0
+while i+4<=len(d) and d[i]==0xFF:
+    ver=(d[i+1]>>3)&3; mpeg1=ver==3
+    sr=[44100,48000,32000][(d[i+2]>>2)&3]//(1 if mpeg1 else (2 if ver==2 else 4))
+    sz=(144*v1[(d[i+2]>>4)&0xF] if mpeg1 else 72*v2[(d[i+2]>>4)&0xF])*1000//sr+((d[i+2]>>1)&1)
+    m=(d[i+3]>>6)&3; nch=1 if m==3 else 2; isst=m==1 and (d[i+3]>>4)&1
+    s0=(i+4+(0 if d[i+1]&1 else 2))*8
+    if mpeg1:
+        scfsi=s0+9+(5 if nch==1 else 3); base=scfsi+4*nch; gsz=59; ngr=2; off=(29,4,33)
+    else:
+        scfsi=None; base=s0+8+nch; gsz=63; ngr=1; off=(29,9,38)
+    grans=[(gr,ch,base+gsz*(gr*nch+ch)) for gr in range(ngr) for ch in range(nch)]
+    if mode=='overrun':
+        if f>0 and f%10==0:
+            for gr,ch,p in reversed(grans):
+                p23=gb(d,p,12)
+                if p23>8: sb(d,p,12,p23-1); n+=1; break
+    else:
+        for gr,ch,p in grans:
+            sfc=gb(d,p+off[0],off[1]); wsf=p+off[2]
+            if not (gb(d,wsf,1) and gb(d,wsf+1,2)==2 and not gb(d,wsf+3,1)): continue
+            if mpeg1:
+                ok=sfc<=3 and gb(d,scfsi+4*ch,4)==0
+            else:
+                ok=sfc<400 and (sfc>>4)//5==0 and not (isst and ch==1)
+            if ok: sb(d,wsf+3,1,1); n+=1
+    i+=sz; f+=1
+open(sys.argv[3],'wb').write(bytes(d)); print(n)
+" "$1" "$2" "$3"
+}
+clicks_wav() { # clicks_wav RATE OUT: loud noise bursts over a quiet floor, to force short blocks
+    python3 -c "
+import sys, struct, random, wave
+sr=int(sys.argv[1]); random.seed(3)
+w=wave.open(sys.argv[2],'wb'); w.setnchannels(2); w.setsampwidth(2); w.setframerate(sr)
+out=bytearray()
+for k in range(sr*10):
+    a=26000 if (k/sr)%0.25<0.02 else 400
+    out+=struct.pack('<hh', int(random.uniform(-a,a)), int(random.uniform(-a,a)))
+w.writeframes(bytes(out)); w.close()
+" "$1" "$2"
+}
+echo ""
+echo "== granules decoders disagree on (overrun, mixed blocks) =="
+for case in overrun:44100 mixed:44100 mixed:22050 mixed:11025 mixed:8000; do
+    mode="${case%%:*}"; rate="${case##*:}"
+    TOTAL=$((TOTAL + 1))
+    label="$mode/${rate}Hz"
+    src="$WORKDIR/gf_src.mp3"; patched="$WORKDIR/gf.mp3"; out="$WORKDIR/gf_out.mp3"
+    if [ "$mode" = "overrun" ]; then
+        ffmpeg -y -v error -f lavfi -i "anoisesrc=duration=8:color=pink:sample_rate=$rate:seed=11" \
+               -f lavfi -i "sine=frequency=440:duration=8:sample_rate=$rate" \
+               -filter_complex "[0][1]amerge=inputs=2" "$WORKDIR/gf.wav" 2>/dev/null
+    else
+        clicks_wav "$rate" "$WORKDIR/gf.wav"
+    fi
+    lame --quiet -V2 "$WORKDIR/gf.wav" "$src"
+    rewritten="$(granule_fixture "$mode" "$src" "$patched")"
+    status=ok
+    if [ "${rewritten:-0}" = "0" ]; then status="fixture rewrote no granules"
+    elif ! $BIN -z "$patched" "$out" >/dev/null 2>&1; then status="pack failed"
+    else
+        # exact, not pcm_diff's 1e-4: one quantised step in a quiet channel is
+        # about one 16-bit LSB, well under that tolerance
+        ffmpeg -y -v error -i "$patched" -f s16le "$WORKDIR/gf_a.s16" 2>/dev/null
+        ffmpeg -y -v error -i "$out" -f s16le "$WORKDIR/gf_b.s16" 2>/dev/null
+        cmp -s "$WORKDIR/gf_a.s16" "$WORKDIR/gf_b.s16" || status="PCM differs over $rewritten rewritten granules"
+    fi
+    if [ "$status" = "ok" ]; then echo "ok    $label  ($rewritten granules)"
+    else FAIL=$((FAIL + 1)); FAILURES+=("$label :: $status"); echo "FAIL  $label  ($status)"; fi
 done
 
 echo ""
