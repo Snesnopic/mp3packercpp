@@ -100,6 +100,7 @@ struct Mp3Frame {
     uint8_t side_info_raw[kMaxSideInfoSize] = {}; ///< Raw bytes of the side info section
     uint8_t side_info_size = 0;                   ///< How many of those bytes there are
 
+    size_t frame_offset = 0;     ///< Where the frame's header starts in the reader's data
     size_t main_data_offset = 0; ///< Where the payload starts in the reader's data
     size_t main_data_size = 0;   ///< Declared payload length, which may run past the data
     size_t main_data_avail = 0;  ///< How much of it the file actually holds

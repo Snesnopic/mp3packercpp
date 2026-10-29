@@ -199,6 +199,32 @@ static bool is_xing_frame(const Mp3Frame& frame, const std::vector<uint8_t>& fil
     return (s.find("Xing") != std::string::npos || s.find("Info") != std::string::npos);
 }
 
+// Where a frame starts in the file. Recorded by the reader rather than worked back
+// from the payload offset: on a frame the file truncates inside its side info, that
+// subtraction went below zero.
+static size_t frame_start_of(const Mp3Frame& frame) {
+    return frame.frame_offset;
+}
+
+// Fraunhofer's alternative to the Xing tag: "VBRI" always 32 bytes after the header,
+// whatever the channel mode or CRC, followed by a byte count, a frame count and a
+// seek table. Decoders that recognise it skip the frame, as they do a Xing frame.
+static bool is_vbri_frame(const Mp3Frame& frame, const std::vector<uint8_t>& file) {
+    const size_t start = frame_start_of(frame);
+    return frame.header.bitrate.frame_size >= 62 && start + 62 <= file.size() &&
+           std::memcmp(file.data() + start + 36, "VBRI", 4) == 0;
+}
+
+static uint32_t read_be(const uint8_t* p, const int n) {
+    uint32_t v = 0;
+    for (int k = 0; k < n; ++k) v = v << 8 | p[k];
+    return v;
+}
+
+static void write_be(uint8_t* p, const int n, const uint32_t v) {
+    for (int k = 0; k < n; ++k) p[k] = static_cast<uint8_t>(v >> (8 * (n - 1 - k)));
+}
+
 struct ChosenBitrate {
     bool padding;
     int data_size;
@@ -406,6 +432,13 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
         // all_frames.erase(all_frames.begin());
         DEBUG_LOG("Detected XING header frame at beginning. Preserving it.");
     }
+    // A VBRI frame used to go through as audio: its tag was dropped as ancillary
+    // data, and a decoder that had been skipping it decoded a frame of silence in its
+    // place instead. It holds no audio, so it is copied through whole and only its
+    // numbers are brought up to date.
+    const bool has_vbri = !has_xing && is_vbri_frame(all_frames[0], file);
+    const bool has_tag_frame = has_xing || has_vbri;
+
     size_t N = all_frames.size();
     DEBUG_LOG("Optimizing " << N << " audio frames...");
 
@@ -446,6 +479,11 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
             if (i >= N) break;
 
             auto& frame = all_frames[i];
+            if (has_vbri && i == 0) {
+                optimized_main_data[i].clear();
+                frame.side_info = SideInfo{};
+                continue;
+            }
             if (has_xing && i == 0) {
                 // output frames are always written without CRC, so "Xing"/"Info" must be at
                 // output mdr[0..3].
@@ -787,6 +825,7 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
     const auto cbr_fits = [&](const int bitrate_kbps) {
         int remainder = 0, reservoir = 0;
         for (size_t i = 0; i < N; ++i) {
+            if (has_vbri && i == 0) continue;   // copied whole at its own size
             bool padded = false;
             const int data_size = cbr_frame_size(version, samplerate, bitrate_kbps, remainder, padded)
                                   - 4 - crc_size_of(i) - side_info_of(i);
@@ -838,6 +877,11 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
         int max_reservoir = max_reservoir_bytes;
 
         ChosenBitrate bitrate_use{};
+        if (has_vbri && i == 0) {
+            chosen_bitrates[0] = {all_frames[0].header.padding, 0, all_frames[0].header.bitrate.index};
+            current_reservoir = 0;
+            continue;
+        }
         if (cbr_bitrate != 0) {
             bool padded = false;
             const int frame_size = cbr_frame_size(version, samplerate, cbr_bitrate, cbr_remainder, padded);
@@ -929,13 +973,24 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
 
     // audio frame byte positions in the output file (index 0 = first audio frame, i.e. frame 1 if has_xing)
     std::vector<size_t> audio_frame_file_pos;
+    const size_t vbri_file_pos = has_vbri ? out_bytes.size() : SIZE_MAX;
 
     for (size_t i = 0; i < N_out; ++i) {
         const auto& frame = all_frames[i];
         const auto& side = frame.side_info;
 
-        if (has_xing && i > 0)
+        if (has_tag_frame && i > 0)
             audio_frame_file_pos.push_back(out_bytes.size());
+
+        if (has_vbri && i == 0) {
+            chosen_bitrates[i] = {frame.header.padding, 0, frame.header.bitrate.index};
+            const size_t start = frame_start_of(frame);
+            const size_t size = frame.header.bitrate.frame_size;
+            const size_t have = start < file.size() ? std::min(size, file.size() - start) : 0;
+            append(file.data() + start, have);
+            out_bytes.resize(out_bytes.size() + (size - have), 0x00);
+            continue;
+        }
 
         ChosenBitrate bitrate_use = chosen_bitrates[i];
 
@@ -1100,6 +1155,59 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
                 const uint8_t tb[2] = {static_cast<uint8_t>(tag >> 8), static_cast<uint8_t>(tag & 0xFF)};
                 patch(tag_crc_pos, tb, 2);
             }
+        }
+    }
+
+    if (has_vbri && vbri_file_pos + 62 <= out_bytes.size()) {
+        uint8_t* v = out_bytes.data() + vbri_file_pos;
+        // The byte count is moved by exactly what the repack saved, which keeps
+        // whatever the encoder meant it to cover — with or without this frame.
+        const size_t in_start = frame_start_of(all_frames[0]);
+        const size_t in_end = file.size() - reader.get_end_junk().size();
+        const long long delta = static_cast<long long>(mp3_end_pos - vbri_file_pos)
+                              - static_cast<long long>(in_end - in_start);
+        const long long bytes = std::max(0LL, static_cast<long long>(read_be(v + 46, 4)) + delta);
+        write_be(v + 46, 4, static_cast<uint32_t>(std::min(bytes, 0xFFFFFFFFLL)));
+
+        // The seek table: entries of frames_per_entry frames each, as a byte size
+        // divided by a scale. Which frames the first entry starts at and how the
+        // division rounds are not pinned down anywhere, so the table is rebuilt only
+        // under the reading that reproduces the input's own table exactly; under any
+        // other it is left as it came.
+        const uint32_t entries = read_be(v + 54, 2), scale = read_be(v + 56, 2);
+        const uint32_t width = read_be(v + 58, 2), per_entry = read_be(v + 60, 2);
+        const size_t frame0_size = all_frames[0].header.bitrate.frame_size;
+        if (entries > 0 && scale > 0 && width >= 1 && width <= 4 && per_entry > 0 &&
+            62 + static_cast<size_t>(entries) * width <= frame0_size) {
+            std::vector<size_t> in_sizes, out_sizes;
+            for (size_t i = 0; i < N; ++i) in_sizes.push_back(all_frames[i].header.bitrate.frame_size);
+            out_sizes.push_back(frame0_size);
+            for (size_t k = 0; k < audio_frame_file_pos.size(); ++k) {
+                const size_t end = k + 1 < audio_frame_file_pos.size() ? audio_frame_file_pos[k + 1] : mp3_end_pos;
+                out_sizes.push_back(end - audio_frame_file_pos[k]);
+            }
+            const auto table_for = [&](const std::vector<size_t>& sizes, const size_t first, const bool round) {
+                std::vector<uint32_t> t;
+                for (uint32_t e = 0; e < entries; ++e) {
+                    size_t sum = 0;
+                    for (size_t f = first + e * per_entry; f < first + (e + 1) * per_entry && f < sizes.size(); ++f) sum += sizes[f];
+                    t.push_back(static_cast<uint32_t>(round ? (sum + scale / 2) / scale : sum / scale));
+                }
+                return t;
+            };
+            std::vector<uint32_t> stored;
+            for (uint32_t e = 0; e < entries; ++e) stored.push_back(read_be(v + 62 + e * width, static_cast<int>(width)));
+            const auto rebuild = [&] {
+                for (const size_t first : {size_t{1}, size_t{0}}) {
+                    for (const bool round : {false, true}) {
+                        if (table_for(in_sizes, first, round) != stored) continue;
+                        const auto rebuilt = table_for(out_sizes, first, round);
+                        for (uint32_t e = 0; e < entries; ++e) write_be(v + 62 + e * width, static_cast<int>(width), rebuilt[e]);
+                        return;
+                    }
+                }
+            };
+            rebuild();
         }
     }
 

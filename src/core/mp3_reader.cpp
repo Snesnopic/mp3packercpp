@@ -199,6 +199,7 @@ std::optional<Mp3Frame> Mp3Reader::read_next_frame() {
 
         DEBUG_LOG("Successfully parsed valid MP3 header: " << std::hex << header_bits << std::dec << " at stream pos " << (pos_ - 4));
         Mp3Frame frame;
+        frame.frame_offset = pos_ - 4;
         header->bitrate.frame_size = calculate_frame_size(*header);
         frame.header = *header;
 
