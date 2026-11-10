@@ -102,6 +102,8 @@ check_case() {
             cbr_status="--ib said $reported but output is $seen"
         elif [ "$(xing_magic "$cbr_out")" = "Xing" ]; then
             cbr_status="constant-bitrate output still tagged Xing"
+        elif [ "$(xing_report "$cbr_out" | cut -d' ' -f4)" = "bad" ]; then
+            cbr_status="constant-bitrate output has a stale LAME MusicLength"
         fi
     fi
     # And the reverse: a repack that leaves the frames at varying bitrates must not
@@ -150,6 +152,8 @@ check_case() {
         local def_x; def_x="$(xing_report "$out_t1")"
         if [ "$(echo "$def_x" | cut -d' ' -f3)" = "bad" ]; then
             xing_status="default output has stale LAME checksums"
+        elif [ "$(echo "$def_x" | cut -d' ' -f4)" = "bad" ]; then
+            xing_status="default output has a stale LAME MusicLength"
         elif ! "$BIN" -z --preserve-xing "$src" "$xing_out" >/dev/null 2>&1; then
             xing_status="--preserve-xing pack failed"
         elif ! ffmpeg -y -v error -i "$xing_out" -f f32le "$pcm_xing" 2>/dev/null; then
@@ -161,6 +165,8 @@ check_case() {
                 xing_status="--preserve-xing $d_x PCM diffs"
             elif [ "$(echo "$out_x" | cut -d' ' -f3)" = "bad" ]; then
                 xing_status="stale LAME checksums under --preserve-xing"
+            elif [ "$(echo "$out_x" | cut -d' ' -f4)" = "bad" ]; then
+                xing_status="stale LAME MusicLength under --preserve-xing"
             elif [ "$(echo "$out_x" | cut -d' ' -f1,2)" != "$(echo "$src_x" | cut -d' ' -f1,2)" ]; then
                 xing_status="frame/tag was [$src_x], output is [$out_x]"
             fi
@@ -201,10 +207,13 @@ print('Xing' if b'Xing' in w else 'Info' if b'Info' in w else 'none')
 " "$1"
 }
 
-# "<frame0_bytes> <tag_bytes> <lame_crc>" for a file: how long the xing frame and
-# its tag are, and whether the two checksums the LAME extension carries agree with
-# a recomputation ("ok", "bad", or "none" when there is no extension). Those
-# checksums cover the audio and the tag itself, both of which a repack rewrites.
+# "<frame0_bytes> <tag_bytes> <lame_crc> <music_length>" for a file: how long the
+# xing frame and its tag are, whether the two checksums the LAME extension carries
+# agree with a recomputation, and whether its MusicLength equals the bytes from the
+# start of the xing frame to the end of the last frame ("ok", "bad", or "none" when
+# there is no extension). All three describe audio a repack rewrites; MusicLength
+# used to go through stale, so a checker reading that many bytes to verify the
+# music checksum read the wrong range.
 xing_report() {
     python3 -c "
 import sys
@@ -243,7 +252,19 @@ if off+36<=size and 0x20<=fr[off]<=0x7E:
     sm=(fr[off+32]<<8)|fr[off+33]
     st=(fr[off+34]<<8)|fr[off+35]
     state='ok' if (sm==crc(d[i+size:end]) and st==crc(fr[:off+34])) else 'bad'
-print(size, size-t, state)
+length='none'
+if state!='none':
+    j=i; last=i
+    while j+4<=len(d) and d[j]==0xFF and (d[j+1]&0xE0)==0xE0:
+        vv=(d[j+1]>>3)&3
+        b=(v1 if vv==3 else v2)[(d[j+2]>>4)&0xF]
+        if not b: break
+        hz=[44100,48000,32000][(d[j+2]>>2)&3]//(1 if vv==3 else (2 if vv==2 else 4))
+        z=(144 if vv==3 else 72)*b*1000//hz+((d[j+2]>>1)&1)
+        if j+z>len(d): break
+        j+=z; last=j
+    length='ok' if int.from_bytes(fr[off+28:off+32],'big')==last-i else 'bad'
+print(size, size-t, state, length)
 " "$1"
 }
 

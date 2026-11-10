@@ -1196,6 +1196,7 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
     // the result plays. The tag says which: its frame count, or failing that its
     // byte count, is held against the head alone and against head and tail.
     size_t stream_end = mp3_end_pos;
+    size_t stream_end_in = file.size() - end_junk.size();   // the same point in the input
     if (has_xing && !tail_frames.empty() && optimized_main_data[0].size() >= 16) {
         const uint8_t* tag = optimized_main_data[0].data();
         const uint32_t flags = read_be(tag + 4, 4);
@@ -1215,6 +1216,7 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
         if (whole) {
             for (const size_t at : tail_frames) audio_frame_file_pos.push_back(mp3_end_pos + at);
             stream_end = mp3_end_pos + tail_end;
+            stream_end_in += tail_end;
         }
     }
     
@@ -1299,6 +1301,22 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
             const size_t lame_pos = main_data_base + lame_off;
             if (lame_pos < mp3_end_pos &&
                 lame_extension_at(out_bytes.data() + lame_pos, mp3_end_pos - lame_pos)) {
+                // MusicLength: the bytes from the start of this frame to the end of the
+                // last audio frame — every source checked holds exactly that, from lame
+                // and ffmpeg alike — and the repack moves it as surely as the byte
+                // count. It used to go through as it arrived, so a checker reading that
+                // many bytes to verify the music checksum read the wrong range. A value
+                // following that reading is replaced; any other is moved by what the
+                // repack saved; zero, which means unset, is left alone.
+                const uint32_t length_in = read_be(out_bytes.data() + lame_pos + 28, 4);
+                if (length_in != 0) {
+                    const long long measured_in = static_cast<long long>(stream_end_in - frame_start_of(all_frames[0]));
+                    const long long measured_out = static_cast<long long>(stream_end - xing_header_file_pos);
+                    const long long length_out = length_in == measured_in ? measured_out
+                                                 : static_cast<long long>(length_in) + (measured_out - measured_in);
+                    write_be(out_bytes.data() + lame_pos + 28, 4,
+                             static_cast<uint32_t>(std::clamp(length_out, 0LL, 0xFFFFFFFFLL)));
+                }
                 if (!audio_frame_file_pos.empty() && audio_frame_file_pos[0] < stream_end) {
                     const size_t audio_start = audio_frame_file_pos[0];
                     const uint16_t music = crc16_lame(out_bytes.data() + audio_start,
