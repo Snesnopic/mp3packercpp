@@ -63,14 +63,19 @@ jobs:
             install_deps: sudo apt-get update && sudo apt-get install -y g++-multilib
             asset_name: mp3packercpp-linux-x86
 
+          # Without a deployment target the binary requires the runner's own macOS,
+          # so every runner upgrade would quietly drop users. 10.15 is the floor for
+          # std::filesystem; 11.0 is the first macOS on Apple Silicon.
           - name: macOS Intel
             os: macos-15-intel
             arch: x64
+            cmake_args: -DCMAKE_OSX_DEPLOYMENT_TARGET=10.15
             asset_name: mp3packercpp-darwin-x64
 
           - name: macOS ARM64
-            os: macos-14
+            os: macos-15
             arch: arm64
+            cmake_args: -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0
             asset_name: mp3packercpp-darwin-arm64
 
     steps:
