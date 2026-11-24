@@ -28,6 +28,10 @@ add_executable(scalefactor_test scalefactor_test.cpp)
 target_link_libraries(scalefactor_test PRIVATE mp3packercpp_core)
 add_test(NAME scalefactor COMMAND scalefactor_test)
 
+add_executable(layout_test layout_test.cpp)
+target_link_libraries(layout_test PRIVATE mp3packercpp_core)
+add_test(NAME layout COMMAND layout_test)
+
 # fixture maker for scripts/test_matrix.sh, not a test of its own
 add_executable(sf_inflate sf_inflate.cpp)
 target_link_libraries(sf_inflate PRIVATE mp3packercpp_core)

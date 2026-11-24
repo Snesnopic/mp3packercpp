@@ -4,6 +4,7 @@
 #include "include/mp3_reader.hpp"
 #include "include/bitstream.hpp"
 #include "include/scalefactors.hpp"
+#include "include/layout.hpp"
 #include <array>
 #include <iostream>
 #include <algorithm>
@@ -910,45 +911,54 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
     size_t n_lay = N;          // frames laid out afresh; [n_lay, N) go through as they arrived
     size_t glue = 0;           // original bytes closing the repacked part, for F to reach back into
     const int reservoir_cap = (version == MpegVersion::MPEG1) ? 511 : 255;
-    const auto unconsumed_after = [&](const size_t end, const size_t extra) {
-        std::vector<int> req(end + 1, 0);
-        for (size_t k = end; k-- > 0;) {
-            const int need = static_cast<int>(optimized_main_data[k].size() + (k + 1 == end ? extra : 0)) + req[k + 1];
-            req[k] = std::max(0, need - bytes_to_bitrate(version, samplerate, side_info_of(k), 9999, crc_size_of(k)).data_size);
-        }
-        int r = 0, mdb_last = 0, excess_last = 0;
-        for (size_t k = 0; k < end; ++k) {
-            const int n = static_cast<int>(optimized_main_data[k].size() + (k + 1 == end ? extra : 0));
-            if (has_vbri && k == 0) continue;
-            int d;
-            if (has_xing && k == 0) {
-                d = this->preserve_xing
-                    ? bitrate_at_index(version, samplerate, side_info_of(0), all_frames[0].header.bitrate.index,
-                                       all_frames[0].header.bitrate.padding, crc_size_of(0)).data_size
-                    : bytes_to_bitrate(version, samplerate, side_info_of(0), n, crc_size_of(0)).data_size;
-            } else {
-                d = bytes_to_bitrate(version, samplerate, side_info_of(k), std::max(0, n + req[k + 1] - r), crc_size_of(k)).data_size;
-            }
-            if (k + 1 == end) mdb_last = r;
-            int projected = r + d - n;
-            if (projected > reservoir_cap) {
-                if (k + 1 == end) excess_last = projected - reservoir_cap;
-                projected = reservoir_cap;
-            }
-            r = (has_xing && k == 0) ? 0 : projected;
-        }
-        const int moved = end >= 2 ? std::min(r, mdb_last) : 0;
-        return excess_last + r - moved + static_cast<int>(extra);
+    const FrameLayout layout(version, samplerate, reservoir_cap);
+    // A tag frame keeps the size its tag needs, or with --preserve-xing the one it
+    // arrived at, and no audio reaches back into it.
+    const auto tag_bitrate = [&]() {
+        if (this->preserve_xing)
+            return bitrate_at_index(version, samplerate, side_info_of(0), all_frames[0].header.bitrate.index,
+                                    all_frames[0].header.bitrate.padding, crc_size_of(0));
+        return bytes_to_bitrate(version, samplerate, side_info_of(0), static_cast<int>(optimized_main_data[0].size()),
+                                crc_size_of(0));
     };
+    const auto layout_frame = [&](const size_t i) {
+        LayoutFrame f;
+        f.need = static_cast<int>(optimized_main_data[i].size());
+        f.overhead = 4 + crc_size_of(i) + side_info_of(i);
+        if (i == 0 && has_vbri) {
+            f.fixed = true;
+            f.fixed_index = all_frames[0].header.bitrate.index;
+            f.fixed_padding = all_frames[0].header.padding;
+        } else if (i == 0 && has_xing) {
+            const ChosenBitrate b = tag_bitrate();
+            f.fixed = true;
+            f.fixed_index = b.index;
+            f.fixed_padding = b.padding;
+        }
+        return f;
+    };
+    bool seamed = false;
     if (tail_reach > 0) {
         const size_t first_audio = has_tag_frame ? 1 : 0;
         n_lay = first_audio;
         // a constant bitrate cannot be held across frames copied at their own sizes
-        if (!(this->constant_bitrate || this->min_bitrate_kbps > 0)) {
+        if (!(this->constant_bitrate || this->min_bitrate_kbps > 0) && N > first_audio + 1) {
+            // the cheapest way into each of the last frames, for every candidate at once
+            std::vector<LayoutFrame> all(N);
+            for (size_t i = 0; i < N; ++i) all[i] = layout_frame(i);
+            const size_t first = N > 65 ? N - 65 : 0;
+            const auto costs = layout.costs_from(all, first);
             for (size_t f = N - 1; f > first_audio && f + 64 >= N; --f) {
                 const size_t k = all_frames[f].side_info.main_data_begin;   // still the input's
                 if (k > frame_main_starts[f] || static_cast<int>(k) > reservoir_cap) continue;
-                if (unconsumed_after(f, k) <= reservoir_cap) { n_lay = f; glue = k; break; }
+                LayoutFrame last = all[f - 1];
+                last.need += static_cast<int>(k);
+                if (layout.seam_fits(costs[f - 1 - first], last, {static_cast<int>(k), f >= 2})) {
+                    n_lay = f;
+                    glue = k;
+                    seamed = true;
+                    break;
+                }
             }
         }
         if (glue > 0) {
@@ -959,19 +969,6 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
         for (size_t k = n_lay; k < N; ++k) optimized_main_data[k].clear();
     }
 
-    // backward pass constraint solver
-    std::vector<int> required_carryover(N, 0);
-    int current_req = 0;
-    for (int i = static_cast<int>(n_lay) - 1; i >= 0; --i) {
-        int space_needed = static_cast<int>(optimized_main_data[i].size()) + current_req;
-        
-        // we allow the forward pass to use up to 320 kbps if needed, so the backward pass should assume max capacity.
-        ChosenBitrate max_br = bytes_to_bitrate(version, samplerate, side_info_of(static_cast<size_t>(i)), 9999, crc_size_of(static_cast<size_t>(i)));
-        int max_data_per_frame = max_br.data_size;
-        
-        current_req = std::max(0, space_needed - max_data_per_frame);
-        required_carryover[i] = current_req;
-    }
     // The reservoir is described rather than built. Deciding a frame's size and its
     // reservoir offset takes lengths only, so the first pass records the pieces —
     // each frame's data, and the run of zeros left at the end where the reservoir
@@ -1040,6 +1037,16 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
     std::vector<ChosenBitrate> chosen_bitrates(N);
     int cbr_remainder = 0;
 
+    // Variable bitrate: every frame's bitrate and padding from the layout that makes
+    // the stream as short as it can be (see FrameLayout).
+    std::vector<LayoutStep> steps;
+    if (cbr_bitrate == 0) {
+        std::vector<LayoutFrame> frames(n_lay);
+        for (size_t i = 0; i < n_lay; ++i) frames[i] = layout_frame(i);
+        const LayoutSeam seam{static_cast<int>(glue), n_lay >= 2};
+        steps = layout.solve(frames, seamed ? &seam : nullptr);
+    }
+
     // pass 1: build global_main_data and calculate main_data_begin
     for (size_t i = 0; i < n_lay; ++i) {
         auto& side = all_frames[i].side_info;
@@ -1056,21 +1063,13 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
             bool padded = false;
             const int frame_size = cbr_frame_size(version, samplerate, cbr_bitrate, cbr_remainder, padded);
             bitrate_use = {padded, frame_size - 4 - crc_size_of(i) - side_info_of(i), cbr_index};
-        } else if (has_xing && i == 0 && this->preserve_xing) {
-            // Keep the frame the length the encoder gave it. Dropping the crc frees
-            // exactly the two bytes the recovered "Xi"/"In" takes back, so the tag
-            // lands in the same payload it came out of, byte for byte.
-            bitrate_use = bitrate_at_index(version, samplerate, side_info_of(0),
-                                           all_frames[0].header.bitrate.index,
-                                           all_frames[0].header.bitrate.padding, crc_size_of(i));
         } else if (has_xing && i == 0) {
-            // use minimum bitrate that fits the trimmed Xing tag content
-            int needed = static_cast<int>(optimized_main_data[0].size());
-            bitrate_use = bytes_to_bitrate(version, samplerate, side_info_of(i), needed, crc_size_of(i));
+            // With --preserve-xing the frame keeps the length the encoder gave it:
+            // dropping the crc frees exactly the two bytes the recovered "Xi"/"In"
+            // takes back, so the tag lands in the payload it came out of, byte for byte.
+            bitrate_use = tag_bitrate();
         } else {
-            int req_for_next = (i + 1 < n_lay) ? required_carryover[i + 1] : 0;
-            int bytes_needed = std::max(0, static_cast<int>(optimized_main_data[i].size()) + req_for_next - current_reservoir);
-            bitrate_use = bytes_to_bitrate(version, samplerate, side_info_of(i), bytes_needed, crc_size_of(i));
+            bitrate_use = {steps[i].padding, steps[i].data_size, steps[i].index};
         }
 
         int data_size = bitrate_use.data_size;

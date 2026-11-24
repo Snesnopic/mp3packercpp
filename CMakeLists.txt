@@ -22,6 +22,7 @@ add_library(mp3packercpp_core STATIC
             src/core/mp3_reader.cpp
             src/core/packer.cpp
             src/core/scalefactors.cpp
+            src/core/layout.cpp
             src/core/decoder.cpp)
 
 target_include_directories(mp3packercpp_core PUBLIC src/core/include)
