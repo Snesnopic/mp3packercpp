@@ -32,10 +32,17 @@ int slen_of(const Mpeg1Scalefactors& s, const int cell) {
                                                   : kSlen2[s.scalefac_compress & 15];
 }
 
-// the part of a cell's step exponent that the scalefactors carry, in quarter steps
-int exponent(const bool short_block, const bool scale, const bool preflag, const int cell, const int value) {
-    const int pre = (!short_block && preflag) ? kPretab[cell] : 0;
-    return (value + pre) << (scale ? 2 : 1);
+// The part of a cell's step exponent, in quarter steps, that the scalefactors and
+// subblock_gain carry. Every decoder sums the two terms as integers before it builds
+// the step, so any split of the same total is heard the same.
+int exponent(const bool short_block, const bool scale, const bool preflag, const uint8_t* subblock_gain,
+             const int cell, const int value) {
+    if (short_block) return (subblock_gain[cell % 3] << 3) + (value << (scale ? 2 : 1));
+    return (value + (preflag ? kPretab[cell] : 0)) << (scale ? 2 : 1);
+}
+
+int exponent(const Mpeg1Scalefactors& s, const int cell, const int value) {
+    return exponent(s.short_block, s.scalefac_scale, s.preflag, s.subblock_gain, cell, value);
 }
 
 int cheapest_compress(const int max1, const int n1, const int max2, const int n2, int& bits) {
@@ -84,12 +91,17 @@ int short_cost(const uint8_t* v, int& compress) {
 struct Candidate {
     bool scale = false;
     bool preflag = false;
+    uint8_t subblock_gain[3] = {};
     uint8_t v[kMaxScalefactorCells] = {};  // inactive cells left at 0
 };
 
 // every scalefac_scale/preflag pair under which each active cell keeps its exponent
 int candidates(const Mpeg1Scalefactors& s, Candidate out[4]) {
     const int cells = mpeg1_cell_count(s);
+    int e[kMaxScalefactorCells] = {};
+    for (int c = 0; c < cells; ++c) {
+        if (s.active[c]) e[c] = exponent(s, c, s.values[c]);
+    }
     int n = 0;
     for (int scale = 0; scale < 2; ++scale) {
         for (int pf = 0; pf < 2; ++pf) {
@@ -98,14 +110,31 @@ int candidates(const Mpeg1Scalefactors& s, Candidate out[4]) {
             Candidate q;
             q.scale = scale != 0;
             q.preflag = s.short_block ? s.preflag : pf != 0;
+            std::copy(s.subblock_gain, s.subblock_gain + 3, q.subblock_gain);
+            if (s.short_block) {
+                // each window's subblock_gain takes as much of its heard cells' exponents
+                // as all of them allow: that only lowers what is left to the scalefactors
+                for (int w = 0; w < 3; ++w) {
+                    if (s.last_band_active[w]) continue;
+                    int gain = 7;
+                    bool heard = false;
+                    for (int c = w; c < cells; c += 3) {
+                        if (!s.active[c]) continue;
+                        heard = true;
+                        gain = std::min(gain, e[c] >> 3);
+                    }
+                    if (heard) q.subblock_gain[w] = static_cast<uint8_t>(gain);
+                }
+            }
             const int shift = scale ? 2 : 1;
             bool ok = true;
             for (int c = 0; c < cells && ok; ++c) {
                 if (!s.active[c]) continue;
-                const int e = exponent(s.short_block, s.scalefac_scale, s.preflag, c, s.values[c]);
+                const int rest = e[c] - (s.short_block ? q.subblock_gain[c % 3] << 3 : 0);
                 const int pre = (!s.short_block && q.preflag) ? kPretab[c] : 0;
-                const int v = (e >> shift) - pre;
-                ok = (e & ((1 << shift) - 1)) == 0 && v >= 0 && v <= (c < first_slen2_cell(s.short_block) ? 15 : 7);
+                const int v = (rest >> shift) - pre;
+                ok = rest >= 0 && (rest & ((1 << shift) - 1)) == 0 && v >= 0 &&
+                     v <= (c < first_slen2_cell(s.short_block) ? 15 : 7);
                 if (ok) q.v[c] = static_cast<uint8_t>(v);
             }
             if (ok) out[n++] = q;
@@ -127,14 +156,15 @@ bool same_steps(const Mpeg1ScalefactorChannel& a, const Mpeg1ScalefactorChannel&
         const Mpeg1Scalefactors& sb = b.gr[gr];
         if (sa.short_block != sb.short_block) return false;
         if (sa.short_block && sa.preflag != sb.preflag) return false;
+        for (int w = 0; w < 3; ++w) {
+            if (sa.short_block && sa.last_band_active[w] && sa.subblock_gain[w] != sb.subblock_gain[w]) return false;
+        }
         for (int cell = 0; cell < mpeg1_cell_count(sb); ++cell) {
             const int v = resolved_value(b, gr, cell);
             if (v >= (1 << slen_of(gr == 1 && b.scfsi[group_of(cell)] && !sb.short_block ? b.gr[0] : sb, cell)))
                 return false;
             if (!sa.active[cell]) continue;
-            if (exponent(sa.short_block, sa.scalefac_scale, sa.preflag, cell, resolved_value(a, gr, cell)) !=
-                exponent(sb.short_block, sb.scalefac_scale, sb.preflag, cell, v))
-                return false;
+            if (exponent(sa, cell, resolved_value(a, gr, cell)) != exponent(sb, cell, v)) return false;
         }
     }
     return true;
@@ -188,6 +218,7 @@ bool mpeg1_mark_active(Mpeg1Scalefactors& s, const Spectrum& coeffs, const uint3
         return false;
     };
     std::fill(std::begin(s.active), std::end(s.active), false);
+    std::fill(std::begin(s.last_band_active), std::end(s.last_band_active), false);
     if (s.short_block) {
         // short-block coefficients arrive band by band, and within a band window by window
         const int* edge = kShortEdges[sr];
@@ -197,6 +228,11 @@ bool mpeg1_mark_active(Mpeg1Scalefactors& s, const Spectrum& coeffs, const uint3
                 const int from = 3 * edge[band] + win * width;
                 s.active[band * 3 + win] = nonzero(from, from + width);
             }
+        }
+        const int width = edge[13] - edge[12];
+        for (int win = 0; win < 3; ++win) {
+            const int from = 3 * edge[12] + win * width;
+            s.last_band_active[win] = nonzero(from, from + width);
         }
     } else {
         for (int band = 0; band < kLongCells; ++band) {
@@ -252,6 +288,7 @@ bool mpeg1_recode_scalefactors(Mpeg1ScalefactorChannel& c, const bool allow_scfs
                         best.gr[gr].scalefac_scale = q[gr]->scale;
                         best.gr[gr].preflag = q[gr]->preflag;
                         best.gr[gr].scalefac_compress = static_cast<uint8_t>(k[gr]);
+                        std::copy(q[gr]->subblock_gain, q[gr]->subblock_gain + 3, best.gr[gr].subblock_gain);
                         std::copy(v[gr], v[gr] + kLongCells, best.gr[gr].values);
                     }
                     for (int grp = 0; grp < 4; ++grp) best.scfsi[grp] = (pattern >> grp) & 1u;
@@ -273,6 +310,7 @@ bool mpeg1_recode_scalefactors(Mpeg1ScalefactorChannel& c, const bool allow_scfs
                 s.scalefac_scale = cand[gr][i].scale;
                 s.preflag = cand[gr][i].preflag;
                 s.scalefac_compress = static_cast<uint8_t>(k);
+                std::copy(cand[gr][i].subblock_gain, cand[gr][i].subblock_gain + 3, s.subblock_gain);
                 std::copy(cand[gr][i].v, cand[gr][i].v + mpeg1_cell_count(s), s.values);
             }
             bits += gr_best;

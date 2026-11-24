@@ -16,9 +16,12 @@ struct Mpeg1Scalefactors {
     bool short_block = false;      // block_type 2: band * 3 + window, else 21 long bands
     bool scalefac_scale = false;
     bool preflag = false;          // decoders read it on long blocks only
+    uint8_t subblock_gain[3] = {}; // short blocks: (gain << 3) joins each cell of its window
     uint8_t scalefac_compress = 0;
     uint8_t values[kMaxScalefactorCells] = {};
     bool active[kMaxScalefactorCells] = {};     // the cell holds a nonzero coefficient
+    bool last_band_active[3] = {};  // short: band 12 has no scalefactor, so a window whose
+                                    // band 12 is heard must keep its subblock_gain
     bool any_nonzero = false;
 };
 
@@ -36,11 +39,12 @@ int mpeg1_scalefactor_bits(const Mpeg1ScalefactorChannel& c, int gr);
 bool mpeg1_mark_active(Mpeg1Scalefactors& s, const Spectrum& coeffs, uint32_t samplerate);
 
 // Re-codes a channel's scalefactors into the fewest bits. Every active cell keeps
-// its exponent as the same integer, (value + preflag * pretab) << (scalefac_scale + 1),
-// and global_gain and subblock_gain never change, so a decoder that builds the step
-// from two float factors (minimp3) outputs the same PCM as one that builds it from
-// the integer (ffmpeg, mpg123). scfsi is chosen only with both granules long and
-// allow_scfsi. Leaves c untouched and returns false unless bits are saved.
+// its exponent as the same integer — (value + preflag * pretab) << (scalefac_scale + 1)
+// on long blocks, (subblock_gain << 3) + (value << (scalefac_scale + 1)) on short ones —
+// and global_gain never changes, so a decoder that builds the step from two float
+// factors (minimp3) outputs the same PCM as one that builds it from the integer
+// (ffmpeg, mpg123). scfsi is chosen only with both granules long and allow_scfsi.
+// Leaves c untouched and returns false unless bits are saved.
 bool mpeg1_recode_scalefactors(Mpeg1ScalefactorChannel& c, bool allow_scfsi);
 
 }  // namespace mp3packer

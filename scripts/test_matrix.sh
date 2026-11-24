@@ -738,6 +738,13 @@ done
 #   intensity — the frames also get the intensity stereo bit, which turns the right
 #               channel's free cells into intensity positions; the repack must keep
 #               them (without that guard it changes what every decoder plays)
+#   subblock  — each short-block window moves steps between its subblock_gain and its
+#               heard cells' scalefactors, 8 quarter steps per unit: the fixture must
+#               decode as its source, which checks that decoders sum the two terms as
+#               one integer, and the repack must come out the size the source's does
+#   band12    — short band 12 has no scalefactor, so a window whose band 12 is heard
+#               must keep its subblock_gain; noise bursts up to the lowpass make
+#               exactly those windows, and a plain -z repack must stay lossless
 SF_INFLATE="$(dirname "$BIN")/sf_inflate"
 tone_bursts_wav() { # tone_bursts_wav RATE OUT: decaying tone bursts, short blocks with empty bands
     python3 -c "
@@ -759,11 +766,11 @@ for rate in 44100 48000 32000; do
     tone_bursts_wav "$rate" "$WORKDIR/sf.wav"
     lame --quiet -V6 "$WORKDIR/sf.wav" "$WORKDIR/sf_src.mp3"
     ffmpeg -y -v error -i "$WORKDIR/sf_src.mp3" -f s16le "$WORKDIR/sf_a.s16" 2>/dev/null
-    for mode in free intensity; do
+    for mode in free intensity subblock; do
         TOTAL=$((TOTAL + 1))
         label="scalefactors/$mode/${rate}Hz"
         fix="$WORKDIR/sf_fix.mp3"; status=ok; filled=""
-        flag=""; [ "$mode" = "intensity" ] && flag="--intensity"
+        flag=""; [ "$mode" != "free" ] && flag="--$mode"
         if [ ! -x "$SF_INFLATE" ]; then status="$SF_INFLATE not built"
         else
             filled="$("$SF_INFLATE" "$WORKDIR/sf_src.mp3" "$fix" $flag)"
@@ -773,19 +780,33 @@ for rate in 44100 48000 32000; do
             else
                 ffmpeg -y -v error -i "$fix" -f s16le "$WORKDIR/sf_b.s16" 2>/dev/null
                 ffmpeg -y -v error -i "$WORKDIR/sf_fix_out.mp3" -f s16le "$WORKDIR/sf_c.s16" 2>/dev/null
-                if [ "$mode" = "free" ] && ! cmp -s "$WORKDIR/sf_a.s16" "$WORKDIR/sf_b.s16"; then
-                    status="fixture decodes differently from its source: a heard cell was taken for free"
+                if [ "$mode" != "intensity" ] && ! cmp -s "$WORKDIR/sf_a.s16" "$WORKDIR/sf_b.s16"; then
+                    status="fixture decodes differently from its source"
                 elif ! cmp -s "$WORKDIR/sf_b.s16" "$WORKDIR/sf_c.s16"; then
                     status="PCM differs"
-                elif [ "$mode" = "free" ]; then
+                elif [ "$mode" != "intensity" ]; then
                     a="$(wc -c < "$WORKDIR/sf_src_out.mp3" | tr -d ' ')"; b="$(wc -c < "$WORKDIR/sf_fix_out.mp3" | tr -d ' ')"
                     [ "$a" = "$b" ] || status="repack of the fixture is $b bytes, of its source $a"
                 fi
             fi
         fi
-        if [ "$status" = "ok" ]; then echo "ok    $label  (${filled%% *} cells, ${filled##* } short)"
+        if [ "$status" = "ok" ]; then echo "ok    $label  ($filled)"
         else FAIL=$((FAIL + 1)); FAILURES+=("$label :: $status"); echo "FAIL  $label  ($status)"; fi
     done
+done
+for rate in 44100 48000; do
+    TOTAL=$((TOTAL + 1))
+    label="scalefactors/band12/${rate}Hz"; status=ok
+    clicks_wav "$rate" "$WORKDIR/sf12.wav"
+    lame --quiet -b 128 "$WORKDIR/sf12.wav" "$WORKDIR/sf12.mp3"
+    if ! $BIN -z "$WORKDIR/sf12.mp3" "$WORKDIR/sf12_out.mp3" >/dev/null 2>&1; then status="pack failed"
+    else
+        ffmpeg -y -v error -i "$WORKDIR/sf12.mp3" -f s16le "$WORKDIR/sf12_a.s16" 2>/dev/null
+        ffmpeg -y -v error -i "$WORKDIR/sf12_out.mp3" -f s16le "$WORKDIR/sf12_b.s16" 2>/dev/null
+        cmp -s "$WORKDIR/sf12_a.s16" "$WORKDIR/sf12_b.s16" || status="PCM differs"
+    fi
+    if [ "$status" = "ok" ]; then echo "ok    $label"
+    else FAIL=$((FAIL + 1)); FAILURES+=("$label :: $status"); echo "FAIL  $label  ($status)"; fi
 done
 
 # Stream structure: what sits around the frames rather than inside them. Each of

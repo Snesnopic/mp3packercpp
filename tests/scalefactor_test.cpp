@@ -1,5 +1,6 @@
 // mpeg1_recode_scalefactors against a search that knows nothing of maxima or
-// candidates: every scalefac_compress, scalefac_scale, preflag and scfsi pattern,
+// candidates: every scalefac_compress, scalefac_scale, preflag, scfsi pattern and
+// (short blocks) subblock_gain,
 // each checked band by band for whether a decoder would hear the same step.
 // Also checks that what is written reads back as what was chosen.
 #include "scalefactors.hpp"
@@ -18,16 +19,18 @@ const int kPre[21] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 3, 3, 3
 int cells(bool short_block) { return short_block ? 36 : 21; }
 int width(int k, bool short_block, int cell) { return cell < (short_block ? 18 : 11) ? kS1[k] : kS2[k]; }
 int group(int b) { return b < 6 ? 0 : b < 11 ? 1 : b < 16 ? 2 : 3; }
-int step(bool short_block, bool scale, bool pf, int cell, int v) {
-    return (v + (!short_block && pf ? kPre[cell] : 0)) * (scale ? 4 : 2);
+// what a decoder adds up for one cell: ffmpeg's gain - ((sf << shift) + sbg * 8), less gain
+int step(bool short_block, bool scale, bool pf, const uint8_t* sbg, int cell, int v) {
+    if (short_block) return sbg[cell % 3] * 8 + v * (scale ? 4 : 2);
+    return (v + (pf ? kPre[cell] : 0)) * (scale ? 4 : 2);
 }
 
-// the value a decoder would need under (scale, pf) to hear exponent e, or -1
-int needed(bool short_block, bool scale, bool pf, int cell, int e) {
+// the value a decoder would need under (scale, pf, sbg) to hear exponent e, or -1
+int needed(bool short_block, bool scale, bool pf, const uint8_t* sbg, int cell, int e) {
     const int m = scale ? 4 : 2;
-    if (e % m) return -1;
-    const int v = e / m - (!short_block && pf ? kPre[cell] : 0);
-    return v;
+    const int rest = e - (short_block ? sbg[cell % 3] * 8 : 0);
+    if (rest < 0 || rest % m) return -1;
+    return rest / m - (!short_block && pf ? kPre[cell] : 0);
 }
 
 int resolved(const Mpeg1ScalefactorChannel& c, int gr, int cell) {
@@ -37,24 +40,41 @@ int resolved(const Mpeg1ScalefactorChannel& c, int gr, int cell) {
 
 int bits_of(const Mpeg1ScalefactorChannel& c) { return mpeg1_scalefactor_bits(c, 0) + mpeg1_scalefactor_bits(c, 1); }
 
-// cheapest single granule with nothing reused
+// cheapest single granule with nothing reused; short blocks try every subblock_gain
 int brute_single(const Mpeg1Scalefactors& s, const int* e) {
     int best = 1 << 30;
     for (int scale = 0; scale < 2; ++scale)
         for (int pf = 0; pf < 2; ++pf) {
             const bool p = s.short_block ? s.preflag : pf;
             if (s.short_block && pf) continue;
-            for (int k = 0; k < 16; ++k) {
-                int cost = 0;
+            for (int gains = 0; gains < (s.short_block ? 512 : 1); ++gains) {
+                uint8_t sbg[3] = {s.subblock_gain[0], s.subblock_gain[1], s.subblock_gain[2]};
+                bool keeps_band12 = true;
+                if (s.short_block)
+                    for (int w = 0; w < 3; ++w) {
+                        sbg[w] = static_cast<uint8_t>((gains >> (3 * w)) & 7);
+                        // band 12 carries no scalefactor: its step is subblock_gain's alone
+                        if (s.last_band_active[w] && sbg[w] != s.subblock_gain[w]) keeps_band12 = false;
+                    }
+                if (!keeps_band12) continue;
+                // the value each cell needs, or -1 for free
+                int need[36];
                 bool ok = true;
                 for (int b = 0; b < cells(s.short_block) && ok; ++b) {
-                    const int w = width(k, s.short_block, b);
-                    cost += w;
-                    if (!s.active[b]) continue;
-                    const int v = needed(s.short_block, scale, p, b, e[b]);
-                    ok = v >= 0 && v < (1 << w);
+                    need[b] = s.active[b] ? needed(s.short_block, scale, p, sbg, b, e[b]) : -1;
+                    if (s.active[b] && need[b] < 0) ok = false;
                 }
-                if (ok) best = std::min(best, cost);
+                if (!ok) continue;
+                for (int k = 0; k < 16; ++k) {
+                    int cost = 0;
+                    bool fit = true;
+                    for (int b = 0; b < cells(s.short_block); ++b) {
+                        const int w = width(k, s.short_block, b);
+                        cost += w;
+                        fit = fit && need[b] < (1 << w);
+                    }
+                    if (fit) best = std::min(best, cost);
+                }
             }
         }
     return best;
@@ -71,10 +91,10 @@ int brute_joint(const Mpeg1ScalefactorChannel& c, const int e[2][36], bool allow
             for (int b = 0; b < 21 && ok; ++b) {
                 const bool a0 = c.gr[0].active[b], a1 = c.gr[1].active[b];
                 int v = -1;
-                if (a0) v = needed(false, sc0, pf0, b, e[0][b]);
+                if (a0) v = needed(false, sc0, pf0, nullptr, b, e[0][b]);
                 if (a0 && v < 0) ok = false;
                 if ((pattern >> group(b)) & 1 && a1) {
-                    const int u = needed(false, sc1, pf1, b, e[1][b]);
+                    const int u = needed(false, sc1, pf1, nullptr, b, e[1][b]);
                     if (u < 0 || (a0 && u != v)) ok = false;
                     v = u;
                 }
@@ -96,7 +116,7 @@ int brute_joint(const Mpeg1ScalefactorChannel& c, const int e[2][36], bool allow
                     if ((pattern >> group(b)) & 1) continue;
                     cost += width(k, false, b);
                     if (!c.gr[1].active[b]) continue;
-                    const int u = needed(false, sc1, pf1, b, e[1][b]);
+                    const int u = needed(false, sc1, pf1, nullptr, b, e[1][b]);
                     fit = fit && u >= 0 && u < (1 << width(k, false, b));
                 }
                 if (fit) c1 = std::min(c1, cost);
@@ -121,6 +141,10 @@ int main() {
             s.scalefac_scale = rng() & 1;
             s.preflag = rng() & 1;
             s.scalefac_compress = static_cast<uint8_t>(rng() % 16);
+            for (int w = 0; w < 3; ++w) {
+                s.subblock_gain[w] = s.short_block ? static_cast<uint8_t>(rng() % 8) : 0;
+                s.last_band_active[w] = s.short_block && rng() % 3 == 0;
+            }
             for (int b = 0; b < cells(s.short_block); ++b) {
                 const int w = width(s.scalefac_compress, s.short_block, b);
                 // small values are what encoders write, and what makes scale changes possible
@@ -141,7 +165,7 @@ int main() {
         int e[2][36] = {};
         for (int gr = 0; gr < 2; ++gr)
             for (int b = 0; b < cells(c.gr[gr].short_block); ++b)
-                e[gr][b] = step(c.gr[gr].short_block, c.gr[gr].scalefac_scale, c.gr[gr].preflag, b, resolved(c, gr, b));
+                e[gr][b] = step(c.gr[gr].short_block, c.gr[gr].scalefac_scale, c.gr[gr].preflag, c.gr[gr].subblock_gain, b, resolved(c, gr, b));
 
         const Mpeg1ScalefactorChannel before = c;
         const int bits_before = bits_of(c);
@@ -166,11 +190,16 @@ int main() {
         for (int gr = 0; gr < 2; ++gr) {
             const Mpeg1Scalefactors& s = c.gr[gr];
             if (s.short_block && s.preflag != before.gr[gr].preflag) { printf("trial %d: short preflag changed\n", t); ++fails; }
+            for (int w = 0; w < 3; ++w)
+                if (s.short_block && before.gr[gr].last_band_active[w] && s.subblock_gain[w] != before.gr[gr].subblock_gain[w]) {
+                    printf("trial %d: gr %d window %d: band 12 heard, subblock_gain %d -> %d\n", t, gr, w, before.gr[gr].subblock_gain[w], s.subblock_gain[w]);
+                    ++fails;
+                }
             for (int b = 0; b < cells(s.short_block); ++b) {
                 if (!before.gr[gr].active[b]) continue;
-                if (step(s.short_block, s.scalefac_scale, s.preflag, b, resolved(c, gr, b)) != e[gr][b]) {
+                if (step(s.short_block, s.scalefac_scale, s.preflag, s.subblock_gain, b, resolved(c, gr, b)) != e[gr][b]) {
                     printf("trial %d: gr %d cell %d step %d -> %d\n", t, gr, b, e[gr][b],
-                           step(s.short_block, s.scalefac_scale, s.preflag, b, resolved(c, gr, b)));
+                           step(s.short_block, s.scalefac_scale, s.preflag, s.subblock_gain, b, resolved(c, gr, b)));
                     ++fails;
                 }
             }

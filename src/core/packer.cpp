@@ -675,6 +675,7 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
                             s.scalefac_scale = g.scalefac_scale;
                             s.preflag = g.preflag;
                             s.scalefac_compress = static_cast<uint8_t>(g.scalefac_compress & 15);
+                            std::copy(g.subblock_gain, g.subblock_gain + 3, s.subblock_gain);
                             if (gr == 0) std::copy(frame.side_info.scfsi[ch], frame.side_info.scfsi[ch] + 4, chans[ch].scfsi);
                             mpeg1_read_scalefactors(data_reader, chans[ch], gr);
                         } else {
@@ -744,6 +745,7 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
                             g.scalefac_scale = chans[ch].gr[gr].scalefac_scale;
                             g.preflag = chans[ch].gr[gr].preflag;
                             g.scalefac_compress = chans[ch].gr[gr].scalefac_compress;
+                            std::copy(chans[ch].gr[gr].subblock_gain, chans[ch].gr[gr].subblock_gain + 3, g.subblock_gain);
                         }
                         std::copy(chans[ch].scfsi, chans[ch].scfsi + 4, frame.side_info.scfsi[ch]);
                     }

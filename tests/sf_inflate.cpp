@@ -4,8 +4,13 @@
 // while its scalefactors are as far from the cheapest coding as they can get without
 // moving a bit. With --intensity the joint-stereo frames also get the intensity
 // stereo bit, and the right channel's free cells become intensity positions (1..6),
-// which a repack must keep as they are.
-// usage: sf_inflate IN OUT [--intensity]; prints the cells written, and how many of them short
+// which a repack must keep as they are. With --subblock nothing is filled: instead
+// each short-block window moves as much of its subblock_gain into its heard cells'
+// scalefactors as their fields hold, or, with no subblock_gain to move, as much of
+// what all its heard cells share into subblock_gain — 8 quarter steps per unit either
+// way, which a decoder that sums the two terms as one integer hears the same.
+// usage: sf_inflate IN OUT [--intensity | --subblock]; prints the cells written and
+// how many of them short, or for --subblock the windows moved and the cells rewritten
 #include "huffman.hpp"
 #include "mp3_reader.hpp"
 #include "scalefactors.hpp"
@@ -39,10 +44,12 @@ size_t scalefactor_bits(const GrChInfo& g, bool gr1, const bool scfsi[4]) {
 
 int main(int argc, char** argv) {
     if (argc < 3) {
-        fprintf(stderr, "usage: sf_inflate IN OUT [--intensity]\n");
+        fprintf(stderr, "usage: sf_inflate IN OUT [--intensity | --subblock]\n");
         return 2;
     }
-    const bool intensity = argc > 3 && std::string(argv[3]) == "--intensity";
+    const std::string mode = argc > 3 ? argv[3] : "";
+    const bool intensity = mode == "--intensity";
+    const bool subblock = mode == "--subblock";
     Mp3Reader reader(argv[1]);
     std::vector<Mp3Frame> frames;
     while (auto f = reader.read_next_frame()) frames.push_back(*f);
@@ -63,6 +70,14 @@ int main(int argc, char** argv) {
         for (int k = 0; k < width; ++k, ++bit) {
             const uint8_t mask = static_cast<uint8_t>(0x80 >> (bit & 7));
             uint8_t& byte = file[where[bit >> 3]];
+            byte = ((value >> (width - 1 - k)) & 1) ? (byte | mask) : (byte & ~mask);
+        }
+    };
+
+    const auto put_file = [&](size_t bit, int width, uint32_t value) {
+        for (int k = 0; k < width; ++k, ++bit) {
+            const uint8_t mask = static_cast<uint8_t>(0x80 >> (bit & 7));
+            uint8_t& byte = file[bit >> 3];
             byte = ((value >> (width - 1 - k)) & 1) ? (byte | mask) : (byte & ~mask);
         }
     };
@@ -132,6 +147,55 @@ int main(int argc, char** argv) {
             const bool both_long = !c.gr[0].short_block && !c.gr[1].short_block;
             const bool any_scfsi = c.scfsi[0] || c.scfsi[1] || c.scfsi[2] || c.scfsi[3];
             if (any_scfsi && !both_long) continue;
+            if (subblock) {
+                for (int gr = 0; gr < 2; ++gr) {
+                    const Mpeg1Scalefactors& s = c.gr[gr];
+                    const GrChInfo& g = f.side_info.gr[gr][ch];
+                    if (!s.short_block) continue;
+                    const int s1 = kSlen1[s.scalefac_compress & 15], s2 = kSlen2[s.scalefac_compress & 15];
+                    const int unit = g.scalefac_scale ? 2 : 4;   // scalefactor steps per subblock_gain step
+                    const size_t side = (f.frame_offset + 4 + (f.header.has_crc ? 2 : 0)) * 8 + 9 +
+                                        (n_ch == 1 ? 5 : 3) + static_cast<size_t>(4 * n_ch) +
+                                        static_cast<size_t>(59 * (gr * n_ch + ch)) + 47;
+                    for (int w = 0; w < 3; ++w) {
+                        // band 12 has no scalefactor to take the difference
+                        if (s.last_band_active[w]) continue;
+                        // d > 0 moves d units out of subblock_gain, d < 0 into it
+                        int d = g.subblock_gain[w];
+                        for (; d > 0; --d) {
+                            bool fits = true;
+                            for (int cell = w; cell < 36 && fits; cell += 3) {
+                                const int width = cell < 18 ? s1 : s2;
+                                fits = !s.active[cell] || s.values[cell] + d * unit < (1 << width);
+                            }
+                            if (fits) break;
+                        }
+                        if (g.subblock_gain[w] == 0) {
+                            int shared = 7;
+                            bool heard = false;
+                            for (int cell = w; cell < 36; cell += 3) {
+                                if (!s.active[cell]) continue;
+                                heard = true;
+                                shared = std::min(shared, s.values[cell] / unit);
+                            }
+                            d = heard ? -shared : 0;
+                        }
+                        if (d == 0) continue;
+                        size_t bit = sf_start[gr][ch];
+                        for (int cell = 0; cell < 36; ++cell) {
+                            const int width = cell < 18 ? s1 : s2;
+                            if (cell % 3 == w && s.active[cell]) {
+                                put(bit, width, static_cast<uint32_t>(s.values[cell] + d * unit));
+                                ++written_short;
+                            }
+                            bit += static_cast<size_t>(width);
+                        }
+                        put_file(side + static_cast<size_t>(3 * w), 3, static_cast<uint32_t>(g.subblock_gain[w] - d));
+                        ++written;
+                    }
+                }
+                continue;
+            }
             const bool positions = intensity && joint && ch == 1;
             for (int gr = 0; gr < 2; ++gr) {
                 const Mpeg1Scalefactors& s = c.gr[gr];
