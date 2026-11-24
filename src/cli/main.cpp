@@ -7,7 +7,7 @@
 void printUsage() {
     std::cout << "Usage: mp3packercpp [-z] [-t threads] [--cbr] [-b kbps] [--ib] [-v] <input.mp3> [output.mp3]\n";
     std::cout << "  Without output.mp3 the input is repacked in place.\n";
-    std::cout << "  -z         : Recompress frames to find optimal Huffman settings\n";
+    std::cout << "  -z         : Recompress frames to find optimal Huffman and scalefactor settings\n";
     std::cout << "  -t threads : Number of threads to use (default: auto)\n";
     std::cout << "  --cbr      : Constant-bitrate output at the lowest bitrate that fits\n";
     std::cout << "  -b kbps    : Floor for the constant bitrate, rounded up to a valid one\n";

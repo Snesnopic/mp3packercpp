@@ -24,6 +24,14 @@ if(MP3PACKERCPP_BUILD_FUZZER)
     target_link_options(fuzz_process PRIVATE -fsanitize=fuzzer,address,undefined)
 endif()
 
+add_executable(scalefactor_test scalefactor_test.cpp)
+target_link_libraries(scalefactor_test PRIVATE mp3packercpp_core)
+add_test(NAME scalefactor COMMAND scalefactor_test)
+
+# fixture maker for scripts/test_matrix.sh, not a test of its own
+add_executable(sf_inflate sf_inflate.cpp)
+target_link_libraries(sf_inflate PRIVATE mp3packercpp_core)
+
 add_executable(search_test search_test.cpp)
 target_link_libraries(search_test PRIVATE mp3packercpp_core)
 add_test(NAME search COMMAND search_test)

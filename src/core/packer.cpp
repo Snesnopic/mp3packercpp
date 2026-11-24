@@ -2,8 +2,8 @@
 #include "include/huffman.hpp"
 #include "include/logger.hpp"
 #include "include/mp3_reader.hpp"
-#include "include/huffman.hpp"
 #include "include/bitstream.hpp"
+#include "include/scalefactors.hpp"
 #include <array>
 #include <iostream>
 #include <algorithm>
@@ -104,6 +104,35 @@ static size_t lsf_scalefactor_bits(const GrChInfo& g, const bool intensity_stere
 }
 
 Packer::Packer() = default;
+
+// one granule between reading it and writing it back
+struct GranuleWork {
+    size_t sf_start = 0;
+    size_t sf_bits = 0;
+    bool sf_truncated = false;     // the scalefactors run past the reservoir data
+    int sf_fields[36] = {};
+    HuffmanConfig best;
+};
+
+// The MPEG-1 scalefactor fields of a granule in stream order, as (index, width).
+template <typename F>
+static void for_each_mpeg1_field(const GrChInfo& g, const bool gr1, const bool scfsi[4], F&& f) {
+    static constexpr int slen1_tab[] = {0, 0, 0, 0, 3, 1, 1, 1, 2, 2, 2, 3, 3, 3, 4, 4};
+    static constexpr int slen2_tab[] = {0, 1, 2, 3, 0, 1, 2, 3, 1, 2, 3, 1, 2, 3, 2, 3};
+    const int slen1 = slen1_tab[g.scalefac_compress & 15];
+    const int slen2 = slen2_tab[g.scalefac_compress & 15];
+    if (g.window_switching_flag && g.block_type == 2) {
+        const int n1 = g.mixed_block_flag ? 17 : 18;
+        for (int k = 0; k < n1; ++k) f(k, slen1);
+        for (int k = n1; k < n1 + 18; ++k) f(k, slen2);
+        return;
+    }
+    static constexpr int group_first[5] = {0, 6, 11, 16, 21};
+    for (int grp = 0; grp < 4; ++grp) {
+        if (gr1 && scfsi[grp]) continue;
+        for (int k = group_first[grp]; k < group_first[grp + 1]; ++k) f(k, grp < 2 ? slen1 : slen2);
+    }
+}
 
 // Takes the original raw side_info bytes and sets only the main_data_begin field.
 static std::vector<uint8_t> patch_mdb(const uint8_t* raw, const size_t size, const MpegVersion version, const uint16_t new_mdb) {
@@ -516,9 +545,11 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
     unsigned int active_threads = num_threads > 0 ? num_threads : std::max(1u, std::thread::hardware_concurrency());
 
     auto worker = [&]() {
-        // One pair of spectra per worker, reused for every granule: the coder fills
-        // them and zeroes only the tail it did not write.
-        Spectrum coeffs{}, vcoeffs{};
+        // Per-worker buffers, reused for every frame: the coder fills a spectrum and
+        // zeroes only the tail it did not write.
+        Spectrum spectra[2][2]{}, vcoeffs{};
+        GranuleWork work[2][2];
+        Mpeg1ScalefactorChannel chans[2];
         while (true) {
             size_t i = current_frame.fetch_add(1);
             if (i >= N) break;
@@ -588,14 +619,17 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
             if (!this->recompress_huffman) {
                 optimization_failed = true; // fallback to raw copy of original data
             } else {
+                const bool is_mpeg1 = frame.header.version == MpegVersion::MPEG1;
+                // Every granule is read before any is written: a channel's two granules
+                // have their scalefactors re-coded together, as granule 1 can reuse granule 0's.
                 for (int gr = 0; gr < n_gr; ++gr) {
                 for (int ch = 0; ch < n_ch; ++ch) {
-                    GrChInfo& g = frame.side_info.gr[gr][ch];
+                    const GrChInfo& g = frame.side_info.gr[gr][ch];
+                    GranuleWork& wk = work[gr][ch];
+                    wk.sf_truncated = false;
                     size_t gc_orig_start = data_reader.tell_bit();
 
-                    // read scalefactors
                     int slen1 = 0, slen2 = 0;
-                    const bool is_mpeg1 = frame.header.version == MpegVersion::MPEG1;
 
                     // Where decoders disagree about what a granule holds, the only
                     // repack that is lossless for every one of them is the original
@@ -613,11 +647,6 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
                         slen2 = slen2_tab[g.scalefac_compress];
                     }
 
-                    // Scalefactors are re-emitted exactly as they arrived, so only
-                    // their total length matters. Copying the bits is what Go's
-                    // reference implementation does; reading each field into a
-                    // vector and writing it back cost an allocation per granule and
-                    // some seventy calls through the bit machinery.
                     size_t sf_bits = 0;
                     if (!is_mpeg1) {
                         // LSF (MPEG-2/2.5): different band-group layout and slen
@@ -635,10 +664,22 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
                         if (gr == 0 || !frame.side_info.scfsi[ch][2]) sf_bits += static_cast<size_t>(5 * slen2);
                         if (gr == 0 || !frame.side_info.scfsi[ch][3]) sf_bits += static_cast<size_t>(5 * slen2);
                     }
+                    wk.sf_start = gc_orig_start;
+                    wk.sf_bits = sf_bits;
 
-                    size_t out_start = writer.tell_bit();
+                    const bool mixed = g.window_switching_flag && g.block_type == 2 && g.mixed_block_flag;
                     if (data_reader.tell_bit() + sf_bits <= data_reader.size_bits()) {
-                        writer.copy_from(data_reader, sf_bits);
+                        if (is_mpeg1 && !mixed) {
+                            Mpeg1Scalefactors& s = chans[ch].gr[gr];
+                            s.short_block = g.window_switching_flag && g.block_type == 2;
+                            s.scalefac_scale = g.scalefac_scale;
+                            s.preflag = g.preflag;
+                            s.scalefac_compress = static_cast<uint8_t>(g.scalefac_compress & 15);
+                            if (gr == 0) std::copy(frame.side_info.scfsi[ch], frame.side_info.scfsi[ch] + 4, chans[ch].scfsi);
+                            mpeg1_read_scalefactors(data_reader, chans[ch], gr);
+                        } else {
+                            data_reader.seek_bit(gc_orig_start + sf_bits);
+                        }
                     } else if (!is_mpeg1) {
                         // Rare edge (reservoir truncated mid-scalefactors); the MPEG1
                         // field-by-field path below does not apply to LSF's band
@@ -647,37 +688,13 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
                     } else {
                         // The span reaches past the end of the reservoir data, where
                         // what a read returns depends on the width it was made at, so
-                        // the fields are read and written one at a time as before.
-                        int scfs[36] = {};
-                        if (g.window_switching_flag && g.block_type == 2) {
-                            if (g.mixed_block_flag) {
-                                for (int k = 0; k < 17; ++k) scfs[k] = static_cast<int>(data_reader.read_bits(slen1));
-                                for (int k = 17; k < 35; ++k) scfs[k] = static_cast<int>(data_reader.read_bits(slen2));
-                                for (int k = 0; k < 17; ++k) writer.write_bits(static_cast<uint32_t>(scfs[k]), slen1);
-                                for (int k = 17; k < 35; ++k) writer.write_bits(static_cast<uint32_t>(scfs[k]), slen2);
-                            } else {
-                                for (int k = 0; k < 18; ++k) scfs[k] = static_cast<int>(data_reader.read_bits(slen1));
-                                for (int k = 18; k < 36; ++k) scfs[k] = static_cast<int>(data_reader.read_bits(slen2));
-                                for (int k = 0; k < 18; ++k) writer.write_bits(static_cast<uint32_t>(scfs[k]), slen1);
-                                for (int k = 18; k < 36; ++k) writer.write_bits(static_cast<uint32_t>(scfs[k]), slen2);
-                            }
-                        } else {
-                            static constexpr int group_first[4] = {0, 6, 11, 16};
-                            static constexpr int group_last[4] = {6, 11, 16, 21};
-                            for (int grp = 0; grp < 4; ++grp) {
-                                const int slen = grp < 2 ? slen1 : slen2;
-                                if (gr != 0 && frame.side_info.scfsi[ch][grp]) continue;
-                                for (int k = group_first[grp]; k < group_last[grp]; ++k) {
-                                    scfs[k] = static_cast<int>(data_reader.read_bits(slen));
-                                }
-                                for (int k = group_first[grp]; k < group_last[grp]; ++k) {
-                                    writer.write_bits(static_cast<uint32_t>(scfs[k]), slen);
-                                }
-                            }
-                        }
+                        // the fields are read and written one at a time.
+                        wk.sf_truncated = true;
+                        for_each_mpeg1_field(g, gr == 1, frame.side_info.scfsi[ch], [&](const int k, const int slen) {
+                            wk.sf_fields[k] = static_cast<int>(data_reader.read_bits(slen));
+                        });
                     }
 
-                    // decode & optimize huffman
                     HuffmanConfig orig_cfg = {
                         g.region0_count,
                         g.region1_count,
@@ -692,6 +709,7 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
                     };
                     int scalefac_bits = static_cast<int>(data_reader.tell_bit() - gc_orig_start);
                     int max_huff_bits = side_copy.gr[gr][ch].part2_3_length - scalefac_bits;
+                    Spectrum& coeffs = spectra[gr][ch];
                     HuffmanOptimizer::decode_quantized_coefficients(coeffs, orig_cfg, data_reader, frame.header.samplerate, max_huff_bits);
                     // The other such case: a last count1 quad that runs past
                     // part2_3_length. We read it whole, as the original mp3packer did;
@@ -701,8 +719,54 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
                     if (data_reader.tell_bit() > gc_orig_start + side_copy.gr[gr][ch].part2_3_length) {
                         throw std::runtime_error("granule overruns part2_3_length");
                     }
-                    auto best_cfg = HuffmanOptimizer::find_best_config(coeffs, orig_cfg, frame.header.samplerate);
-                    
+                    wk.best = HuffmanOptimizer::find_best_config(coeffs, orig_cfg, frame.header.samplerate);
+                    data_reader.seek_bit(gc_orig_start + side_copy.gr[gr][ch].part2_3_length);
+                }
+                }
+
+                bool recoded[2] = {false, false};
+                if (is_mpeg1) {
+                    for (int ch = 0; ch < n_ch; ++ch) {
+                        // the right channel's scalefactors above its last nonzero band
+                        // are intensity positions, not steps
+                        bool eligible = !(frame.header.is_stereo && ch == 1);
+                        for (int gr = 0; gr < 2 && eligible; ++gr) {
+                            const GrChInfo& g = frame.side_info.gr[gr][ch];
+                            eligible = !work[gr][ch].sf_truncated &&
+                                       !(g.window_switching_flag && g.block_type == 2 && g.mixed_block_flag) &&
+                                       mpeg1_mark_active(chans[ch].gr[gr], spectra[gr][ch], frame.header.samplerate);
+                        }
+                        // granule 1 reuses values only from a granule 0 that carries data
+                        if (!eligible || !mpeg1_recode_scalefactors(chans[ch], chans[ch].gr[0].any_nonzero)) continue;
+                        recoded[ch] = true;
+                        for (int gr = 0; gr < 2; ++gr) {
+                            GrChInfo& g = frame.side_info.gr[gr][ch];
+                            g.scalefac_scale = chans[ch].gr[gr].scalefac_scale;
+                            g.preflag = chans[ch].gr[gr].preflag;
+                            g.scalefac_compress = chans[ch].gr[gr].scalefac_compress;
+                        }
+                        std::copy(chans[ch].scfsi, chans[ch].scfsi + 4, frame.side_info.scfsi[ch]);
+                    }
+                }
+
+                for (int gr = 0; gr < n_gr; ++gr) {
+                for (int ch = 0; ch < n_ch; ++ch) {
+                    GrChInfo& g = frame.side_info.gr[gr][ch];
+                    const GranuleWork& wk = work[gr][ch];
+                    size_t out_start = writer.tell_bit();
+                    if (recoded[ch]) {
+                        mpeg1_write_scalefactors(writer, chans[ch], gr);
+                    } else if (!wk.sf_truncated) {
+                        data_reader.seek_bit(wk.sf_start);
+                        writer.copy_from(data_reader, wk.sf_bits);
+                    } else {
+                        for_each_mpeg1_field(side_copy.gr[gr][ch], gr == 1, side_copy.scfsi[ch], [&](const int k, const int slen) {
+                            writer.write_bits(static_cast<uint32_t>(wk.sf_fields[k]), slen);
+                        });
+                    }
+
+                    const Spectrum& coeffs = spectra[gr][ch];
+                    const HuffmanConfig& best_cfg = wk.best;
                     size_t scalefac_end_bit = writer.tell_bit();
                     HuffmanOptimizer::encode_quantized_coefficients(coeffs, best_cfg, writer, frame.header.samplerate);
 
@@ -727,13 +791,9 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
                     g.table_select[1] = best_cfg.table1;
                     g.table_select[2] = best_cfg.table2;
                     g.count1table_select = best_cfg.count1_table_select;
-                    
-                    int orig_part2_3 = side_copy.gr[gr][ch].part2_3_length;
                     g.part2_3_length = static_cast<uint16_t>(writer.tell_bit() - out_start);
-
-                    data_reader.seek_bit(gc_orig_start + orig_part2_3);
                 }
-            }
+                }
             }
         } catch (const std::exception&) {
             optimization_failed = true;

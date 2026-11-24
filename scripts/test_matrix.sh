@@ -726,6 +726,68 @@ for case in overrun:44100 mixed:44100 mixed:22050 mixed:11025 mixed:8000; do
     else FAIL=$((FAIL + 1)); FAILURES+=("$label :: $status"); echo "FAIL  $label  ($status)"; fi
 done
 
+# MPEG-1 scalefactor re-coding under -z. A cell whose coefficients are all zero is
+# heard by no decoder, so the repack may give it any value, and choose
+# scalefac_scale, preflag, scalefac_compress and scfsi around it, as long as every
+# heard cell keeps its step. sf_inflate (built with the tests) writes the largest
+# value its field holds into every unheard cell, in place, so:
+#   free      — the fixture must decode as its source, which checks that the map
+#               from coefficients to cells (short blocks included) never takes a
+#               heard cell for a free one; and its repack must decode as the fixture
+#               and come out exactly the size the source's does
+#   intensity — the frames also get the intensity stereo bit, which turns the right
+#               channel's free cells into intensity positions; the repack must keep
+#               them (without that guard it changes what every decoder plays)
+SF_INFLATE="$(dirname "$BIN")/sf_inflate"
+tone_bursts_wav() { # tone_bursts_wav RATE OUT: decaying tone bursts, short blocks with empty bands
+    python3 -c "
+import sys, struct, math, wave
+sr=int(sys.argv[1])
+w=wave.open(sys.argv[2],'wb'); w.setnchannels(2); w.setsampwidth(2); w.setframerate(sr)
+out=bytearray()
+for k in range(sr*6):
+    t=k/sr; ph=t%0.25; env=math.exp(-ph*40) if ph<0.12 else 0.0
+    l=env*(0.6*math.sin(2*math.pi*880*t)+0.3*math.sin(2*math.pi*2637*t))
+    r=env*(0.5*math.sin(2*math.pi*660*t)+0.3*math.sin(2*math.pi*1975*t))
+    out+=struct.pack('<hh', int(26000*l), int(26000*r))
+w.writeframes(bytes(out)); w.close()
+" "$1" "$2"
+}
+echo ""
+echo "== mpeg1 scalefactor re-coding (free cells, intensity positions) =="
+for rate in 44100 48000 32000; do
+    tone_bursts_wav "$rate" "$WORKDIR/sf.wav"
+    lame --quiet -V6 "$WORKDIR/sf.wav" "$WORKDIR/sf_src.mp3"
+    ffmpeg -y -v error -i "$WORKDIR/sf_src.mp3" -f s16le "$WORKDIR/sf_a.s16" 2>/dev/null
+    for mode in free intensity; do
+        TOTAL=$((TOTAL + 1))
+        label="scalefactors/$mode/${rate}Hz"
+        fix="$WORKDIR/sf_fix.mp3"; status=ok; filled=""
+        flag=""; [ "$mode" = "intensity" ] && flag="--intensity"
+        if [ ! -x "$SF_INFLATE" ]; then status="$SF_INFLATE not built"
+        else
+            filled="$("$SF_INFLATE" "$WORKDIR/sf_src.mp3" "$fix" $flag)"
+            if [ "${filled%% *}" = "0" ] || [ "${filled##* }" = "0" ]; then status="fixture filled no cells, or none short ($filled)"
+            elif ! $BIN -z "$WORKDIR/sf_src.mp3" "$WORKDIR/sf_src_out.mp3" >/dev/null 2>&1 \
+                 || ! $BIN -z "$fix" "$WORKDIR/sf_fix_out.mp3" >/dev/null 2>&1; then status="pack failed"
+            else
+                ffmpeg -y -v error -i "$fix" -f s16le "$WORKDIR/sf_b.s16" 2>/dev/null
+                ffmpeg -y -v error -i "$WORKDIR/sf_fix_out.mp3" -f s16le "$WORKDIR/sf_c.s16" 2>/dev/null
+                if [ "$mode" = "free" ] && ! cmp -s "$WORKDIR/sf_a.s16" "$WORKDIR/sf_b.s16"; then
+                    status="fixture decodes differently from its source: a heard cell was taken for free"
+                elif ! cmp -s "$WORKDIR/sf_b.s16" "$WORKDIR/sf_c.s16"; then
+                    status="PCM differs"
+                elif [ "$mode" = "free" ]; then
+                    a="$(wc -c < "$WORKDIR/sf_src_out.mp3" | tr -d ' ')"; b="$(wc -c < "$WORKDIR/sf_fix_out.mp3" | tr -d ' ')"
+                    [ "$a" = "$b" ] || status="repack of the fixture is $b bytes, of its source $a"
+                fi
+            fi
+        fi
+        if [ "$status" = "ok" ]; then echo "ok    $label  (${filled%% *} cells, ${filled##* } short)"
+        else FAIL=$((FAIL + 1)); FAILURES+=("$label :: $status"); echo "FAIL  $label  ($status)"; fi
+    done
+done
+
 # Stream structure: what sits around the frames rather than inside them. Each of
 # these used to cost either the whole file or its audio after some point:
 #   lead-*  — junk before the first frame that is not one well-formed ID3v2 tag
