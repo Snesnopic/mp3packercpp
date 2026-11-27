@@ -242,6 +242,7 @@ bool mark_cells(const bool short_block, const int* long_edges, const int* short_
         for (int band = 0; band < kLongCells; ++band) {
             active[band] = nonzero(long_edges[band], long_edges[band + 1]);
         }
+        last_band_active[0] = nonzero(long_edges[kLongCells], kNumCoefficients);
     }
     return nonzero(0, kNumCoefficients);
 }
@@ -249,26 +250,55 @@ bool mark_cells(const bool short_block, const int* long_edges, const int* short_
 struct Candidate {
     bool scale = false;
     bool preflag = false;
+    uint8_t global_gain = 0;
     uint8_t subblock_gain[3] = {};
     uint8_t v[kMaxScalefactorCells] = {};  // inactive cells left at 0
 };
 
-// every scalefac_scale/preflag pair under which each active cell keeps its exponent
+constexpr int kMaxCandidates = 4;
+
+// Every scalefac_scale/preflag pair under which each active cell keeps its step. A
+// decoder hears global_gain minus the scalefactor exponent; minimp3 builds that from two
+// float factors, which multiply to the same float whenever the split moves by a multiple
+// of 4 quarter steps (only a power of two changes) and not otherwise, so global_gain only
+// ever moves by such multiples, and only on long blocks whose band 21 (no scalefactor)
+// is silent. At a fixed scale and preflag a granule alone is cheapest at the largest drop
+// that keeps every heard value in range (every value lower), so that is the one taken;
+// it can be negative, a rise, where that is what makes preflag possible. Two granules
+// sharing values through scfsi are searched together by long_families instead.
 template <class S>
-int candidates(const S& s, Candidate out[4]) {
+int candidates(const S& s, Candidate out[kMaxCandidates]) {
     const int cells = cell_count(s);
     int e[kMaxScalefactorCells] = {};
+    bool any_heard = false;
     for (int c = 0; c < cells; ++c) {
         if (s.active[c]) e[c] = exponent(s, c, s.values[c]);
+        any_heard = any_heard || s.active[c];
     }
+    const bool may_move = !s.short_block && !s.last_band_active[0] && any_heard;
     int n = 0;
     for (int scale = 0; scale < 2; ++scale) {
+        const int shift = scale ? 2 : 1;
         for (int pf = 0; pf < 2; ++pf) {
             // short blocks ignore preflag: the bit stays as it came
             if (s.short_block && pf == 1) continue;
             Candidate q;
             q.scale = scale != 0;
             q.preflag = s.short_block ? preflag_of(s) : pf != 0;
+            int drop = 0;
+            if (may_move) {
+                int lo = -std::min(255 - s.global_gain, 72);
+                drop = s.global_gain;
+                for (int c = 0; c < cells; ++c) {
+                    if (!s.active[c]) continue;
+                    const int pre = q.preflag ? kPretab[c] << shift : 0;
+                    lo = std::max(lo, e[c] - (value_limit(s, c) << shift) - pre);
+                    drop = std::min(drop, e[c] - pre);
+                }
+                drop &= ~3;
+                if (((lo + 3) & ~3) > drop) continue;
+            }
+            q.global_gain = static_cast<uint8_t>(s.global_gain - drop);
             std::copy(s.subblock_gain, s.subblock_gain + 3, q.subblock_gain);
             if (s.short_block) {
                 // each window's subblock_gain takes as much of its heard cells' exponents
@@ -285,17 +315,73 @@ int candidates(const S& s, Candidate out[4]) {
                     if (heard) q.subblock_gain[w] = static_cast<uint8_t>(gain);
                 }
             }
-            const int shift = scale ? 2 : 1;
             bool ok = true;
             for (int c = 0; c < cells && ok; ++c) {
                 if (!s.active[c]) continue;
-                const int rest = e[c] - (s.short_block ? q.subblock_gain[c % 3] << 3 : 0);
+                const int rest = e[c] - drop - (s.short_block ? q.subblock_gain[c % 3] << 3 : 0);
                 const int pre = (!s.short_block && q.preflag) ? kPretab[c] : 0;
                 const int v = (rest >> shift) - pre;
                 ok = rest >= 0 && (rest & ((1 << shift) - 1)) == 0 && v >= 0 && v <= value_limit(s, c);
                 if (ok) q.v[c] = static_cast<uint8_t>(v);
             }
             if (ok) out[n++] = q;
+        }
+    }
+    return n;
+}
+
+// a decoder hears global_gain minus the exponent; a silent top band leaves global_gain free
+template <class S>
+bool same_heard(const S& a, int ea, const S& b, int eb) {
+    return a.global_gain - ea == b.global_gain - eb;
+}
+
+template <class S>
+bool gain_free(const S& a) {
+    return !a.short_block && !a.last_band_active[0];
+}
+
+// A long granule under one scalefac_scale and preflag: each heard cell's value at
+// global_gain drop d is base - d / unit, and every drop in lo..hi (multiples of 4) keeps
+// all of them in 0..limit.
+struct Family {
+    bool scale = false;
+    bool preflag = false;
+    int unit = 2;                  // drop per unit of value: 1 << (scale + 1)
+    int lo = 0, hi = 0;
+    int base[kLongCells] = {};
+};
+
+int long_families(const Mpeg1Scalefactors& s, Family out[4]) {
+    int e[kLongCells] = {};
+    bool any_heard = false;
+    for (int c = 0; c < kLongCells; ++c) {
+        if (s.active[c]) e[c] = exponent(s, c, s.values[c]);
+        any_heard = any_heard || s.active[c];
+    }
+    const bool may_move = !s.last_band_active[0] && any_heard;
+    int n = 0;
+    for (int scale = 0; scale < 2; ++scale) {
+        const int shift = scale ? 2 : 1;
+        for (int pf = 0; pf < 2; ++pf) {
+            Family f;
+            f.scale = scale != 0;
+            f.preflag = pf != 0;
+            f.unit = 1 << shift;
+            int lo = may_move ? -std::min(255 - s.global_gain, 72) : 0;
+            int hi = may_move ? s.global_gain : 0;
+            bool ok = true;
+            for (int c = 0; c < kLongCells && ok; ++c) {
+                if (!s.active[c]) continue;
+                const int pre = pf ? kPretab[c] : 0;
+                ok = (e[c] & (f.unit - 1)) == 0;
+                f.base[c] = (e[c] >> shift) - pre;
+                lo = std::max(lo, (f.base[c] - value_limit(s, c)) * f.unit);
+                hi = std::min(hi, f.base[c] * f.unit);
+            }
+            f.lo = (lo + 3) & ~3;
+            f.hi = hi & ~3;
+            if (ok && f.lo <= f.hi) out[n++] = f;
         }
     }
     return n;
@@ -322,8 +408,10 @@ bool same_steps(const Mpeg1ScalefactorChannel& a, const Mpeg1ScalefactorChannel&
             if (v >= (1 << slen_of(gr == 1 && b.scfsi[group_of(cell)] && !sb.short_block ? b.gr[0] : sb, cell)))
                 return false;
             if (!sa.active[cell]) continue;
-            if (exponent(sa, cell, resolved_value(a, gr, cell)) != exponent(sb, cell, v)) return false;
+            if (!same_heard(sa, exponent(sa, cell, resolved_value(a, gr, cell)), sb, exponent(sb, cell, v))) return false;
         }
+        if (!gain_free(sa) && sa.global_gain != sb.global_gain) return false;
+        if ((sa.global_gain - sb.global_gain) % 4 != 0) return false;
     }
     return true;
 }
@@ -339,9 +427,12 @@ bool same_steps(const LsfScalefactors& a, const LsfScalefactors& b) {
     for (int part = 0; part < 4; ++part) {
         for (int k = 0; k < p.count[part]; ++k, ++cell) {
             if (b.values[cell] >= (1 << p.slen[part])) return false;
-            if (a.active[cell] && exponent(a, cell, a.values[cell]) != exponent(b, cell, b.values[cell])) return false;
+            if (a.active[cell] && !same_heard(a, exponent(a, cell, a.values[cell]), b, exponent(b, cell, b.values[cell])))
+                return false;
         }
     }
+    if (!gain_free(a) && a.global_gain != b.global_gain) return false;
+    if ((a.global_gain - b.global_gain) % 4 != 0) return false;
     return cell == lsf_cell_count(b);
 }
 
@@ -396,46 +487,69 @@ bool mpeg1_recode_scalefactors(Mpeg1ScalefactorChannel& c, const bool allow_scfs
     if (!joint && (c.scfsi[0] || c.scfsi[1] || c.scfsi[2] || c.scfsi[3])) return false;
 
     const int before = mpeg1_scalefactor_bits(c, 0) + mpeg1_scalefactor_bits(c, 1);
-    Candidate cand[2][4];
-    const int count[2] = {candidates(c.gr[0], cand[0]), candidates(c.gr[1], cand[1])};
     Mpeg1ScalefactorChannel best = c;
     int best_bits = before;
 
     if (joint) {
+        Family fam[2][4];
+        const int nf[2] = {long_families(c.gr[0], fam[0]), long_families(c.gr[1], fam[1])};
         const unsigned patterns = allow_scfsi ? 16u : 1u;
-        for (int i0 = 0; i0 < count[0]; ++i0) {
-            for (int i1 = 0; i1 < count[1]; ++i1) {
-                const Candidate& q0 = cand[0][i0];
-                const Candidate& q1 = cand[1][i1];
-                for (unsigned pattern = 0; pattern < patterns; ++pattern) {
+        for (unsigned pattern = 0; pattern < patterns; ++pattern) {
+            for (int a = 0; a < nf[0]; ++a) {
+                for (int b1 = 0; b1 < nf[1]; ++b1) {
+                    const Family& f0 = fam[0][a];
+                    const Family& f1 = fam[1][b1];
+                    // A cell both granules hear in a reused group needs the same value in
+                    // both: base0 - d0 / unit0 == base1 - d1 / unit1, one fixed difference.
+                    int delta = 0;
+                    bool tied = false, ok = true;
+                    for (int b = 0; b < kLongCells && ok; ++b) {
+                        if (!((pattern >> group_of(b)) & 1) || !c.gr[0].active[b] || !c.gr[1].active[b]) continue;
+                        const int diff = f0.base[b] - f1.base[b];
+                        ok = !tied || diff == delta;
+                        delta = diff;
+                        tied = true;
+                    }
+                    if (!ok) continue;
+                    // every value falls as either drop grows, so the largest pair that fits wins
+                    int d0 = f0.hi, d1 = f1.hi;
+                    if (tied) {
+                        bool found = false;
+                        for (d1 = f1.hi; d1 >= f1.lo && !found; d1 -= 4) {
+                            const int t0 = d1 / f1.unit + delta;
+                            d0 = t0 * f0.unit;
+                            if (d0 < f0.lo) break;
+                            found = d0 <= f0.hi && d0 % 4 == 0;
+                            if (found) break;
+                        }
+                        if (!found) continue;
+                    }
                     uint8_t v0[kLongCells];
                     uint8_t v1[kLongCells];
-                    bool ok = true;
-                    for (int b = 0; b < kLongCells && ok; ++b) {
+                    for (int b = 0; b < kLongCells; ++b) {
                         const bool a0 = c.gr[0].active[b];
                         const bool a1 = c.gr[1].active[b];
-                        v0[b] = a0 ? q0.v[b] : 0;
-                        v1[b] = a1 ? q1.v[b] : 0;
+                        v0[b] = a0 ? static_cast<uint8_t>(f0.base[b] - d0 / f0.unit) : 0;
+                        v1[b] = a1 ? static_cast<uint8_t>(f1.base[b] - d1 / f1.unit) : 0;
                         if (pattern & (1u << group_of(b))) {
                             // granule 1 hears granule 0's value; a free cell there takes the one it needs
-                            if (a0 && a1 && v0[b] != v1[b]) ok = false;
                             if (!a0 && a1) v0[b] = v1[b];
                             v1[b] = v0[b];
                         }
                     }
-                    if (!ok) continue;
                     int k0 = 0, k1 = 0;
                     const int bits = long_cost(v0, 0xFu, k0) + long_cost(v1, ~pattern & 0xFu, k1);
                     if (bits >= best_bits) continue;
                     best_bits = bits;
-                    const Candidate* q[2] = {&q0, &q1};
+                    const Family* f[2] = {&f0, &f1};
+                    const int d[2] = {d0, d1};
                     const uint8_t* v[2] = {v0, v1};
                     const int k[2] = {k0, k1};
                     for (int gr = 0; gr < 2; ++gr) {
-                        best.gr[gr].scalefac_scale = q[gr]->scale;
-                        best.gr[gr].preflag = q[gr]->preflag;
+                        best.gr[gr].scalefac_scale = f[gr]->scale;
+                        best.gr[gr].preflag = f[gr]->preflag;
+                        best.gr[gr].global_gain = static_cast<uint8_t>(c.gr[gr].global_gain - d[gr]);
                         best.gr[gr].scalefac_compress = static_cast<uint8_t>(k[gr]);
-                        std::copy(q[gr]->subblock_gain, q[gr]->subblock_gain + 3, best.gr[gr].subblock_gain);
                         std::copy(v[gr], v[gr] + kLongCells, best.gr[gr].values);
                     }
                     for (int grp = 0; grp < 4; ++grp) best.scfsi[grp] = (pattern >> grp) & 1u;
@@ -443,6 +557,8 @@ bool mpeg1_recode_scalefactors(Mpeg1ScalefactorChannel& c, const bool allow_scfs
             }
         }
     } else {
+        Candidate cand[2][kMaxCandidates];
+        const int count[2] = {candidates(c.gr[0], cand[0]), candidates(c.gr[1], cand[1])};
         if (count[0] == 0 || count[1] == 0) return false;
         Mpeg1ScalefactorChannel trial = c;
         int bits = 0;
@@ -456,6 +572,7 @@ bool mpeg1_recode_scalefactors(Mpeg1ScalefactorChannel& c, const bool allow_scfs
                 gr_best = b;
                 s.scalefac_scale = cand[gr][i].scale;
                 s.preflag = cand[gr][i].preflag;
+                s.global_gain = cand[gr][i].global_gain;
                 s.scalefac_compress = static_cast<uint8_t>(k);
                 std::copy(cand[gr][i].subblock_gain, cand[gr][i].subblock_gain + 3, s.subblock_gain);
                 std::copy(cand[gr][i].v, cand[gr][i].v + mpeg1_cell_count(s), s.values);
@@ -529,7 +646,7 @@ bool lsf_mark_active(LsfScalefactors& s, const Spectrum& coeffs, const uint32_t 
 
 bool lsf_recode_scalefactors(LsfScalefactors& s) {
     const int before = lsf_scalefactor_bits(s);
-    Candidate cand[4];
+    Candidate cand[kMaxCandidates];
     const int count = candidates(s, cand);
     LsfScalefactors best = s;
     int best_bits = before;
@@ -539,6 +656,7 @@ bool lsf_recode_scalefactors(LsfScalefactors& s) {
         if (sfc < 0 || bits >= best_bits) continue;
         best_bits = bits;
         best.scalefac_scale = cand[i].scale;
+        best.global_gain = cand[i].global_gain;
         best.scalefac_compress = static_cast<uint16_t>(sfc);
         std::copy(cand[i].subblock_gain, cand[i].subblock_gain + 3, best.subblock_gain);
         std::copy(cand[i].v, cand[i].v + lsf_cell_count(s), best.values);

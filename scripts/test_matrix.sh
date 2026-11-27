@@ -742,14 +742,21 @@ done
 #               heard cells' scalefactors, 8 quarter steps per unit: the fixture must
 #               decode as its source, which checks that decoders sum the two terms as
 #               one integer, and the repack must come out the size the source's does
+#   gain      — each long granule's global_gain moves up by 4 quarter steps and every
+#               heard scalefactor down to match: the repack may lower global_gain by
+#               multiples of 4 only, the one move minimp3 (two float factors) hears
+#               exactly as the integer decoders do; moving by 2 changes its last bits
 #   band12    — short band 12 has no scalefactor, so a window whose band 12 is heard
-#               must keep its subblock_gain; noise bursts up to the lowpass make
-#               exactly those windows, and a plain -z repack must stay lossless
-# The LSF rates run free and subblock: every rate, since 11025/12000 take 22050's
+#               must keep its subblock_gain, and long band 21 likewise, so a granule
+#               that hears it must keep its global_gain; noise bursts up to the lowpass
+#               make exactly those, and a plain -z repack must stay lossless
+# Every fixture and repack is also decoded by minimp3 (float), built with the tests.
+# The LSF rates run free, subblock and gain: every rate, since 11025/12000 take 22050's
 # long bands but 16000's short ones, and 24000 and 8000 have tables of their own.
 # Their intensity case is lsf-intensity/* above: an LSF right channel reads
 # scalefac_compress differently under intensity stereo, so the bit cannot simply be set.
 SF_INFLATE="$(dirname "$BIN")/sf_inflate"
+MINIMP3_PCM="$(dirname "$BIN")/minimp3_pcm"
 tone_bursts_wav() { # tone_bursts_wav RATE OUT: decaying tone bursts, short blocks with empty bands
     python3 -c "
 import sys, struct, math, wave
@@ -765,31 +772,51 @@ w.writeframes(bytes(out)); w.close()
 " "$1" "$2"
 }
 echo ""
-echo "== scalefactor re-coding (free cells, intensity positions, subblock_gain) =="
+echo "== scalefactor re-coding (free cells, intensity positions, subblock_gain, global_gain) =="
 for rate in 44100 48000 32000 22050 24000 16000 11025 12000 8000; do
     tone_bursts_wav "$rate" "$WORKDIR/sf.wav"
-    modes="free intensity subblock"; resample=""
-    if [ "$rate" -lt 32000 ]; then modes="free subblock"; resample="--resample $rate"; fi
+    modes="free intensity subblock gain"; resample=""; gain_kbps=64
+    if [ "$rate" -lt 32000 ]; then modes="free subblock gain"; resample="--resample $rate"; gain_kbps=16; fi
     lame --quiet -V6 $resample "$WORKDIR/sf.wav" "$WORKDIR/sf_src.mp3"
     ffmpeg -y -v error -i "$WORKDIR/sf_src.mp3" -f s16le "$WORKDIR/sf_a.s16" 2>/dev/null
+    # gain: pink noise and a tone at a low constant bitrate, where LAME leaves global_gain
+    # room to drop and a repack moving it by 2 is heard by minimp3 at every rate here
+    ffmpeg -y -v error -f lavfi -i "anoisesrc=duration=6:color=pink:sample_rate=$rate:seed=42" \
+           -f lavfi -i "sine=frequency=330:duration=6:sample_rate=$rate" \
+           -filter_complex "[0][1]amerge=inputs=2" "$WORKDIR/sfg.wav" 2>/dev/null
+    lame --quiet -b "$gain_kbps" --resample "$rate" "$WORKDIR/sfg.wav" "$WORKDIR/sfg_src.mp3"
+    ffmpeg -y -v error -i "$WORKDIR/sfg_src.mp3" -f s16le "$WORKDIR/sfg_a.s16" 2>/dev/null
     for mode in $modes; do
         TOTAL=$((TOTAL + 1))
         label="scalefactors/$mode/${rate}Hz"
+        src="$WORKDIR/sf_src.mp3"; ref="$WORKDIR/sf_a.s16"
+        [ "$mode" = "gain" ] && { src="$WORKDIR/sfg_src.mp3"; ref="$WORKDIR/sfg_a.s16"; }
         fix="$WORKDIR/sf_fix.mp3"; status=ok; filled=""
-        flag=""; [ "$mode" != "free" ] && flag="--$mode"
-        if [ ! -x "$SF_INFLATE" ]; then status="$SF_INFLATE not built"
+        flag=""; [ "$mode" != "free" ] && flag="--$mode"; [ "$mode" = "gain" ] && flag="--gain 4"
+        if [ ! -x "$SF_INFLATE" ] || [ ! -x "$MINIMP3_PCM" ]; then status="$SF_INFLATE or $MINIMP3_PCM not built"
         else
-            filled="$("$SF_INFLATE" "$WORKDIR/sf_src.mp3" "$fix" $flag)"
-            if [ "${filled%% *}" = "0" ] || [ "${filled##* }" = "0" ]; then status="fixture filled no cells, or none short ($filled)"
-            elif ! $BIN -z "$WORKDIR/sf_src.mp3" "$WORKDIR/sf_src_out.mp3" >/dev/null 2>&1 \
+            filled="$("$SF_INFLATE" "$src" "$fix" $flag)"
+            if [ "${filled%% *}" = "0" ] || { [ "$mode" != "gain" ] && [ "${filled##* }" = "0" ]; }; then
+                status="fixture filled no cells, or none short ($filled)"
+            elif ! $BIN -z "$src" "$WORKDIR/sf_src_out.mp3" >/dev/null 2>&1 \
                  || ! $BIN -z "$fix" "$WORKDIR/sf_fix_out.mp3" >/dev/null 2>&1; then status="pack failed"
             else
                 ffmpeg -y -v error -i "$fix" -f s16le "$WORKDIR/sf_b.s16" 2>/dev/null
                 ffmpeg -y -v error -i "$WORKDIR/sf_fix_out.mp3" -f s16le "$WORKDIR/sf_c.s16" 2>/dev/null
-                if [ "$mode" != "intensity" ] && ! cmp -s "$WORKDIR/sf_a.s16" "$WORKDIR/sf_b.s16"; then
+                m_src="$("$MINIMP3_PCM" "$src" | cksum)"
+                m_src_out="$("$MINIMP3_PCM" "$WORKDIR/sf_src_out.mp3" | cksum)"
+                m_fix="$("$MINIMP3_PCM" "$fix" | cksum)"
+                m_out="$("$MINIMP3_PCM" "$WORKDIR/sf_fix_out.mp3" | cksum)"
+                if [ "$mode" != "intensity" ] && ! cmp -s "$ref" "$WORKDIR/sf_b.s16"; then
                     status="fixture decodes differently from its source"
+                elif [ "$mode" != "intensity" ] && [ "$m_src" != "$m_fix" ]; then
+                    status="fixture decodes differently from its source in minimp3"
+                elif [ "$m_src" != "$m_src_out" ]; then
+                    status="repack of the source differs in minimp3"
                 elif ! cmp -s "$WORKDIR/sf_b.s16" "$WORKDIR/sf_c.s16"; then
                     status="PCM differs"
+                elif [ "$m_fix" != "$m_out" ]; then
+                    status="PCM differs in minimp3"
                 elif [ "$mode" != "intensity" ]; then
                     a="$(wc -c < "$WORKDIR/sf_src_out.mp3" | tr -d ' ')"; b="$(wc -c < "$WORKDIR/sf_fix_out.mp3" | tr -d ' ')"
                     [ "$a" = "$b" ] || status="repack of the fixture is $b bytes, of its source $a"

@@ -12,13 +12,21 @@
 // scalefactors as their fields hold, or, with no subblock_gain to move, as much of
 // what all its heard cells share into subblock_gain — 8 quarter steps per unit either
 // way, which a decoder that sums the two terms as one integer hears the same.
-// usage: sf_inflate IN OUT [--intensity | --subblock]; prints the cells written and
-// how many of them short, or for --subblock the windows moved and the cells rewritten
+// With --gain D (quarter steps) each long granule's global_gain moves by D where that
+// fits, and every heard cell's scalefactor by the same amount the other way, so the
+// step every decoder sums is unchanged; granules whose band 21 (no scalefactor) is
+// heard, or that reuse values through scfsi, are left alone, as are short blocks — the
+// packer only moves global_gain on long ones, so the fixture's repack must come out
+// the size of its source's.
+// usage: sf_inflate IN OUT [--intensity | --subblock | --gain D]; prints the cells written
+// and how many of them short, for --subblock the windows moved and the cells rewritten,
+// for --gain the granules moved and how many of them short
 #include "huffman.hpp"
 #include "mp3_reader.hpp"
 #include "scalefactors.hpp"
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <string>
@@ -53,6 +61,8 @@ int main(int argc, char** argv) {
     const std::string mode = argc > 3 ? argv[3] : "";
     const bool intensity = mode == "--intensity";
     const bool subblock = mode == "--subblock";
+    const bool gain = mode == "--gain";
+    const int gain_d = gain && argc > 4 ? atoi(argv[4]) : 0;
     Mp3Reader reader(argv[1]);
     std::vector<Mp3Frame> frames;
     while (auto f = reader.read_next_frame()) frames.push_back(*f);
@@ -125,6 +135,30 @@ int main(int argc, char** argv) {
             ++written;
         }
     };
+    // moves one granule's global_gain by d or -d and its heard cells' scalefactors with it
+    const auto move_gain = [&](const bool* active, const uint8_t* values, const bool* last_band_active,
+                               const int* width, const int cells, const bool short_block, const bool scale,
+                               const size_t sf_bit, const size_t gain_bit, const int global_gain) {
+        const int shift = scale ? 2 : 1;
+        if (short_block || gain_d % (1 << shift) != 0 || last_band_active[0]) return;
+        const int dv = gain_d / (1 << shift);
+        if (global_gain + gain_d < 0 || global_gain + gain_d > 255) return;
+        bool fits = true, heard = false;
+        for (int cell = 0; cell < cells && fits; ++cell) {
+            if (!active[cell]) continue;
+            heard = true;
+            fits = values[cell] + dv >= 0 && values[cell] + dv < (1 << width[cell]);
+        }
+        if (!fits || !heard) return;
+        size_t bit = sf_bit;
+        for (int cell = 0; cell < cells; ++cell) {
+            if (active[cell]) put(bit, width[cell], static_cast<uint32_t>(values[cell] + dv));
+            bit += static_cast<size_t>(width[cell]);
+        }
+        put_file(gain_bit, 8, static_cast<uint32_t>(global_gain + gain_d));
+        ++written;
+        if (short_block) ++written_short;
+    };
     BitstreamReader r(res);
     for (size_t i = 0; i < starts.size(); ++i) {
         Mp3Frame& f = frames[i];
@@ -168,6 +202,11 @@ int main(int argc, char** argv) {
                 int width[36] = {};
                 for (int k = 0, cell = 0; k < 4; ++k)
                     for (int n = 0; n < part.count[k]; ++n) width[cell++] = part.slen[k];
+                if (gain) {
+                    move_gain(s.active, s.values, s.last_band_active, width, lsf_cell_count(s), s.short_block,
+                              g.scalefac_scale, start, side + static_cast<size_t>(63 * ch) + 21, g.global_gain);
+                    continue;
+                }
                 if (subblock) {
                     if (s.short_block)
                         move_subblock(s.active, s.values, s.last_band_active, width, g.subblock_gain, g.scalefac_scale,
@@ -238,6 +277,22 @@ int main(int argc, char** argv) {
             const bool both_long = !c.gr[0].short_block && !c.gr[1].short_block;
             const bool any_scfsi = c.scfsi[0] || c.scfsi[1] || c.scfsi[2] || c.scfsi[3];
             if (any_scfsi && !both_long) continue;
+            if (gain) {
+                if (any_scfsi) continue;
+                for (int gr = 0; gr < 2; ++gr) {
+                    const Mpeg1Scalefactors& s = c.gr[gr];
+                    const GrChInfo& g = f.side_info.gr[gr][ch];
+                    const int s1 = kSlen1[s.scalefac_compress & 15], s2 = kSlen2[s.scalefac_compress & 15];
+                    int width[36];
+                    for (int cell = 0; cell < 36; ++cell) width[cell] = cell < (s.short_block ? 18 : 11) ? s1 : s2;
+                    const size_t side = (f.frame_offset + 4 + (f.header.has_crc ? 2 : 0)) * 8 + 9 +
+                                        (n_ch == 1 ? 5 : 3) + static_cast<size_t>(4 * n_ch) +
+                                        static_cast<size_t>(59 * (gr * n_ch + ch)) + 21;
+                    move_gain(s.active, s.values, s.last_band_active, width, mpeg1_cell_count(s), s.short_block,
+                              g.scalefac_scale, sf_start[gr][ch], side, g.global_gain);
+                }
+                continue;
+            }
             if (subblock) {
                 for (int gr = 0; gr < 2; ++gr) {
                     const Mpeg1Scalefactors& s = c.gr[gr];

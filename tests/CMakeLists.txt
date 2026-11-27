@@ -36,6 +36,11 @@ add_test(NAME layout COMMAND layout_test)
 add_executable(sf_inflate sf_inflate.cpp)
 target_link_libraries(sf_inflate PRIVATE mp3packercpp_core)
 
+# float decoder for scripts/test_matrix.sh; standalone, since the core builds minimp3
+# with 16-bit output
+add_executable(minimp3_pcm minimp3_pcm.cpp)
+target_include_directories(minimp3_pcm PRIVATE ${CMAKE_SOURCE_DIR}/third_party/minimp3)
+
 add_executable(search_test search_test.cpp)
 target_link_libraries(search_test PRIVATE mp3packercpp_core)
 add_test(NAME search COMMAND search_test)
