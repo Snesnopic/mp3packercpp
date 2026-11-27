@@ -726,7 +726,7 @@ for case in overrun:44100 mixed:44100 mixed:22050 mixed:11025 mixed:8000; do
     else FAIL=$((FAIL + 1)); FAILURES+=("$label :: $status"); echo "FAIL  $label  ($status)"; fi
 done
 
-# MPEG-1 scalefactor re-coding under -z. A cell whose coefficients are all zero is
+# Scalefactor re-coding under -z, MPEG-1 and MPEG-2/2.5. A cell whose coefficients are all zero is
 # heard by no decoder, so the repack may give it any value, and choose
 # scalefac_scale, preflag, scalefac_compress and scfsi around it, as long as every
 # heard cell keeps its step. sf_inflate (built with the tests) writes the largest
@@ -745,6 +745,10 @@ done
 #   band12    — short band 12 has no scalefactor, so a window whose band 12 is heard
 #               must keep its subblock_gain; noise bursts up to the lowpass make
 #               exactly those windows, and a plain -z repack must stay lossless
+# The LSF rates run free and subblock: every rate, since 11025/12000 take 22050's
+# long bands but 16000's short ones, and 24000 and 8000 have tables of their own.
+# Their intensity case is lsf-intensity/* above: an LSF right channel reads
+# scalefac_compress differently under intensity stereo, so the bit cannot simply be set.
 SF_INFLATE="$(dirname "$BIN")/sf_inflate"
 tone_bursts_wav() { # tone_bursts_wav RATE OUT: decaying tone bursts, short blocks with empty bands
     python3 -c "
@@ -761,12 +765,14 @@ w.writeframes(bytes(out)); w.close()
 " "$1" "$2"
 }
 echo ""
-echo "== mpeg1 scalefactor re-coding (free cells, intensity positions) =="
-for rate in 44100 48000 32000; do
+echo "== scalefactor re-coding (free cells, intensity positions, subblock_gain) =="
+for rate in 44100 48000 32000 22050 24000 16000 11025 12000 8000; do
     tone_bursts_wav "$rate" "$WORKDIR/sf.wav"
-    lame --quiet -V6 "$WORKDIR/sf.wav" "$WORKDIR/sf_src.mp3"
+    modes="free intensity subblock"; resample=""
+    if [ "$rate" -lt 32000 ]; then modes="free subblock"; resample="--resample $rate"; fi
+    lame --quiet -V6 $resample "$WORKDIR/sf.wav" "$WORKDIR/sf_src.mp3"
     ffmpeg -y -v error -i "$WORKDIR/sf_src.mp3" -f s16le "$WORKDIR/sf_a.s16" 2>/dev/null
-    for mode in free intensity subblock; do
+    for mode in $modes; do
         TOTAL=$((TOTAL + 1))
         label="scalefactors/$mode/${rate}Hz"
         fix="$WORKDIR/sf_fix.mp3"; status=ok; filled=""

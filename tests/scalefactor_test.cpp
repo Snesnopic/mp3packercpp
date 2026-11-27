@@ -1,8 +1,8 @@
-// mpeg1_recode_scalefactors against a search that knows nothing of maxima or
-// candidates: every scalefac_compress, scalefac_scale, preflag, scfsi pattern and
-// (short blocks) subblock_gain,
-// each checked band by band for whether a decoder would hear the same step.
-// Also checks that what is written reads back as what was chosen.
+// mpeg1_recode_scalefactors and lsf_recode_scalefactors against a search that knows
+// nothing of maxima or candidates: every scalefac_compress, scalefac_scale, preflag,
+// scfsi pattern and (short blocks) subblock_gain, each checked band by band for
+// whether a decoder would hear the same step. Also checks that what is written reads
+// back as what was chosen, and lsf_partition against minimp3's way of reading the field.
 #include "scalefactors.hpp"
 #include <algorithm>
 #include <cstdio>
@@ -126,6 +126,161 @@ int brute_joint(const Mpeg1ScalefactorChannel& c, const int e[2][36], bool allow
     return best;
 }
 
+// MPEG-2/2.5: the field read the way minimp3 reads it, as mixed-radix digits over
+// three ranges in turn, and the partition sizes as ffmpeg and minimp3 list them
+const int kMod[2][3][4] = {{{5, 5, 4, 4}, {5, 5, 4, 1}, {4, 3, 1, 1}}, {{5, 6, 6, 1}, {4, 4, 4, 1}, {4, 3, 1, 1}}};
+const int kCount[3][6][4] = {
+    {{6, 5, 5, 5}, {6, 5, 7, 3}, {11, 10, 0, 0}, {7, 7, 7, 0}, {6, 6, 6, 3}, {8, 8, 5, 0}},
+    {{9, 9, 9, 9}, {9, 9, 12, 6}, {18, 18, 0, 0}, {12, 12, 12, 0}, {12, 9, 9, 6}, {15, 12, 9, 0}},
+    {{6, 9, 9, 9}, {6, 9, 12, 6}, {15, 18, 0, 0}, {6, 15, 12, 0}, {6, 12, 9, 6}, {6, 18, 9, 0}},
+};
+
+void lsf_read_field(int sfc, bool intensity, int slen[4], int& row) {
+    if (intensity) sfc >>= 1;
+    const int (*mod)[4] = kMod[intensity ? 1 : 0];
+    row = 0;
+    while (row < 2 && sfc >= mod[row][0] * mod[row][1] * mod[row][2] * mod[row][3]) {
+        sfc -= mod[row][0] * mod[row][1] * mod[row][2] * mod[row][3];
+        ++row;
+    }
+    for (int i = 3, m = 1; i >= 0; --i) {
+        slen[i] = sfc / m % mod[row][i];
+        m *= mod[row][i];
+    }
+    if (intensity) row += 3;
+}
+
+int lsf_partition_failures() {
+    int fails = 0;
+    for (int intensity = 0; intensity < 2; ++intensity)
+        for (int sfc = 0; sfc < 512; ++sfc)
+            for (int cat = 0; cat < 3; ++cat) {
+                int slen[4], row;
+                lsf_read_field(sfc, intensity, slen, row);
+                const LsfPartition p = lsf_partition(sfc, intensity, cat);
+                int cells = 0;
+                for (int i = 0; i < 4; ++i) {
+                    cells += kCount[cat][row][i];
+                    if (p.slen[i] != slen[i] || p.count[i] != kCount[cat][row][i]) {
+                        if (fails++ < 5) printf("lsf_partition(%d, %d, %d) partition %d: slen %d count %d, expected %d %d\n",
+                                                sfc, intensity, cat, i, p.slen[i], p.count[i], slen[i], kCount[cat][row][i]);
+                    }
+                }
+                if (cells != (cat == 0 ? 21 : cat == 1 ? 36 : 33) && fails++ < 5) printf("row %d cat %d holds %d cells\n", row, cat, cells);
+            }
+    return fails;
+}
+
+// cheapest LSF coding: every scale, subblock_gain and scalefac_compress
+int lsf_brute(const LsfScalefactors& s, const int* e) {
+    const int cat = s.short_block ? 1 : 0;
+    const int n = cells(s.short_block);
+    int best = 1 << 30;
+    for (int scale = 0; scale < 2; ++scale)
+        for (int gains = 0; gains < (s.short_block ? 512 : 1); ++gains) {
+            uint8_t sbg[3] = {s.subblock_gain[0], s.subblock_gain[1], s.subblock_gain[2]};
+            bool keeps_band12 = true;
+            if (s.short_block)
+                for (int w = 0; w < 3; ++w) {
+                    sbg[w] = static_cast<uint8_t>((gains >> (3 * w)) & 7);
+                    if (s.last_band_active[w] && sbg[w] != s.subblock_gain[w]) keeps_band12 = false;
+                }
+            if (!keeps_band12) continue;
+            for (int pf = 0; pf < 2; ++pf) {
+                // decoders ignore preflag on short blocks: the coding stays in its range
+                if (s.short_block && pf != (s.scalefac_compress >= 500)) continue;
+                int need[36];
+                bool ok = true;
+                for (int b = 0; b < n && ok; ++b) {
+                    need[b] = s.active[b] ? needed(s.short_block, scale, pf, sbg, b, e[b]) : 0;
+                    ok = need[b] >= 0;
+                }
+                if (!ok) continue;
+                int top[3][4] = {};
+                for (int row = 0; row < 3; ++row)
+                    for (int i = 0, b = 0; i < 4; ++i)
+                        for (int k = 0; k < kCount[cat][row][i]; ++k, ++b) top[row][i] = std::max(top[row][i], need[b]);
+                for (int sfc = pf ? 500 : 0; sfc < (pf ? 512 : 500); ++sfc) {
+                    int slen[4], row;
+                    lsf_read_field(sfc, false, slen, row);
+                    int cost = 0;
+                    bool fit = true;
+                    for (int i = 0; i < 4; ++i) {
+                        cost += slen[i] * kCount[cat][row][i];
+                        fit = fit && top[row][i] < (1 << slen[i]);
+                    }
+                    if (fit) best = std::min(best, cost);
+                }
+            }
+        }
+    return best;
+}
+
+int lsf_trials(std::mt19937& rng, int& recoded, int& saved) {
+    int fails = 0;
+    for (int t = 0; t < 2000 && fails < 10; ++t) {
+        LsfScalefactors s;
+        s.short_block = rng() % 4 == 0;
+        s.scalefac_scale = rng() & 1;
+        s.scalefac_compress = static_cast<uint16_t>(rng() % 5 == 0 ? 500 + rng() % 12 : rng() % 500);
+        const int cat = s.short_block ? 1 : 0;
+        int slen[4], row;
+        lsf_read_field(s.scalefac_compress, false, slen, row);
+        const int density = static_cast<int>(rng() % 4);
+        for (int w = 0; w < 3; ++w) {
+            s.subblock_gain[w] = s.short_block ? static_cast<uint8_t>(rng() % 8) : 0;
+            s.last_band_active[w] = s.short_block && rng() % 3 == 0;
+        }
+        for (int i = 0, b = 0; i < 4; ++i)
+            for (int k = 0; k < kCount[cat][row][i]; ++k, ++b) {
+                const int range = (rng() % 3 == 0) ? (1 << slen[i]) : std::min(1 << slen[i], 4);
+                s.values[b] = static_cast<uint8_t>(rng() % static_cast<unsigned>(range));
+                s.active[b] = density == 3 || (density == 2 && rng() % 4 != 0) || (density == 1 && rng() % 4 == 0);
+            }
+        const bool pf = s.scalefac_compress >= 500;
+        int e[36] = {};
+        for (int b = 0; b < cells(s.short_block); ++b) e[b] = step(s.short_block, s.scalefac_scale, pf, s.subblock_gain, b, s.values[b]);
+
+        const LsfScalefactors before = s;
+        const int bits_before = lsf_scalefactor_bits(s);
+        const bool changed = lsf_recode_scalefactors(s);
+        const int bits_after = lsf_scalefactor_bits(s);
+        const int expected = std::min(bits_before, lsf_brute(before, e));
+        if (bits_after != expected) {
+            printf("lsf trial %d: %d bits, a plain search finds %d (before %d, short %d, sfc %d)\n", t, bits_after, expected,
+                   bits_before, before.short_block, before.scalefac_compress);
+            ++fails;
+            continue;
+        }
+        if (!changed) continue;
+        ++recoded;
+        saved += bits_before - bits_after;
+        const bool pf_after = s.scalefac_compress >= 500;
+        if (s.short_block && pf_after != pf) { printf("lsf trial %d: short block left the preflag range\n", t); ++fails; }
+        for (int w = 0; w < 3; ++w)
+            if (s.short_block && before.last_band_active[w] && s.subblock_gain[w] != before.subblock_gain[w]) {
+                printf("lsf trial %d: window %d: band 12 heard, subblock_gain changed\n", t, w);
+                ++fails;
+            }
+        for (int b = 0; b < cells(s.short_block); ++b)
+            if (before.active[b] && step(s.short_block, s.scalefac_scale, pf_after, s.subblock_gain, b, s.values[b]) != e[b]) {
+                printf("lsf trial %d: cell %d step changed\n", t, b);
+                ++fails;
+            }
+        BitstreamWriter w;
+        lsf_write_scalefactors(w, s);
+        if (static_cast<int>(w.tell_bit()) != bits_after) { printf("lsf trial %d: wrote %zu bits, counted %d\n", t, w.tell_bit(), bits_after); ++fails; }
+        const std::vector<uint8_t> bytes = w.data();
+        BitstreamReader r(bytes);
+        LsfScalefactors back = s;
+        std::fill(std::begin(back.values), std::end(back.values), 0xFF);
+        lsf_read_scalefactors(r, back);
+        for (int b = 0; b < cells(s.short_block); ++b)
+            if (back.values[b] != s.values[b]) { printf("lsf trial %d: cell %d reads back %d, wrote %d\n", t, b, back.values[b], s.values[b]); ++fails; break; }
+    }
+    return fails;
+}
+
 }  // namespace
 
 int main() {
@@ -226,6 +381,10 @@ int main() {
                 if (resolved(back, gr, b) != resolved(c, gr, b)) { printf("trial %d: gr %d cell %d reads back %d, wrote %d\n", t, gr, b, resolved(back, gr, b), resolved(c, gr, b)); ++fails; break; }
     }
     printf("%d trials, %d re-coded, %d bits saved\n", trials, recoded, saved);
+    fails += lsf_partition_failures();
+    int lsf_recoded = 0, lsf_saved = 0;
+    fails += lsf_trials(rng, lsf_recoded, lsf_saved);
+    printf("lsf: 2000 trials, %d re-coded, %d bits saved\n", lsf_recoded, lsf_saved);
     printf(fails ? "FAILURES: %d\n" : "ok\n", fails);
     return fails != 0;
 }

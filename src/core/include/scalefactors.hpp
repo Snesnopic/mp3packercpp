@@ -47,6 +47,41 @@ bool mpeg1_mark_active(Mpeg1Scalefactors& s, const Spectrum& coeffs, uint32_t sa
 // Leaves c untouched and returns false unless bits are saved.
 bool mpeg1_recode_scalefactors(Mpeg1ScalefactorChannel& c, bool allow_scfsi);
 
+// The four partitions an MPEG-2/2.5 scalefac_compress selects: each one's slen and
+// how many cells it holds (ISO 13818-3 2.4.3.2). category: 0 long, 1 short, 2 mixed;
+// intensity: the right channel under intensity stereo, whose field reads differently.
+struct LsfPartition {
+    int slen[4] = {};
+    int count[4] = {};
+};
+LsfPartition lsf_partition(int scalefac_compress, bool intensity, int category);
+
+// One MPEG-2/2.5 granule's scalefactors: one granule per frame, no scfsi, preflag
+// is scalefac_compress 500 and up. Never the right channel under intensity stereo,
+// and never a mixed block.
+struct LsfScalefactors {
+    bool short_block = false;
+    bool scalefac_scale = false;
+    uint8_t subblock_gain[3] = {};
+    uint16_t scalefac_compress = 0;
+    uint8_t values[kMaxScalefactorCells] = {};
+    bool active[kMaxScalefactorCells] = {};
+    bool last_band_active[3] = {};
+};
+
+int lsf_cell_count(const LsfScalefactors& s);
+void lsf_read_scalefactors(BitstreamReader& reader, LsfScalefactors& s);
+void lsf_write_scalefactors(BitstreamWriter& writer, const LsfScalefactors& s);
+int lsf_scalefactor_bits(const LsfScalefactors& s);
+
+// false for a sample rate MPEG-2/2.5 does not have
+bool lsf_mark_active(LsfScalefactors& s, const Spectrum& coeffs, uint32_t samplerate);
+
+// As mpeg1_recode_scalefactors, for one LSF granule: scalefac_scale, preflag (long
+// blocks), subblock_gain (short blocks), free cells and scalefac_compress. A short
+// block keeps whether it is in the preflag range, which decoders ignore there.
+bool lsf_recode_scalefactors(LsfScalefactors& s);
+
 }  // namespace mp3packer
 
 #endif

@@ -19,88 +19,16 @@
 
 namespace mp3packer {
 
-// MPEG-2/2.5 LSF scalefactor band group counts, indexed by [block category][slen
-// set][group] (ISO 13818-3 table B.1). Block category is 0 for long blocks, 1 for
-// pure short blocks and 2 for mixed blocks.
-static constexpr int lsf_band_counts[3][6][4] = {
-    {{6, 5, 5, 5}, {6, 5, 7, 3}, {11, 10, 0, 0}, {7, 7, 7, 0}, {6, 6, 6, 3}, {8, 8, 5, 0}},
-    {{9, 9, 9, 9}, {9, 9, 12, 6}, {18, 18, 0, 0}, {12, 12, 12, 0}, {12, 9, 9, 6}, {15, 12, 9, 0}},
-    {{6, 9, 9, 9}, {6, 9, 12, 6}, {15, 18, 0, 0}, {6, 15, 12, 0}, {6, 12, 9, 6}, {6, 15, 9, 0}},
-};
-
-// The LSF scalefac_compress field is a compound index selecting both a group of
-// band counts and the bit length used within each group (ISO 13818-3 2.4.3.2).
-// Each entry packs four 3-bit lengths in bits 0..11 and the band-count set in
-// bits 12..14.
-struct LsfSlenTables {
-    std::array<uint32_t, 512> normal{};
-    std::array<uint32_t, 256> intensity{};
-};
-
-// The six ranges map one to one onto the six rows of lsf_band_counts, in order:
-// normal 0..399, 400..499, 500..511 (the last is how LSF signals preflag), then
-// intensity 0..179, 180..243, 244..255. They used to be numbered 0, 1, 1, 2, 3, 4,
-// so everything from 500 on took the row before its own: -z sized those
-// scalefactors wrongly, decoded the spectrum from the wrong bit and re-encoded the
-// garbage, and the granule round trip — self-consistent — let it through. LAME never
-// emits preflag or intensity stereo in LSF, which is why no corpus caught it, and
-// go-mp3packer carries the same table. Rows checked against ISO 13818-3 and
-// minimp3's partition walk.
-static const LsfSlenTables& lsf_slen_tables() {
-    static const LsfSlenTables tables = [] {
-        LsfSlenTables t;
-        for (int i = 0; i < 5; ++i)
-            for (int j = 0; j < 5; ++j)
-                for (int k = 0; k < 4; ++k)
-                    for (int l = 0; l < 4; ++l)
-                        t.normal[static_cast<size_t>(l + k * 4 + j * 16 + i * 80)] =
-                            static_cast<uint32_t>(i | j << 3 | k << 6 | l << 9);
-        for (int i = 0; i < 5; ++i)
-            for (int j = 0; j < 5; ++j)
-                for (int k = 0; k < 4; ++k)
-                    t.normal[static_cast<size_t>(k + j * 4 + i * 20 + 400)] =
-                        static_cast<uint32_t>(i | j << 3 | k << 6 | 1 << 12);
-        for (int i = 0; i < 4; ++i)
-            for (int j = 0; j < 3; ++j)
-                t.normal[static_cast<size_t>(j + i * 3 + 500)] = static_cast<uint32_t>(i | j << 3 | 2 << 12);
-        for (int i = 0; i < 5; ++i)
-            for (int j = 0; j < 6; ++j)
-                for (int k = 0; k < 6; ++k)
-                    t.intensity[static_cast<size_t>(k + j * 6 + i * 36)] =
-                        static_cast<uint32_t>(i | j << 3 | k << 6 | 3 << 12);
-        for (int i = 0; i < 4; ++i)
-            for (int j = 0; j < 4; ++j)
-                for (int k = 0; k < 4; ++k)
-                    t.intensity[static_cast<size_t>(k + j * 4 + i * 16 + 180)] =
-                        static_cast<uint32_t>(i | j << 3 | k << 6 | 4 << 12);
-        for (int i = 0; i < 4; ++i)
-            for (int j = 0; j < 3; ++j)
-                t.intensity[static_cast<size_t>(j + i * 3 + 244)] = static_cast<uint32_t>(i | j << 3 | 5 << 12);
-        return t;
-    }();
-    return tables;
-}
-
 // part2_length for an LSF granule: how many bits of scalefactors precede the
-// Huffman-coded spectrum. Never decodes the values themselves — like MPEG1 they
-// are copied through bit for bit.
-static size_t lsf_scalefactor_bits(const GrChInfo& g, const bool intensity_stereo_ch1) {
-    const auto& tables = lsf_slen_tables();
-    uint32_t slen = intensity_stereo_ch1
-        ? tables.intensity[static_cast<size_t>(g.scalefac_compress >> 1) & 0xFF]
-        : tables.normal[static_cast<size_t>(g.scalefac_compress) & 0x1FF];
-
+// Huffman-coded spectrum.
+static size_t lsf_part2_bits(const GrChInfo& g, const bool intensity_stereo_ch1) {
     int category = 0;
     if (g.window_switching_flag && g.block_type == 2) {
         category = g.mixed_block_flag ? 2 : 1;
     }
-    const int* counts = lsf_band_counts[category][(slen >> 12) & 7];
-
+    const LsfPartition p = lsf_partition(g.scalefac_compress, intensity_stereo_ch1, category);
     size_t bits = 0;
-    for (int i = 0; i < 4; ++i) {
-        bits += static_cast<size_t>(counts[i]) * (slen & 7);
-        slen >>= 3;
-    }
+    for (int i = 0; i < 4; ++i) bits += static_cast<size_t>(p.count[i] * p.slen[i]);
     return bits;
 }
 
@@ -551,6 +479,7 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
         Spectrum spectra[2][2]{}, vcoeffs{};
         GranuleWork work[2][2];
         Mpeg1ScalefactorChannel chans[2];
+        LsfScalefactors lsf[2];
         while (true) {
             size_t i = current_frame.fetch_add(1);
             if (i >= N) break;
@@ -652,7 +581,7 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
                     if (!is_mpeg1) {
                         // LSF (MPEG-2/2.5): different band-group layout and slen
                         // decomposition (ISO 13818-3 Annex B).
-                        sf_bits = lsf_scalefactor_bits(g, frame.header.is_stereo && ch == 1);
+                        sf_bits = lsf_part2_bits(g, frame.header.is_stereo && ch == 1);
                     } else if (g.window_switching_flag && g.block_type == 2) {
                         sf_bits = g.mixed_block_flag
                                   ? static_cast<size_t>(17 * slen1 + 18 * slen2)
@@ -679,6 +608,13 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
                             std::copy(g.subblock_gain, g.subblock_gain + 3, s.subblock_gain);
                             if (gr == 0) std::copy(frame.side_info.scfsi[ch], frame.side_info.scfsi[ch] + 4, chans[ch].scfsi);
                             mpeg1_read_scalefactors(data_reader, chans[ch], gr);
+                        } else if (!is_mpeg1 && !mixed && !(frame.header.is_stereo && ch == 1)) {
+                            LsfScalefactors& s = lsf[ch];
+                            s.short_block = g.window_switching_flag && g.block_type == 2;
+                            s.scalefac_scale = g.scalefac_scale;
+                            s.scalefac_compress = g.scalefac_compress;
+                            std::copy(g.subblock_gain, g.subblock_gain + 3, s.subblock_gain);
+                            lsf_read_scalefactors(data_reader, s);
                         } else {
                             data_reader.seek_bit(gc_orig_start + sf_bits);
                         }
@@ -750,6 +686,21 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
                         }
                         std::copy(chans[ch].scfsi, chans[ch].scfsi + 4, frame.side_info.scfsi[ch]);
                     }
+                } else {
+                    for (int ch = 0; ch < n_ch; ++ch) {
+                        // the right channel under intensity stereo reads scalefac_compress
+                        // differently, and its free cells are intensity positions
+                        const GrChInfo& g = frame.side_info.gr[0][ch];
+                        const bool eligible = !(frame.header.is_stereo && ch == 1) &&
+                                              !(g.window_switching_flag && g.block_type == 2 && g.mixed_block_flag) &&
+                                              lsf_mark_active(lsf[ch], spectra[0][ch], frame.header.samplerate);
+                        if (!eligible || !lsf_recode_scalefactors(lsf[ch])) continue;
+                        recoded[ch] = true;
+                        GrChInfo& out = frame.side_info.gr[0][ch];
+                        out.scalefac_scale = lsf[ch].scalefac_scale;
+                        out.scalefac_compress = lsf[ch].scalefac_compress;
+                        std::copy(lsf[ch].subblock_gain, lsf[ch].subblock_gain + 3, out.subblock_gain);
+                    }
                 }
 
                 for (int gr = 0; gr < n_gr; ++gr) {
@@ -758,7 +709,8 @@ void Packer::process(const std::string& input_file, const std::string& output_fi
                     const GranuleWork& wk = work[gr][ch];
                     size_t out_start = writer.tell_bit();
                     if (recoded[ch]) {
-                        mpeg1_write_scalefactors(writer, chans[ch], gr);
+                        if (is_mpeg1) mpeg1_write_scalefactors(writer, chans[ch], gr);
+                        else lsf_write_scalefactors(writer, lsf[ch]);
                     } else if (!wk.sf_truncated) {
                         data_reader.seek_bit(wk.sf_start);
                         writer.copy_from(data_reader, wk.sf_bits);

@@ -1,6 +1,7 @@
 #include "scalefactors.hpp"
 
 #include <algorithm>
+#include <array>
 
 namespace mp3packer {
 namespace {
@@ -23,6 +24,83 @@ constexpr int kShortEdges[3][14] = {
     {0, 4, 8, 12, 16, 22, 30, 42, 58, 78, 104, 138, 180, 192},
 };
 
+// MPEG-2/2.5 bands (ISO 13818-3 B.2, and the 8 kHz tables every MPEG-2.5 decoder
+// shares). 11025/12000 take 22050's long bands but 16000's short ones.
+constexpr int kLsfLongEdges[3][23] = {
+    {0, 6, 12, 18, 24, 30, 36, 44, 54, 66, 80, 96, 116, 140, 168, 200, 238, 284, 336, 396, 464, 522, 576},
+    {0, 6, 12, 18, 24, 30, 36, 44, 54, 66, 80, 96, 114, 136, 162, 194, 232, 278, 332, 394, 464, 540, 576},
+    {0, 12, 24, 36, 48, 60, 72, 88, 108, 132, 160, 192, 232, 280, 336, 400, 476, 566, 568, 570, 572, 574, 576},
+};
+constexpr int kLsfShortEdges[4][14] = {
+    {0, 4, 8, 12, 18, 24, 32, 42, 56, 74, 100, 132, 174, 192},
+    {0, 4, 8, 12, 18, 26, 36, 48, 62, 80, 104, 136, 180, 192},
+    {0, 4, 8, 12, 18, 26, 36, 48, 62, 80, 104, 134, 174, 192},
+    {0, 8, 16, 24, 36, 52, 72, 96, 124, 160, 162, 164, 166, 192},
+};
+
+// LSF partition sizes, indexed by [block category][row][partition] (ISO 13818-3
+// table B.1). Block category is 0 for long blocks, 1 for pure short blocks and 2
+// for mixed blocks.
+constexpr int kLsfCounts[3][6][4] = {
+    {{6, 5, 5, 5}, {6, 5, 7, 3}, {11, 10, 0, 0}, {7, 7, 7, 0}, {6, 6, 6, 3}, {8, 8, 5, 0}},
+    {{9, 9, 9, 9}, {9, 9, 12, 6}, {18, 18, 0, 0}, {12, 12, 12, 0}, {12, 9, 9, 6}, {15, 12, 9, 0}},
+    {{6, 9, 9, 9}, {6, 9, 12, 6}, {15, 18, 0, 0}, {6, 15, 12, 0}, {6, 12, 9, 6}, {6, 18, 9, 0}},
+};
+// the largest slen each partition of rows 0..2 can declare
+constexpr int kLsfSlenLimit[3][4] = {{4, 4, 3, 3}, {4, 4, 3, 0}, {3, 2, 0, 0}};
+
+// The LSF scalefac_compress field is a compound index selecting both a row of
+// partition sizes and the slen used within each partition. Each entry packs four
+// 3-bit lengths in bits 0..11 and the row in bits 12..14.
+struct LsfSlenTables {
+    std::array<uint32_t, 512> normal{};
+    std::array<uint32_t, 256> intensity{};
+};
+
+// The six ranges map one to one onto the six rows of kLsfCounts, in order:
+// normal 0..399, 400..499, 500..511 (the last is how LSF signals preflag), then
+// intensity 0..179, 180..243, 244..255. They used to be numbered 0, 1, 1, 2, 3, 4,
+// so everything from 500 on took the row before its own: -z sized those
+// scalefactors wrongly, decoded the spectrum from the wrong bit and re-encoded the
+// garbage, and the granule round trip — self-consistent — let it through. LAME never
+// emits preflag or intensity stereo in LSF, which is why no corpus caught it, and
+// go-mp3packer carries the same table. Rows checked against ISO 13818-3 and
+// minimp3's partition walk.
+const LsfSlenTables& lsf_slen_tables() {
+    static const LsfSlenTables tables = [] {
+        LsfSlenTables t;
+        for (int i = 0; i < 5; ++i)
+            for (int j = 0; j < 5; ++j)
+                for (int k = 0; k < 4; ++k)
+                    for (int l = 0; l < 4; ++l)
+                        t.normal[static_cast<size_t>(l + k * 4 + j * 16 + i * 80)] =
+                            static_cast<uint32_t>(i | j << 3 | k << 6 | l << 9);
+        for (int i = 0; i < 5; ++i)
+            for (int j = 0; j < 5; ++j)
+                for (int k = 0; k < 4; ++k)
+                    t.normal[static_cast<size_t>(k + j * 4 + i * 20 + 400)] =
+                        static_cast<uint32_t>(i | j << 3 | k << 6 | 1 << 12);
+        for (int i = 0; i < 4; ++i)
+            for (int j = 0; j < 3; ++j)
+                t.normal[static_cast<size_t>(j + i * 3 + 500)] = static_cast<uint32_t>(i | j << 3 | 2 << 12);
+        for (int i = 0; i < 5; ++i)
+            for (int j = 0; j < 6; ++j)
+                for (int k = 0; k < 6; ++k)
+                    t.intensity[static_cast<size_t>(k + j * 6 + i * 36)] =
+                        static_cast<uint32_t>(i | j << 3 | k << 6 | 3 << 12);
+        for (int i = 0; i < 4; ++i)
+            for (int j = 0; j < 4; ++j)
+                for (int k = 0; k < 4; ++k)
+                    t.intensity[static_cast<size_t>(k + j * 4 + i * 16 + 180)] =
+                        static_cast<uint32_t>(i | j << 3 | k << 6 | 4 << 12);
+        for (int i = 0; i < 4; ++i)
+            for (int j = 0; j < 3; ++j)
+                t.intensity[static_cast<size_t>(j + i * 3 + 244)] = static_cast<uint32_t>(i | j << 3 | 5 << 12);
+        return t;
+    }();
+    return tables;
+}
+
 int group_of(const int band) { return band < 6 ? 0 : band < 11 ? 1 : band < 16 ? 2 : 3; }
 
 int first_slen2_cell(const bool short_block) { return short_block ? 18 : 11; }
@@ -31,6 +109,18 @@ int slen_of(const Mpeg1Scalefactors& s, const int cell) {
     return cell < first_slen2_cell(s.short_block) ? kSlen1[s.scalefac_compress & 15]
                                                   : kSlen2[s.scalefac_compress & 15];
 }
+
+bool preflag_of(const Mpeg1Scalefactors& s) { return s.preflag; }
+bool preflag_of(const LsfScalefactors& s) { return s.scalefac_compress >= 500; }
+
+// the largest value any coding could give a cell; the cost function decides the rest
+int value_limit(const Mpeg1Scalefactors& s, const int cell) { return cell < first_slen2_cell(s.short_block) ? 15 : 7; }
+int value_limit(const LsfScalefactors&, int) { return 15; }
+
+int cell_count(const Mpeg1Scalefactors& s) { return mpeg1_cell_count(s); }
+int cell_count(const LsfScalefactors& s) { return lsf_cell_count(s); }
+
+int lsf_category(const LsfScalefactors& s) { return s.short_block ? 1 : 0; }
 
 // The part of a cell's step exponent, in quarter steps, that the scalefactors and
 // subblock_gain carry. Every decoder sums the two terms as integers before it builds
@@ -41,8 +131,9 @@ int exponent(const bool short_block, const bool scale, const bool preflag, const
     return (value + (preflag ? kPretab[cell] : 0)) << (scale ? 2 : 1);
 }
 
-int exponent(const Mpeg1Scalefactors& s, const int cell, const int value) {
-    return exponent(s.short_block, s.scalefac_scale, s.preflag, s.subblock_gain, cell, value);
+template <class S>
+int exponent(const S& s, const int cell, const int value) {
+    return exponent(s.short_block, s.scalefac_scale, preflag_of(s), s.subblock_gain, cell, value);
 }
 
 int cheapest_compress(const int max1, const int n1, const int max2, const int n2, int& bits) {
@@ -88,6 +179,73 @@ int short_cost(const uint8_t* v, int& compress) {
     return bits;
 }
 
+int bit_length(const int max) {
+    int n = 0;
+    while ((1 << n) <= max) ++n;
+    return n;
+}
+
+// the cheapest LSF scalefac_compress that holds v with preflag as given, or -1
+int lsf_cheapest(const uint8_t* v, const int category, const bool preflag, int& bits) {
+    int best = -1;
+    for (int row = preflag ? 2 : 0; row < (preflag ? 3 : 2); ++row) {
+        int slen[4] = {};
+        int b = 0, cell = 0;
+        bool fits = true;
+        for (int p = 0; p < 4; ++p) {
+            int max = 0;
+            for (int k = 0; k < kLsfCounts[category][row][p]; ++k) max = std::max<int>(max, v[cell++]);
+            slen[p] = bit_length(max);
+            fits = fits && slen[p] <= kLsfSlenLimit[row][p];
+            b += slen[p] * kLsfCounts[category][row][p];
+        }
+        if (!fits) continue;
+        const int sfc = row == 0   ? ((slen[0] * 5 + slen[1]) << 4) + (slen[2] << 2) + slen[3]
+                        : row == 1 ? 400 + ((slen[0] * 5 + slen[1]) << 2) + slen[2]
+                                   : 500 + slen[0] * 3 + slen[1];
+        if (best < 0 || b < bits) {
+            best = sfc;
+            bits = b;
+        }
+    }
+    return best;
+}
+
+// Which cells hold a nonzero coefficient, given the band edges; returns whether any
+// coefficient at all is nonzero.
+bool mark_cells(const bool short_block, const int* long_edges, const int* short_edges, const Spectrum& coeffs,
+                bool* active, bool* last_band_active) {
+    const auto nonzero = [&coeffs](const int from, const int to) {
+        for (int k = from; k < to; ++k) {
+            if (coeffs[static_cast<size_t>(k)] != 0) return true;
+        }
+        return false;
+    };
+    std::fill(active, active + kMaxScalefactorCells, false);
+    std::fill(last_band_active, last_band_active + 3, false);
+    if (short_block) {
+        // short-block coefficients arrive band by band, and within a band window by window
+        const int* edge = short_edges;
+        for (int band = 0; band < 12; ++band) {
+            const int width = edge[band + 1] - edge[band];
+            for (int win = 0; win < 3; ++win) {
+                const int from = 3 * edge[band] + win * width;
+                active[band * 3 + win] = nonzero(from, from + width);
+            }
+        }
+        const int width = edge[13] - edge[12];
+        for (int win = 0; win < 3; ++win) {
+            const int from = 3 * edge[12] + win * width;
+            last_band_active[win] = nonzero(from, from + width);
+        }
+    } else {
+        for (int band = 0; band < kLongCells; ++band) {
+            active[band] = nonzero(long_edges[band], long_edges[band + 1]);
+        }
+    }
+    return nonzero(0, kNumCoefficients);
+}
+
 struct Candidate {
     bool scale = false;
     bool preflag = false;
@@ -96,8 +254,9 @@ struct Candidate {
 };
 
 // every scalefac_scale/preflag pair under which each active cell keeps its exponent
-int candidates(const Mpeg1Scalefactors& s, Candidate out[4]) {
-    const int cells = mpeg1_cell_count(s);
+template <class S>
+int candidates(const S& s, Candidate out[4]) {
+    const int cells = cell_count(s);
     int e[kMaxScalefactorCells] = {};
     for (int c = 0; c < cells; ++c) {
         if (s.active[c]) e[c] = exponent(s, c, s.values[c]);
@@ -109,7 +268,7 @@ int candidates(const Mpeg1Scalefactors& s, Candidate out[4]) {
             if (s.short_block && pf == 1) continue;
             Candidate q;
             q.scale = scale != 0;
-            q.preflag = s.short_block ? s.preflag : pf != 0;
+            q.preflag = s.short_block ? preflag_of(s) : pf != 0;
             std::copy(s.subblock_gain, s.subblock_gain + 3, q.subblock_gain);
             if (s.short_block) {
                 // each window's subblock_gain takes as much of its heard cells' exponents
@@ -133,8 +292,7 @@ int candidates(const Mpeg1Scalefactors& s, Candidate out[4]) {
                 const int rest = e[c] - (s.short_block ? q.subblock_gain[c % 3] << 3 : 0);
                 const int pre = (!s.short_block && q.preflag) ? kPretab[c] : 0;
                 const int v = (rest >> shift) - pre;
-                ok = rest >= 0 && (rest & ((1 << shift) - 1)) == 0 && v >= 0 &&
-                     v <= (c < first_slen2_cell(s.short_block) ? 15 : 7);
+                ok = rest >= 0 && (rest & ((1 << shift) - 1)) == 0 && v >= 0 && v <= value_limit(s, c);
                 if (ok) q.v[c] = static_cast<uint8_t>(v);
             }
             if (ok) out[n++] = q;
@@ -168,6 +326,23 @@ bool same_steps(const Mpeg1ScalefactorChannel& a, const Mpeg1ScalefactorChannel&
         }
     }
     return true;
+}
+
+bool same_steps(const LsfScalefactors& a, const LsfScalefactors& b) {
+    if (a.short_block != b.short_block) return false;
+    if (a.short_block && preflag_of(a) != preflag_of(b)) return false;
+    for (int w = 0; w < 3; ++w) {
+        if (a.short_block && a.last_band_active[w] && a.subblock_gain[w] != b.subblock_gain[w]) return false;
+    }
+    const LsfPartition p = lsf_partition(b.scalefac_compress, false, lsf_category(b));
+    int cell = 0;
+    for (int part = 0; part < 4; ++part) {
+        for (int k = 0; k < p.count[part]; ++k, ++cell) {
+            if (b.values[cell] >= (1 << p.slen[part])) return false;
+            if (a.active[cell] && exponent(a, cell, a.values[cell]) != exponent(b, cell, b.values[cell])) return false;
+        }
+    }
+    return cell == lsf_cell_count(b);
 }
 
 }  // namespace
@@ -211,35 +386,7 @@ bool mpeg1_mark_active(Mpeg1Scalefactors& s, const Spectrum& coeffs, const uint3
         case 32000: sr = 2; break;
         default: return false;
     }
-    const auto nonzero = [&coeffs](const int from, const int to) {
-        for (int k = from; k < to; ++k) {
-            if (coeffs[static_cast<size_t>(k)] != 0) return true;
-        }
-        return false;
-    };
-    std::fill(std::begin(s.active), std::end(s.active), false);
-    std::fill(std::begin(s.last_band_active), std::end(s.last_band_active), false);
-    if (s.short_block) {
-        // short-block coefficients arrive band by band, and within a band window by window
-        const int* edge = kShortEdges[sr];
-        for (int band = 0; band < 12; ++band) {
-            const int width = edge[band + 1] - edge[band];
-            for (int win = 0; win < 3; ++win) {
-                const int from = 3 * edge[band] + win * width;
-                s.active[band * 3 + win] = nonzero(from, from + width);
-            }
-        }
-        const int width = edge[13] - edge[12];
-        for (int win = 0; win < 3; ++win) {
-            const int from = 3 * edge[12] + win * width;
-            s.last_band_active[win] = nonzero(from, from + width);
-        }
-    } else {
-        for (int band = 0; band < kLongCells; ++band) {
-            s.active[band] = nonzero(kLongEdges[sr][band], kLongEdges[sr][band + 1]);
-        }
-    }
-    s.any_nonzero = nonzero(0, kNumCoefficients);
+    s.any_nonzero = mark_cells(s.short_block, kLongEdges[sr], kShortEdges[sr], coeffs, s.active, s.last_band_active);
     return true;
 }
 
@@ -323,6 +470,81 @@ bool mpeg1_recode_scalefactors(Mpeg1ScalefactorChannel& c, const bool allow_scfs
 
     if (best_bits >= before || !same_steps(c, best)) return false;
     c = best;
+    return true;
+}
+
+LsfPartition lsf_partition(const int scalefac_compress, const bool intensity, const int category) {
+    const auto& tables = lsf_slen_tables();
+    uint32_t packed = intensity ? tables.intensity[static_cast<size_t>(scalefac_compress >> 1) & 0xFF]
+                                : tables.normal[static_cast<size_t>(scalefac_compress) & 0x1FF];
+    LsfPartition p;
+    const int* counts = kLsfCounts[category][(packed >> 12) & 7];
+    for (int i = 0; i < 4; ++i) {
+        p.slen[i] = static_cast<int>(packed & 7);
+        p.count[i] = counts[i];
+        packed >>= 3;
+    }
+    return p;
+}
+
+int lsf_cell_count(const LsfScalefactors& s) { return s.short_block ? kShortCells : kLongCells; }
+
+void lsf_read_scalefactors(BitstreamReader& reader, LsfScalefactors& s) {
+    const LsfPartition p = lsf_partition(s.scalefac_compress, false, lsf_category(s));
+    int cell = 0;
+    for (int part = 0; part < 4; ++part) {
+        for (int k = 0; k < p.count[part]; ++k) s.values[cell++] = static_cast<uint8_t>(reader.read_bits(p.slen[part]));
+    }
+}
+
+void lsf_write_scalefactors(BitstreamWriter& writer, const LsfScalefactors& s) {
+    const LsfPartition p = lsf_partition(s.scalefac_compress, false, lsf_category(s));
+    int cell = 0;
+    for (int part = 0; part < 4; ++part) {
+        for (int k = 0; k < p.count[part]; ++k) writer.write_bits(s.values[cell++], p.slen[part]);
+    }
+}
+
+int lsf_scalefactor_bits(const LsfScalefactors& s) {
+    const LsfPartition p = lsf_partition(s.scalefac_compress, false, lsf_category(s));
+    int bits = 0;
+    for (int part = 0; part < 4; ++part) bits += p.slen[part] * p.count[part];
+    return bits;
+}
+
+bool lsf_mark_active(LsfScalefactors& s, const Spectrum& coeffs, const uint32_t samplerate) {
+    int lr = 0, sr = 0;
+    switch (samplerate) {
+        case 22050: lr = 0; sr = 0; break;
+        case 24000: lr = 1; sr = 1; break;
+        case 16000:
+        case 11025:
+        case 12000: lr = 0; sr = 2; break;
+        case 8000: lr = 2; sr = 3; break;
+        default: return false;
+    }
+    mark_cells(s.short_block, kLsfLongEdges[lr], kLsfShortEdges[sr], coeffs, s.active, s.last_band_active);
+    return true;
+}
+
+bool lsf_recode_scalefactors(LsfScalefactors& s) {
+    const int before = lsf_scalefactor_bits(s);
+    Candidate cand[4];
+    const int count = candidates(s, cand);
+    LsfScalefactors best = s;
+    int best_bits = before;
+    for (int i = 0; i < count; ++i) {
+        int bits = 0;
+        const int sfc = lsf_cheapest(cand[i].v, lsf_category(s), cand[i].preflag, bits);
+        if (sfc < 0 || bits >= best_bits) continue;
+        best_bits = bits;
+        best.scalefac_scale = cand[i].scale;
+        best.scalefac_compress = static_cast<uint16_t>(sfc);
+        std::copy(cand[i].subblock_gain, cand[i].subblock_gain + 3, best.subblock_gain);
+        std::copy(cand[i].v, cand[i].v + lsf_cell_count(s), best.values);
+    }
+    if (best_bits >= before || !same_steps(s, best)) return false;
+    s = best;
     return true;
 }
 
